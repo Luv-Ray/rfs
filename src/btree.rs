@@ -74,6 +74,25 @@ fn count_keys(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64) -> usize {
     }
 }
 
+/// Collect the depth of every leaf node. All leaves must be at the same depth
+/// for the tree to be balanced.
+#[cfg(test)]
+fn collect_leaf_depths(
+    block_map: &HashMap<u64, BtreeNodeRaw>,
+    block_nr: u64,
+    depth: usize,
+    depths: &mut Vec<usize>,
+) {
+    let node = &block_map[&block_nr];
+    if node.level() == 0 {
+        depths.push(depth);
+    } else {
+        for i in 0..=node.nkeys() {
+            collect_leaf_depths(block_map, node.child_block(i), depth + 1, depths);
+        }
+    }
+}
+
 /// Recursive invariant check. `lo`/`hi` are exclusive bounds inherited from
 /// the parent separator (separator-in-right convention: the separator belongs
 /// to the right subtree, so child[i] holds keys in [lo, hi)).
@@ -1073,6 +1092,171 @@ mod tests {
         // Verify all values.
         for (&k, &v) in &reference {
             assert_eq!(tree.find(&key(k)), Some(val(v).as_slice()));
+        }
+        tree.verify();
+    }
+
+    // ---------- Balance invariance ----------
+
+    /// Verify all leaves are at the same depth and return that depth.
+    fn assert_balanced(tree: &Btree) -> usize {
+        let mut depths = Vec::new();
+        collect_leaf_depths(&tree.block_map, tree.root_block, 0, &mut depths);
+        assert!(!depths.is_empty(), "tree has no leaves");
+        let first = depths[0];
+        for (i, &d) in depths.iter().enumerate() {
+            assert_eq!(
+                d, first,
+                "leaf {i} is at depth {d}, expected {first}"
+            );
+        }
+        first
+    }
+
+    #[test]
+    fn test_balance_sequential_inserts() {
+        let mut tree = Btree::new();
+        // Insert enough keys to create multiple levels.
+        for i in 0..5000u32 {
+            tree.insert(&key(i), &val(i));
+        }
+        let depth = assert_balanced(&tree);
+        assert!(depth >= 2, "expected multi-level tree, got depth {depth}");
+        tree.verify();
+    }
+
+    #[test]
+    fn test_balance_reverse_inserts() {
+        let mut tree = Btree::new();
+        for i in (0..5000u32).rev() {
+            tree.insert(&key(i), &val(i));
+        }
+        assert_balanced(&tree);
+        tree.verify();
+    }
+
+    #[test]
+    fn test_balance_random_inserts() {
+        let mut rng = Rng(0xBEEF_FACE);
+        let mut tree = Btree::new();
+        for _ in 0..5000u32 {
+            let k = rng.next_u32();
+            tree.insert(&key(k), &val(k));
+        }
+        assert_balanced(&tree);
+        tree.verify();
+    }
+
+    #[test]
+    fn test_balance_after_overwrites() {
+        let mut tree = Btree::new();
+        for i in 0..2000u32 {
+            tree.insert(&key(i), &val(i));
+        }
+        // Overwrite doesn't change tree structure, balance must hold.
+        for i in 0..2000u32 {
+            tree.insert(&key(i), &val(i + 99999));
+        }
+        assert_balanced(&tree);
+        tree.verify();
+    }
+
+    #[test]
+    fn test_balance_at_each_split_level() {
+        // Insert one key at a time and verify balance after every insert.
+        let mut tree = Btree::new();
+        for i in 0..2000u32 {
+            tree.insert(&key(i), &val(i));
+            assert_balanced(&tree);
+        }
+        tree.verify();
+    }
+
+    #[test]
+    fn test_balance_height_grows_logarithmically() {
+        // With MAX_ENTRIES=29, a B-tree of height h can hold at least
+        // 29^h keys (each leaf full). So height should be O(log_29(n)).
+        let mut tree = Btree::new();
+        let mut prev_depth = 0usize;
+        let mut prev_n = 0u32;
+
+        for n in [50, 500, 5000, 20000u32] {
+            for i in prev_n..n {
+                tree.insert(&key(i), &val(i));
+            }
+            let depth = assert_balanced(&tree);
+
+            // Height should never jump by more than 1 between these checkpoints.
+            if prev_depth > 0 {
+                assert!(
+                    depth <= prev_depth + 1,
+                    "height jumped from {prev_depth} to {depth} \
+                     when inserting {prev_n}..{n}"
+                );
+            }
+
+            prev_depth = depth;
+            prev_n = n;
+        }
+
+        // With 20000 keys and branching factor 29, height should be small.
+        assert!(prev_depth <= 5, "unexpectedly deep tree: height={prev_depth}");
+        tree.verify();
+    }
+
+    #[test]
+    fn test_balance_leaf_fill_ratio() {
+        // Every leaf (except possibly the last split remainder) should have
+        // at least MAX_ENTRIES/2 keys. This is the standard B-tree invariant.
+        let mut tree = Btree::new();
+        for i in 0..5000u32 {
+            tree.insert(&key(i), &val(i));
+        }
+
+        let min_keys = crate::block_btree::MAX_ENTRIES / 2;
+        check_leaf_fill(&tree.block_map, tree.root_block, min_keys);
+        tree.verify();
+    }
+
+    fn check_leaf_fill(
+        block_map: &HashMap<u64, BtreeNodeRaw>,
+        block_nr: u64,
+        min_keys: usize,
+    ) {
+        let node = &block_map[&block_nr];
+        if node.level() == 0 {
+            assert!(
+                node.nkeys() >= min_keys,
+                "leaf blk={block_nr} has only {} keys, expected >= {min_keys}",
+                node.nkeys()
+            );
+        } else {
+            for i in 0..=node.nkeys() {
+                check_leaf_fill(block_map, node.child_block(i), min_keys);
+            }
+        }
+    }
+
+    #[test]
+    fn test_balance_cow_snapshots_all_balanced() {
+        let mut tree = Btree::new();
+        let mut snapshots = Vec::new();
+
+        for i in 0..3000u32 {
+            tree.insert(&key(i), &val(i));
+            if i % 500 == 499 {
+                snapshots.push(tree.root_block);
+            }
+        }
+
+        // Every historical snapshot must also be balanced.
+        for &snap in &snapshots {
+            let mut depths = Vec::new();
+            collect_leaf_depths(&tree.block_map, snap, 0, &mut depths);
+            let first = depths[0];
+            for (i, &d) in depths.iter().enumerate() {
+                assert_eq!(d, first, "snapshot leaf {i} depth {d} != {first}");
+            }
         }
         tree.verify();
     }
