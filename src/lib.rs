@@ -1,2 +1,2 @@
-mod block_btree;
-mod btree;
+pub mod block_btree;
+pub mod btree;
