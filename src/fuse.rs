@@ -15,9 +15,7 @@ use fuser::{
 use libc::{S_IFDIR, S_IFMT, S_IFREG};
 
 use crate::btree;
-use crate::fs::{
-    DirentV1, FILE_KIND_DIR, FILE_KIND_REGULAR, Fs, InodeV1, MAX_NAME_LEN, ROOT_INO,
-};
+use crate::fs::{DirentV1, FILE_KIND_DIR, FILE_KIND_REGULAR, Fs, InodeV1, MAX_NAME_LEN, ROOT_INO};
 
 const BLOCK_SIZE: u64 = 4096;
 const BLOCK_SIZE_USIZE: usize = BLOCK_SIZE as usize;
@@ -179,8 +177,14 @@ impl Filesystem for FuseFs {
         if raw == b"." || raw == b".." {
             let parent_inode = match fs.get_inode(parent) {
                 Ok(Some(i)) => i,
-                Ok(None) => { reply.error(Errno::ENOENT); return; }
-                Err(_) => { reply.error(Errno::EIO); return; }
+                Ok(None) => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
             };
             let (target_ino, target_inode) = if raw == b"." {
                 (parent, parent_inode)
@@ -188,8 +192,14 @@ impl Filesystem for FuseFs {
                 let pp = parent_inode.parent_ino;
                 match fs.get_inode(pp) {
                     Ok(Some(i)) => (pp, i),
-                    Ok(None) => { reply.error(Errno::ENOENT); return; }
-                    Err(_) => { reply.error(Errno::EIO); return; }
+                    Ok(None) => {
+                        reply.error(Errno::ENOENT);
+                        return;
+                    }
+                    Err(_) => {
+                        reply.error(Errno::EIO);
+                        return;
+                    }
                 }
             };
             reply.entry(&TTL, &to_attr(target_ino, &target_inode), GENERATION);
@@ -197,7 +207,10 @@ impl Filesystem for FuseFs {
         }
         let bytes = match validate_name(name) {
             Ok(b) => b,
-            Err(e) => { reply.error(e); return; }
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
         };
         match fs.lookup_dirent(parent, bytes) {
             Ok(Some(d)) => match fs.get_inode(d.target_ino) {
@@ -232,8 +245,14 @@ impl Filesystem for FuseFs {
         let fs = self.fs.lock().unwrap();
         let inode = match fs.get_inode(ino) {
             Ok(Some(i)) => i,
-            Ok(None) => { reply.error(Errno::ENOENT); return; }
-            Err(_) => { reply.error(Errno::EIO); return; }
+            Ok(None) => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
         };
         if inode.mode & S_IFMT as u32 != S_IFDIR as u32 {
             reply.error(Errno::ENOTDIR);
@@ -241,7 +260,10 @@ impl Filesystem for FuseFs {
         }
         let dirents = match fs.list_dirents(ino) {
             Ok(v) => v,
-            Err(_) => { reply.error(Errno::EIO); return; }
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
         };
 
         let mut entries: Vec<(u64, FileType, Vec<u8>)> = Vec::with_capacity(2 + dirents.len());
@@ -299,12 +321,21 @@ impl Filesystem for FuseFs {
         let mut fs = self.fs.lock().unwrap();
         let written = match do_write(&mut fs, ino, offset, data) {
             Ok(n) => n,
-            Err(_) => { reply.error(Errno::EIO); return; }
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
         };
         let mut inode = match fs.get_inode(ino) {
             Ok(Some(i)) => i,
-            Ok(None) => { reply.error(Errno::ENOENT); return; }
-            Err(_) => { reply.error(Errno::EIO); return; }
+            Ok(None) => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
         };
         inode.size = inode.size.max(offset + data.len() as u64);
         let now = now_secs();
@@ -331,12 +362,21 @@ impl Filesystem for FuseFs {
         let mut fs = self.fs.lock().unwrap();
         let name_bytes = match validate_name(name) {
             Ok(b) => b,
-            Err(e) => { reply.error(e); return; }
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
         };
         match fs.lookup_dirent(parent, name_bytes) {
-            Ok(Some(_)) => { reply.error(Errno::EEXIST); return; }
+            Ok(Some(_)) => {
+                reply.error(Errno::EEXIST);
+                return;
+            }
             Ok(None) => {}
-            Err(_) => { reply.error(Errno::EIO); return; }
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
         }
         let new_ino = fs.alloc_ino();
         let now = now_secs();
@@ -382,12 +422,21 @@ impl Filesystem for FuseFs {
         let mut fs = self.fs.lock().unwrap();
         let name_bytes = match validate_name(name) {
             Ok(b) => b,
-            Err(e) => { reply.error(e); return; }
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
         };
         match fs.lookup_dirent(parent, name_bytes) {
-            Ok(Some(_)) => { reply.error(Errno::EEXIST); return; }
+            Ok(Some(_)) => {
+                reply.error(Errno::EEXIST);
+                return;
+            }
             Ok(None) => {}
-            Err(_) => { reply.error(Errno::EIO); return; }
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
         }
         let new_ino = fs.alloc_ino();
         let now = now_secs();
@@ -469,8 +518,13 @@ mod tests {
         };
         InodeV1 {
             mode,
-            uid: 0, gid: 0, nlink: 1, size: 0,
-            atime: 0, mtime: 0, ctime: 0,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
             parent_ino: ROOT_INO,
         }
     }
@@ -500,9 +554,13 @@ mod tests {
         let ino = fs.alloc_ino(); // 1
         let inode = InodeV1 {
             mode: S_IFREG as u32 | 0o644,
-            uid: 0, gid: 0, nlink: 1,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
             size: size_bytes as u64,
-            atime: 0, mtime: 0, ctime: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
             parent_ino: ROOT_INO,
         };
         fs.put_inode(ino, &inode).unwrap();

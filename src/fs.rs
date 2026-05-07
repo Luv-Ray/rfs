@@ -69,10 +69,7 @@ fn extent_key(ino: u64, offset: u64) -> [u8; EXTENT_KEY_LEN] {
 }
 
 fn extent_range(ino: u64) -> ([u8; EXTENT_KEY_LEN], [u8; EXTENT_KEY_LEN]) {
-    (
-        extent_key(ino, 0),
-        extent_key(ino.saturating_add(1), 0),
-    )
+    (extent_key(ino, 0), extent_key(ino.saturating_add(1), 0))
 }
 
 fn extent_offset_from_key(key: &[u8]) -> u64 {
@@ -117,7 +114,11 @@ const _: () = assert!(std::mem::size_of::<DirentV1>() == 16);
 
 impl DirentV1 {
     pub fn new(target_ino: u64, kind: u8) -> Self {
-        DirentV1 { target_ino, kind, _pad: [0; 7] }
+        DirentV1 {
+            target_ino,
+            kind,
+            _pad: [0; 7],
+        }
     }
 }
 
@@ -171,9 +172,7 @@ impl Fs {
 
     pub fn get_inode(&self, ino: u64) -> Result<Option<InodeV1>> {
         let bytes = self.tree.find(&inode_key(ino))?;
-        Ok(bytes.map(|b| {
-            InodeV1::read_from_bytes(&b).expect("inode value size mismatch")
-        }))
+        Ok(bytes.map(|b| InodeV1::read_from_bytes(&b).expect("inode value size mismatch")))
     }
 
     // -- Dirent --
@@ -184,9 +183,7 @@ impl Fs {
 
     pub fn lookup_dirent(&self, parent: u64, name: &[u8]) -> Result<Option<DirentV1>> {
         let bytes = self.tree.find(&dirent_key(parent, name))?;
-        Ok(bytes.map(|b| {
-            DirentV1::read_from_bytes(&b).expect("dirent value size mismatch")
-        }))
+        Ok(bytes.map(|b| DirentV1::read_from_bytes(&b).expect("dirent value size mismatch")))
     }
 
     pub fn list_dirents(&self, parent: u64) -> Result<Vec<(Vec<u8>, DirentV1)>> {
@@ -218,14 +215,13 @@ impl Fs {
             _pad: [0; 4],
             data_block: block_nr,
         };
-        self.tree.insert(&extent_key(ino, offset), extent.as_bytes())
+        self.tree
+            .insert(&extent_key(ino, offset), extent.as_bytes())
     }
 
     pub fn get_extent(&self, ino: u64, offset: u64) -> Result<Option<ExtentV1>> {
         let bytes = self.tree.find(&extent_key(ino, offset))?;
-        Ok(bytes.map(|b| {
-            ExtentV1::read_from_bytes(&b).expect("extent value size mismatch")
-        }))
+        Ok(bytes.map(|b| ExtentV1::read_from_bytes(&b).expect("extent value size mismatch")))
     }
 
     pub fn read_data_block(&self, block_nr: u64) -> &[u8; BLOCK_SIZE] {
@@ -305,8 +301,10 @@ mod tests {
     #[test]
     fn dirent_isolated_across_parents() {
         let mut fs = Fs::new();
-        fs.put_dirent(1, b"x", &DirentV1::new(100, FILE_KIND_REGULAR)).unwrap();
-        fs.put_dirent(2, b"x", &DirentV1::new(200, FILE_KIND_REGULAR)).unwrap();
+        fs.put_dirent(1, b"x", &DirentV1::new(100, FILE_KIND_REGULAR))
+            .unwrap();
+        fs.put_dirent(2, b"x", &DirentV1::new(200, FILE_KIND_REGULAR))
+            .unwrap();
         assert_eq!(fs.lookup_dirent(1, b"x").unwrap().unwrap().target_ino, 100);
         assert_eq!(fs.lookup_dirent(2, b"x").unwrap().unwrap().target_ino, 200);
         assert_eq!(fs.list_dirents(1).unwrap().len(), 1);
@@ -353,7 +351,8 @@ mod tests {
         // None of the three range scans should see keys from the others.
         let mut fs = Fs::new();
         fs.put_inode(5, &sample_inode(100)).unwrap();
-        fs.put_dirent(5, b"child", &DirentV1::new(9, FILE_KIND_REGULAR)).unwrap();
+        fs.put_dirent(5, b"child", &DirentV1::new(9, FILE_KIND_REGULAR))
+            .unwrap();
         fs.put_extent(5, 0, b"data").unwrap();
 
         assert!(fs.get_inode(5).unwrap().is_some());

@@ -77,6 +77,12 @@ impl Btree {
     }
 }
 
+impl Default for Btree {
+    fn default() -> Self {
+        Btree::new()
+    }
+}
+
 /// Count total keys in the subtree rooted at `block_nr`.
 #[cfg(test)]
 fn count_keys(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64) -> usize {
@@ -214,7 +220,9 @@ fn clone_to_heap(node: &BtreeNodeRaw) -> Box<BtreeNodeRaw> {
 // ---------- Recursive operations ----------
 
 fn read_block(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64) -> Result<&BtreeNodeRaw> {
-    block_map.get(&block_nr).ok_or(Error::BlockNotFound(block_nr))
+    block_map
+        .get(&block_nr)
+        .ok_or(Error::BlockNotFound(block_nr))
 }
 
 fn find(
@@ -349,8 +357,8 @@ fn insert_leaf(
             for i in idx..old_node.nkeys() {
                 let k = old_node.entry(i).key_bytes();
                 let v = old_node.value_bytes(i);
-                new_node.entry_mut(i + 1).set_key(&k);
-                new_node.set_value(i + 1, &v);
+                new_node.entry_mut(i + 1).set_key(k);
+                new_node.set_value(i + 1, v);
             }
             new_node.set_nkeys(old_node.nkeys() + 1);
             block_map.insert(new_block, *new_node);
@@ -631,7 +639,10 @@ mod tests {
     fn test_single_insert_and_find() {
         let mut tree = Btree::new();
         tree.insert(&key(1), &val(1)).unwrap();
-        assert_eq!(tree.find(&key(1)).unwrap().as_deref(), Some(val(1).as_slice()));
+        assert_eq!(
+            tree.find(&key(1)).unwrap().as_deref(),
+            Some(val(1).as_slice())
+        );
         assert_eq!(tree.find(&key(99)).unwrap().as_deref(), None);
         tree.verify();
     }
@@ -665,16 +676,28 @@ mod tests {
         tree.insert(&key(30), &val(30)).unwrap();
 
         assert_eq!(
-            find(&tree.block_map, old_root_block, &key(10)).unwrap().as_deref(),
+            find(&tree.block_map, old_root_block, &key(10))
+                .unwrap()
+                .as_deref(),
             Some(val(10).as_slice())
         );
         assert_eq!(
-            find(&tree.block_map, old_root_block, &key(20)).unwrap().as_deref(),
+            find(&tree.block_map, old_root_block, &key(20))
+                .unwrap()
+                .as_deref(),
             Some(val(20).as_slice())
         );
-        assert_eq!(find(&tree.block_map, old_root_block, &key(30)).unwrap().as_deref(), None);
+        assert_eq!(
+            find(&tree.block_map, old_root_block, &key(30))
+                .unwrap()
+                .as_deref(),
+            None
+        );
 
-        assert_eq!(tree.find(&key(30)).unwrap().as_deref(), Some(val(30).as_slice()));
+        assert_eq!(
+            tree.find(&key(30)).unwrap().as_deref(),
+            Some(val(30).as_slice())
+        );
         tree.verify();
     }
 
@@ -715,10 +738,16 @@ mod tests {
     fn test_overwrite() {
         let mut tree = Btree::new();
         tree.insert(&key(1), b"old").unwrap();
-        assert_eq!(tree.find(&key(1)).unwrap().as_deref(), Some(b"old".as_slice()));
+        assert_eq!(
+            tree.find(&key(1)).unwrap().as_deref(),
+            Some(b"old".as_slice())
+        );
 
         tree.insert(&key(1), b"new").unwrap();
-        assert_eq!(tree.find(&key(1)).unwrap().as_deref(), Some(b"new".as_slice()));
+        assert_eq!(
+            tree.find(&key(1)).unwrap().as_deref(),
+            Some(b"new".as_slice())
+        );
         tree.verify();
     }
 
@@ -740,7 +769,10 @@ mod tests {
             tree.insert(&key(i), &val(i)).unwrap();
         }
         for i in 0..n {
-            assert_eq!(tree.find(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()));
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i).as_slice())
+            );
         }
         tree.verify();
     }
@@ -816,7 +848,10 @@ mod tests {
             }
         }
 
-        assert_eq!(count_keys(&tree.block_map, tree.root_block), reference.len());
+        assert_eq!(
+            count_keys(&tree.block_map, tree.root_block),
+            reference.len()
+        );
         tree.verify();
     }
 
@@ -839,9 +874,15 @@ mod tests {
         }
 
         for (&k, &v) in &reference {
-            assert_eq!(tree.find(&key(k)).unwrap().as_deref(), Some(val(v).as_slice()));
+            assert_eq!(
+                tree.find(&key(k)).unwrap().as_deref(),
+                Some(val(v).as_slice())
+            );
         }
-        assert_eq!(count_keys(&tree.block_map, tree.root_block), reference.len());
+        assert_eq!(
+            count_keys(&tree.block_map, tree.root_block),
+            reference.len()
+        );
         tree.verify();
     }
 
@@ -859,11 +900,18 @@ mod tests {
 
         // Tree should have grown beyond level 1.
         let root = &tree.block_map[&tree.root_block];
-        assert!(root.level() >= 2, "expected multi-level tree, got level {}", root.level());
+        assert!(
+            root.level() >= 2,
+            "expected multi-level tree, got level {}",
+            root.level()
+        );
 
         // Every key must still be findable.
         for i in 0..n {
-            assert_eq!(tree.find(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()));
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i).as_slice())
+            );
         }
         assert_eq!(count_keys(&tree.block_map, tree.root_block), n as usize);
         tree.verify();
@@ -885,9 +933,15 @@ mod tests {
         assert_eq!(tree.block_map[&tree.root_block].level(), 1);
 
         for i in 0..=max {
-            assert_eq!(tree.find(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()));
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i).as_slice())
+            );
         }
-        assert_eq!(count_keys(&tree.block_map, tree.root_block), (max + 1) as usize);
+        assert_eq!(
+            count_keys(&tree.block_map, tree.root_block),
+            (max + 1) as usize
+        );
         tree.verify();
     }
 
@@ -902,7 +956,10 @@ mod tests {
         // Key at exactly MAX_KEY_SIZE.
         let full_key = vec![0xABu8; MAX_KEY_SIZE];
         tree.insert(&full_key, b"full").unwrap();
-        assert_eq!(tree.find(&full_key).unwrap().as_deref(), Some(b"full".as_slice()));
+        assert_eq!(
+            tree.find(&full_key).unwrap().as_deref(),
+            Some(b"full".as_slice())
+        );
 
         // Key exceeding MAX_KEY_SIZE — should be silently truncated.
         let long_key = vec![0xCDu8; MAX_KEY_SIZE + 100];
@@ -910,7 +967,10 @@ mod tests {
         // The stored key is truncated to MAX_KEY_SIZE, so looking up the
         // truncated version should find it.
         let truncated_key = vec![0xCDu8; MAX_KEY_SIZE];
-        assert_eq!(tree.find(&truncated_key).unwrap().as_deref(), Some(b"truncated".as_slice()));
+        assert_eq!(
+            tree.find(&truncated_key).unwrap().as_deref(),
+            Some(b"truncated".as_slice())
+        );
 
         // A key of a different length but same prefix should NOT match.
         let short_key = vec![0xCDu8; MAX_KEY_SIZE - 1];
@@ -923,7 +983,10 @@ mod tests {
     fn test_empty_key() {
         let mut tree = Btree::new();
         tree.insert(b"", b"empty-key").unwrap();
-        assert_eq!(tree.find(b"").unwrap().as_deref(), Some(b"empty-key".as_slice()));
+        assert_eq!(
+            tree.find(b"").unwrap().as_deref(),
+            Some(b"empty-key".as_slice())
+        );
         assert_eq!(tree.find(b"x").unwrap().as_deref(), None);
         tree.verify();
     }
@@ -945,13 +1008,19 @@ mod tests {
         let mut tree = Btree::new();
         let full_val = vec![0x42u8; MAX_VALUE_SIZE];
         tree.insert(&key(1), &full_val).unwrap();
-        assert_eq!(tree.find(&key(1)).unwrap().as_deref(), Some(full_val.as_slice()));
+        assert_eq!(
+            tree.find(&key(1)).unwrap().as_deref(),
+            Some(full_val.as_slice())
+        );
 
         // Value exceeding MAX_VALUE_SIZE — truncated.
         let long_val = vec![0x99u8; MAX_VALUE_SIZE + 50];
         tree.insert(&key(2), &long_val).unwrap();
         let truncated_val = vec![0x99u8; MAX_VALUE_SIZE];
-        assert_eq!(tree.find(&key(2)).unwrap().as_deref(), Some(truncated_val.as_slice()));
+        assert_eq!(
+            tree.find(&key(2)).unwrap().as_deref(),
+            Some(truncated_val.as_slice())
+        );
 
         tree.verify();
     }
@@ -975,14 +1044,18 @@ mod tests {
         for &(last_key, snap_root) in &snapshots {
             for i in 0..=last_key {
                 assert_eq!(
-                    find(&tree.block_map, snap_root, &key(i)).unwrap().as_deref(),
+                    find(&tree.block_map, snap_root, &key(i))
+                        .unwrap()
+                        .as_deref(),
                     Some(val(i).as_slice()),
                     "snapshot after key {last_key}: key {i} missing"
                 );
             }
             // Key just beyond the snapshot should not exist.
             assert_eq!(
-                find(&tree.block_map, snap_root, &key(last_key + 1)).unwrap().as_deref(),
+                find(&tree.block_map, snap_root, &key(last_key + 1))
+                    .unwrap()
+                    .as_deref(),
                 None,
                 "snapshot after key {last_key}: key {} unexpectedly present",
                 last_key + 1
@@ -1001,9 +1074,18 @@ mod tests {
 
         // Overwrite key(1) — old snapshot should still see "v1".
         tree.insert(&key(1), b"v1-new").unwrap();
-        assert_eq!(tree.find(&key(1)).unwrap().as_deref(), Some(b"v1-new".as_slice()));
-        assert_eq!(find(&tree.block_map, snap, &key(1)).unwrap().as_deref(), Some(b"v1".as_slice()));
-        assert_eq!(find(&tree.block_map, snap, &key(2)).unwrap().as_deref(), Some(b"v2".as_slice()));
+        assert_eq!(
+            tree.find(&key(1)).unwrap().as_deref(),
+            Some(b"v1-new".as_slice())
+        );
+        assert_eq!(
+            find(&tree.block_map, snap, &key(1)).unwrap().as_deref(),
+            Some(b"v1".as_slice())
+        );
+        assert_eq!(
+            find(&tree.block_map, snap, &key(2)).unwrap().as_deref(),
+            Some(b"v2".as_slice())
+        );
         tree.verify();
     }
 
@@ -1056,7 +1138,10 @@ mod tests {
             tree.insert(&key(i), &val(i)).unwrap();
         }
         for i in 0..n {
-            assert_eq!(tree.find(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()));
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i).as_slice())
+            );
         }
         assert_eq!(count_keys(&tree.block_map, tree.root_block), n as usize);
 
@@ -1081,9 +1166,15 @@ mod tests {
         }
 
         for (&k, &v) in &reference {
-            assert_eq!(tree.find(&key(k)).unwrap().as_deref(), Some(val(v).as_slice()));
+            assert_eq!(
+                tree.find(&key(k)).unwrap().as_deref(),
+                Some(val(v).as_slice())
+            );
         }
-        assert_eq!(count_keys(&tree.block_map, tree.root_block), reference.len());
+        assert_eq!(
+            count_keys(&tree.block_map, tree.root_block),
+            reference.len()
+        );
         tree.verify();
     }
 
@@ -1117,7 +1208,10 @@ mod tests {
 
         // Verify all values.
         for (&k, &v) in &reference {
-            assert_eq!(tree.find(&key(k)).unwrap().as_deref(), Some(val(v).as_slice()));
+            assert_eq!(
+                tree.find(&key(k)).unwrap().as_deref(),
+                Some(val(v).as_slice())
+            );
         }
         tree.verify();
     }
@@ -1131,10 +1225,7 @@ mod tests {
         assert!(!depths.is_empty(), "tree has no leaves");
         let first = depths[0];
         for (i, &d) in depths.iter().enumerate() {
-            assert_eq!(
-                d, first,
-                "leaf {i} is at depth {d}, expected {first}"
-            );
+            assert_eq!(d, first, "leaf {i} is at depth {d}, expected {first}");
         }
         first
     }
@@ -1226,7 +1317,10 @@ mod tests {
         }
 
         // With 20000 keys and branching factor 29, height should be small.
-        assert!(prev_depth <= 5, "unexpectedly deep tree: height={prev_depth}");
+        assert!(
+            prev_depth <= 5,
+            "unexpectedly deep tree: height={prev_depth}"
+        );
         tree.verify();
     }
 
@@ -1244,11 +1338,7 @@ mod tests {
         tree.verify();
     }
 
-    fn check_leaf_fill(
-        block_map: &HashMap<u64, BtreeNodeRaw>,
-        block_nr: u64,
-        min_keys: usize,
-    ) {
+    fn check_leaf_fill(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64, min_keys: usize) {
         let node = &block_map[&block_nr];
         if node.level() == 0 {
             assert!(

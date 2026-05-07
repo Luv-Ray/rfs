@@ -5,7 +5,10 @@ fn main() {
     let mountpoint = match args.get(1) {
         Some(p) => p,
         None => {
-            eprintln!("usage: {} <mountpoint>", args.first().map(String::as_str).unwrap_or("rfs"));
+            eprintln!(
+                "usage: {} <mountpoint>",
+                args.first().map(String::as_str).unwrap_or("rfs")
+            );
             std::process::exit(2);
         }
     };
