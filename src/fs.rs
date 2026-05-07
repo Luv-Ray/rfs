@@ -96,9 +96,13 @@ pub struct InodeV1 {
     pub atime: u64,
     pub mtime: u64,
     pub ctime: u64,
+    /// Parent directory inode. For the root directory this self-references
+    /// `ROOT_INO` so `cd ..` from `/` stays put. Hardlinks are not supported,
+    /// so each inode has exactly one parent.
+    pub parent_ino: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<InodeV1>() == 48);
+const _: () = assert!(std::mem::size_of::<InodeV1>() == 56);
 const _: () = assert!(std::mem::size_of::<InodeV1>() <= MAX_VALUE_SIZE);
 
 #[repr(C)]
@@ -262,6 +266,7 @@ mod tests {
             atime: 10,
             mtime: 20,
             ctime: 30,
+            parent_ino: ROOT_INO,
         }
     }
 

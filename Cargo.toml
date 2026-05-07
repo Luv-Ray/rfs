@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 zerocopy = { version = "0.8", features = ["derive"] }
+fuser = { version = "0.17", default-features = false }
+libc = "0.2"
