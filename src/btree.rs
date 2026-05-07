@@ -2,6 +2,26 @@ use std::collections::HashMap;
 
 use crate::block_btree::{BtreeNodeRaw, MAGIC_NUMBER, MAX_ENTRIES, MAX_INTERNAL_KEYS};
 
+#[derive(Debug)]
+pub enum Error {
+    /// A block referenced by the tree is missing from the block map.
+    /// On a real block device this would cover both I/O failure and
+    /// an inconsistent tree pointing at an unallocated block.
+    BlockNotFound(u64),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::BlockNotFound(nr) => write!(f, "block {nr} not found"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
 /// COW B-tree: all mutations produce new nodes; old nodes remain reachable
 /// via their block numbers (key for crash recovery and snapshots).
 pub struct Btree {
@@ -22,25 +42,26 @@ impl Btree {
         }
     }
 
-    pub fn find(&self, key: &[u8]) -> Option<&[u8]> {
+    pub fn find(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         find(&self.block_map, self.root_block, key)
     }
 
-    pub fn insert(&mut self, key: &[u8], value: &[u8]) {
+    pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let new_root = insert(
             &mut self.block_map,
             &mut self.next_block_nr,
             self.root_block,
             key,
             value,
-        );
+        )?;
         self.root_block = new_root;
+        Ok(())
     }
 
-    pub fn range_scan(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub fn range_scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut results = Vec::new();
-        range_scan(&self.block_map, self.root_block, start, end, &mut results);
-        results
+        range_scan(&self.block_map, self.root_block, start, end, &mut results)?;
+        Ok(results)
     }
 
     pub fn dump(&self) {
@@ -192,16 +213,20 @@ fn clone_to_heap(node: &BtreeNodeRaw) -> Box<BtreeNodeRaw> {
 
 // ---------- Recursive operations ----------
 
-fn find<'a>(
-    block_map: &'a HashMap<u64, BtreeNodeRaw>,
+fn read_block(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64) -> Result<&BtreeNodeRaw> {
+    block_map.get(&block_nr).ok_or(Error::BlockNotFound(block_nr))
+}
+
+fn find(
+    block_map: &HashMap<u64, BtreeNodeRaw>,
     block_nr: u64,
     key: &[u8],
-) -> Option<&'a [u8]> {
-    let node = &block_map[&block_nr];
+) -> Result<Option<Vec<u8>>> {
+    let node = read_block(block_map, block_nr)?;
     match node.search(key) {
         Ok(idx) => {
             if node.level() == 0 {
-                Some(node.value_bytes(idx))
+                Ok(Some(node.value_bytes(idx).to_vec()))
             } else {
                 // Separator-in-right: the matching key is the separator itself,
                 // so the value lives in the right subtree (child idx+1).
@@ -210,7 +235,7 @@ fn find<'a>(
         }
         Err(idx) => {
             if node.level() == 0 {
-                None
+                Ok(None)
             } else {
                 find(block_map, node.child_block(idx), key)
             }
@@ -225,9 +250,9 @@ fn insert(
     block_nr: u64,
     key: &[u8],
     value: &[u8],
-) -> u64 {
+) -> Result<u64> {
     // COW: clone before mutating so the original block stays intact.
-    let old_node = clone_to_heap(&block_map[&block_nr]);
+    let old_node = clone_to_heap(read_block(block_map, block_nr)?);
     if old_node.level() == 0 {
         insert_leaf(block_map, next_block_nr, &old_node, key, value)
     } else {
@@ -241,7 +266,7 @@ fn insert_leaf(
     old_node: &BtreeNodeRaw,
     key: &[u8],
     value: &[u8],
-) -> u64 {
+) -> Result<u64> {
     // Leaf is full — split first, then insert into the correct child.
     // This may cascade if the child also splits.
     if old_node.nkeys() >= MAX_ENTRIES {
@@ -257,28 +282,28 @@ fn insert_leaf(
             .set_child_block(1, right_block);
 
         let (child_idx, child_nr) = {
-            let root = &block_map[&new_root_block];
+            let root = read_block(block_map, new_root_block)?;
             let child_idx = match root.search(key) {
                 Ok(i) => i + 1,
                 Err(i) => i,
             };
             (child_idx, root.child_block(child_idx))
         };
-        let child_level = block_map[&child_nr].level();
-        let new_child_nr = insert(block_map, next_block_nr, child_nr, key, value);
+        let child_level = read_block(block_map, child_nr)?.level();
+        let new_child_nr = insert(block_map, next_block_nr, child_nr, key, value)?;
 
-        let new_child_level = block_map[&new_child_nr].level();
+        let new_child_level = read_block(block_map, new_child_nr)?.level();
         if new_child_level > child_level {
             // Child itself split — promote its median to the new root.
             let (median_key, left, right) = {
-                let new_child = &block_map[&new_child_nr];
+                let new_child = read_block(block_map, new_child_nr)?;
                 (
                     new_child.entry(0).key_bytes().to_vec(),
                     new_child.child_block(0),
                     new_child.child_block(1),
                 )
             };
-            let parent = clone_to_heap(&block_map[&new_root_block]);
+            let parent = clone_to_heap(read_block(block_map, new_root_block)?);
             return promote_to_parent(
                 block_map,
                 next_block_nr,
@@ -294,7 +319,7 @@ fn insert_leaf(
             .get_mut(&new_root_block)
             .unwrap()
             .set_child_block(child_idx, new_child_nr);
-        return new_root_block;
+        return Ok(new_root_block);
     }
 
     match old_node.search(key) {
@@ -305,7 +330,7 @@ fn insert_leaf(
             let mut new_node = clone_to_heap(old_node);
             new_node.set_value(idx, value);
             block_map.insert(new_block, *new_node);
-            new_block
+            Ok(new_block)
         }
         Err(idx) => {
             // New key — build a fresh leaf with the entry inserted at idx.
@@ -329,7 +354,7 @@ fn insert_leaf(
             }
             new_node.set_nkeys(old_node.nkeys() + 1);
             block_map.insert(new_block, *new_node);
-            new_block
+            Ok(new_block)
         }
     }
 }
@@ -340,20 +365,20 @@ fn insert_internal(
     old_node: &BtreeNodeRaw,
     key: &[u8],
     value: &[u8],
-) -> u64 {
+) -> Result<u64> {
     let child_idx = match old_node.search(key) {
         Ok(i) => i + 1,
         Err(i) => i,
     };
     let child_nr = old_node.child_block(child_idx);
-    let child_level = block_map[&child_nr].level();
+    let child_level = read_block(block_map, child_nr)?.level();
 
-    let new_child_nr = insert(block_map, next_block_nr, child_nr, key, value);
+    let new_child_nr = insert(block_map, next_block_nr, child_nr, key, value)?;
 
     // Child split and grew a level — promote its median key to this level.
-    let new_child_level = block_map[&new_child_nr].level();
+    let new_child_level = read_block(block_map, new_child_nr)?.level();
     if new_child_level > child_level {
-        let new_child = &block_map[&new_child_nr];
+        let new_child = read_block(block_map, new_child_nr)?;
         let median_key = new_child.entry(0).key_bytes().to_vec();
         let left = new_child.child_block(0);
         let right = new_child.child_block(1);
@@ -376,7 +401,7 @@ fn insert_internal(
     let mut new_node = clone_to_heap(old_node);
     new_node.set_child_block(child_idx, new_child_nr);
     block_map.insert(new_block, *new_node);
-    new_block
+    Ok(new_block)
 }
 
 // ---------- Split & promote ----------
@@ -479,7 +504,7 @@ fn promote_to_parent(
     median_key: &[u8],
     left_child: u64,
     right_child: u64,
-) -> u64 {
+) -> Result<u64> {
     debug_assert!(old_parent.level() > 0);
     debug_assert!(child_idx <= old_parent.nkeys());
 
@@ -509,7 +534,7 @@ fn promote_to_parent(
 
     if new_node.nkeys() <= MAX_INTERNAL_KEYS {
         block_map.insert(new_block, *new_node);
-        new_block
+        Ok(new_block)
     } else {
         let (new_root, new_left, new_right) =
             split_internal_node(block_map, next_block_nr, &new_node);
@@ -521,7 +546,7 @@ fn promote_to_parent(
             .get_mut(&new_root)
             .unwrap()
             .set_child_block(1, new_right);
-        new_root
+        Ok(new_root)
     }
 }
 
@@ -533,8 +558,8 @@ fn range_scan(
     start: &[u8],
     end: &[u8],
     results: &mut Vec<(Vec<u8>, Vec<u8>)>,
-) {
-    let node = &block_map[&block_nr];
+) -> Result<()> {
+    let node = read_block(block_map, block_nr)?;
     if node.level() == 0 {
         for i in 0..node.nkeys() {
             let k = node.entry(i).key_bytes();
@@ -552,15 +577,16 @@ fn range_scan(
             i = nchildren - 1;
         }
         while i < nchildren {
-            range_scan(block_map, node.child_block(i), start, end, results);
+            range_scan(block_map, node.child_block(i), start, end, results)?;
             // Separator-in-right: once a separator >= end, all further
             // subtrees are out of range.
             if i < node.nkeys() && node.entry(i).key_bytes() >= end {
-                return;
+                return Ok(());
             }
             i += 1;
         }
     }
+    Ok(())
 }
 
 fn dump(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64, indent: usize) {
@@ -604,9 +630,9 @@ mod tests {
     #[test]
     fn test_single_insert_and_find() {
         let mut tree = Btree::new();
-        tree.insert(&key(1), &val(1));
-        assert_eq!(tree.find(&key(1)), Some(val(1).as_slice()));
-        assert_eq!(tree.find(&key(99)), None);
+        tree.insert(&key(1), &val(1)).unwrap();
+        assert_eq!(tree.find(&key(1)).unwrap().as_deref(), Some(val(1).as_slice()));
+        assert_eq!(tree.find(&key(99)).unwrap().as_deref(), None);
         tree.verify();
     }
 
@@ -615,40 +641,40 @@ mod tests {
         let mut tree = Btree::new();
         let n = 1000u32;
         for i in 0..n {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
         for i in 0..n {
             assert_eq!(
-                tree.find(&key(i)),
+                tree.find(&key(i)).unwrap().as_deref(),
                 Some(val(i).as_slice()),
                 "key {i} not found"
             );
         }
-        assert_eq!(tree.find(&key(u32::MAX)), None);
+        assert_eq!(tree.find(&key(u32::MAX)).unwrap().as_deref(), None);
         tree.verify();
     }
 
     #[test]
     fn test_cow_preserves_old_root() {
         let mut tree = Btree::new();
-        tree.insert(&key(10), &val(10));
-        tree.insert(&key(20), &val(20));
+        tree.insert(&key(10), &val(10)).unwrap();
+        tree.insert(&key(20), &val(20)).unwrap();
 
         let old_root_block = tree.root_block;
 
-        tree.insert(&key(30), &val(30));
+        tree.insert(&key(30), &val(30)).unwrap();
 
         assert_eq!(
-            find(&tree.block_map, old_root_block, &key(10)),
+            find(&tree.block_map, old_root_block, &key(10)).unwrap().as_deref(),
             Some(val(10).as_slice())
         );
         assert_eq!(
-            find(&tree.block_map, old_root_block, &key(20)),
+            find(&tree.block_map, old_root_block, &key(20)).unwrap().as_deref(),
             Some(val(20).as_slice())
         );
-        assert_eq!(find(&tree.block_map, old_root_block, &key(30)), None);
+        assert_eq!(find(&tree.block_map, old_root_block, &key(30)).unwrap().as_deref(), None);
 
-        assert_eq!(tree.find(&key(30)), Some(val(30).as_slice()));
+        assert_eq!(tree.find(&key(30)).unwrap().as_deref(), Some(val(30).as_slice()));
         tree.verify();
     }
 
@@ -657,11 +683,11 @@ mod tests {
         let mut tree = Btree::new();
         let n = 2000u32;
         for i in 0..n {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
         for i in 0..n {
             assert_eq!(
-                tree.find(&key(i)),
+                tree.find(&key(i)).unwrap().as_deref(),
                 Some(val(i).as_slice()),
                 "key {i} not found"
             );
@@ -673,11 +699,11 @@ mod tests {
     fn test_range_scan() {
         let mut tree = Btree::new();
         for i in 0u32..5000 {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
         tree.verify();
 
-        let results = tree.range_scan(&key(10), &key(20));
+        let results = tree.range_scan(&key(10), &key(20)).unwrap();
         assert_eq!(results.len(), 10);
         for (j, (k, v)) in results.iter().enumerate() {
             assert_eq!(k.as_slice(), &key(10 + j as u32));
@@ -688,11 +714,11 @@ mod tests {
     #[test]
     fn test_overwrite() {
         let mut tree = Btree::new();
-        tree.insert(&key(1), b"old");
-        assert_eq!(tree.find(&key(1)), Some(b"old".as_slice()));
+        tree.insert(&key(1), b"old").unwrap();
+        assert_eq!(tree.find(&key(1)).unwrap().as_deref(), Some(b"old".as_slice()));
 
-        tree.insert(&key(1), b"new");
-        assert_eq!(tree.find(&key(1)), Some(b"new".as_slice()));
+        tree.insert(&key(1), b"new").unwrap();
+        assert_eq!(tree.find(&key(1)).unwrap().as_deref(), Some(b"new".as_slice()));
         tree.verify();
     }
 
@@ -700,7 +726,7 @@ mod tests {
     fn test_dump() {
         let mut tree = Btree::new();
         for i in 0u32..10 {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
         tree.dump();
         tree.verify();
@@ -711,10 +737,10 @@ mod tests {
         let mut tree = Btree::new();
         let n = 2000u32;
         for i in (0..n).rev() {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
         for i in 0..n {
-            assert_eq!(tree.find(&key(i)), Some(val(i).as_slice()));
+            assert_eq!(tree.find(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()));
         }
         tree.verify();
     }
@@ -769,14 +795,14 @@ mod tests {
         for _ in 0..n {
             let k = rng.next_u32();
             let v = rng.next_u32();
-            tree.insert(&key(k), &val(v));
+            tree.insert(&key(k), &val(v)).unwrap();
             reference.insert(k, v);
         }
 
         // Verify every inserted key can be found with the correct value.
         for (&k, &v) in &reference {
             assert_eq!(
-                tree.find(&key(k)),
+                tree.find(&key(k)).unwrap().as_deref(),
                 Some(val(v).as_slice()),
                 "random key {k} not found or value mismatch"
             );
@@ -786,7 +812,7 @@ mod tests {
         for _ in 0..100 {
             let probe = rng.next_u32();
             if !reference.contains_key(&probe) {
-                assert_eq!(tree.find(&key(probe)), None);
+                assert_eq!(tree.find(&key(probe)).unwrap().as_deref(), None);
             }
         }
 
@@ -802,18 +828,18 @@ mod tests {
 
         // Insert, then overwrite a subset.
         for i in 0..2000u32 {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
             reference.insert(i, i);
         }
         for _ in 0..1000 {
             let k = rng.next_u32() % 2000;
             let v = rng.next_u32();
-            tree.insert(&key(k), &val(v));
+            tree.insert(&key(k), &val(v)).unwrap();
             reference.insert(k, v);
         }
 
         for (&k, &v) in &reference {
-            assert_eq!(tree.find(&key(k)), Some(val(v).as_slice()));
+            assert_eq!(tree.find(&key(k)).unwrap().as_deref(), Some(val(v).as_slice()));
         }
         assert_eq!(count_keys(&tree.block_map, tree.root_block), reference.len());
         tree.verify();
@@ -828,7 +854,7 @@ mod tests {
         let mut tree = Btree::new();
         let n = 2000u32;
         for i in 0..n {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
 
         // Tree should have grown beyond level 1.
@@ -837,7 +863,7 @@ mod tests {
 
         // Every key must still be findable.
         for i in 0..n {
-            assert_eq!(tree.find(&key(i)), Some(val(i).as_slice()));
+            assert_eq!(tree.find(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()));
         }
         assert_eq!(count_keys(&tree.block_map, tree.root_block), n as usize);
         tree.verify();
@@ -849,17 +875,17 @@ mod tests {
         let mut tree = Btree::new();
         let max = crate::block_btree::MAX_ENTRIES as u32;
         for i in 0..max {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
         // Root should still be a leaf.
         assert_eq!(tree.block_map[&tree.root_block].level(), 0);
 
         // One more triggers a split.
-        tree.insert(&key(max), &val(max));
+        tree.insert(&key(max), &val(max)).unwrap();
         assert_eq!(tree.block_map[&tree.root_block].level(), 1);
 
         for i in 0..=max {
-            assert_eq!(tree.find(&key(i)), Some(val(i).as_slice()));
+            assert_eq!(tree.find(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()));
         }
         assert_eq!(count_keys(&tree.block_map, tree.root_block), (max + 1) as usize);
         tree.verify();
@@ -875,20 +901,20 @@ mod tests {
 
         // Key at exactly MAX_KEY_SIZE.
         let full_key = vec![0xABu8; MAX_KEY_SIZE];
-        tree.insert(&full_key, b"full");
-        assert_eq!(tree.find(&full_key), Some(b"full".as_slice()));
+        tree.insert(&full_key, b"full").unwrap();
+        assert_eq!(tree.find(&full_key).unwrap().as_deref(), Some(b"full".as_slice()));
 
         // Key exceeding MAX_KEY_SIZE — should be silently truncated.
         let long_key = vec![0xCDu8; MAX_KEY_SIZE + 100];
-        tree.insert(&long_key, b"truncated");
+        tree.insert(&long_key, b"truncated").unwrap();
         // The stored key is truncated to MAX_KEY_SIZE, so looking up the
         // truncated version should find it.
         let truncated_key = vec![0xCDu8; MAX_KEY_SIZE];
-        assert_eq!(tree.find(&truncated_key), Some(b"truncated".as_slice()));
+        assert_eq!(tree.find(&truncated_key).unwrap().as_deref(), Some(b"truncated".as_slice()));
 
         // A key of a different length but same prefix should NOT match.
         let short_key = vec![0xCDu8; MAX_KEY_SIZE - 1];
-        assert_eq!(tree.find(&short_key), None);
+        assert_eq!(tree.find(&short_key).unwrap().as_deref(), None);
 
         tree.verify();
     }
@@ -896,9 +922,9 @@ mod tests {
     #[test]
     fn test_empty_key() {
         let mut tree = Btree::new();
-        tree.insert(b"", b"empty-key");
-        assert_eq!(tree.find(b""), Some(b"empty-key".as_slice()));
-        assert_eq!(tree.find(b"x"), None);
+        tree.insert(b"", b"empty-key").unwrap();
+        assert_eq!(tree.find(b"").unwrap().as_deref(), Some(b"empty-key".as_slice()));
+        assert_eq!(tree.find(b"x").unwrap().as_deref(), None);
         tree.verify();
     }
 
@@ -907,8 +933,8 @@ mod tests {
     #[test]
     fn test_empty_value() {
         let mut tree = Btree::new();
-        tree.insert(&key(1), b"");
-        assert_eq!(tree.find(&key(1)), Some(b"".as_slice()));
+        tree.insert(&key(1), b"").unwrap();
+        assert_eq!(tree.find(&key(1)).unwrap().as_deref(), Some(b"".as_slice()));
         tree.verify();
     }
 
@@ -918,14 +944,14 @@ mod tests {
 
         let mut tree = Btree::new();
         let full_val = vec![0x42u8; MAX_VALUE_SIZE];
-        tree.insert(&key(1), &full_val);
-        assert_eq!(tree.find(&key(1)), Some(full_val.as_slice()));
+        tree.insert(&key(1), &full_val).unwrap();
+        assert_eq!(tree.find(&key(1)).unwrap().as_deref(), Some(full_val.as_slice()));
 
         // Value exceeding MAX_VALUE_SIZE — truncated.
         let long_val = vec![0x99u8; MAX_VALUE_SIZE + 50];
-        tree.insert(&key(2), &long_val);
+        tree.insert(&key(2), &long_val).unwrap();
         let truncated_val = vec![0x99u8; MAX_VALUE_SIZE];
-        assert_eq!(tree.find(&key(2)), Some(truncated_val.as_slice()));
+        assert_eq!(tree.find(&key(2)).unwrap().as_deref(), Some(truncated_val.as_slice()));
 
         tree.verify();
     }
@@ -939,7 +965,7 @@ mod tests {
 
         // Take a snapshot (save root_block) after every 100 inserts.
         for i in 0u32..500 {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
             if i % 100 == 99 {
                 snapshots.push((i, tree.root_block));
             }
@@ -949,14 +975,14 @@ mod tests {
         for &(last_key, snap_root) in &snapshots {
             for i in 0..=last_key {
                 assert_eq!(
-                    find(&tree.block_map, snap_root, &key(i)),
+                    find(&tree.block_map, snap_root, &key(i)).unwrap().as_deref(),
                     Some(val(i).as_slice()),
                     "snapshot after key {last_key}: key {i} missing"
                 );
             }
             // Key just beyond the snapshot should not exist.
             assert_eq!(
-                find(&tree.block_map, snap_root, &key(last_key + 1)),
+                find(&tree.block_map, snap_root, &key(last_key + 1)).unwrap().as_deref(),
                 None,
                 "snapshot after key {last_key}: key {} unexpectedly present",
                 last_key + 1
@@ -969,15 +995,15 @@ mod tests {
     #[test]
     fn test_cow_after_overwrite() {
         let mut tree = Btree::new();
-        tree.insert(&key(1), b"v1");
-        tree.insert(&key(2), b"v2");
+        tree.insert(&key(1), b"v1").unwrap();
+        tree.insert(&key(2), b"v2").unwrap();
         let snap = tree.root_block;
 
         // Overwrite key(1) — old snapshot should still see "v1".
-        tree.insert(&key(1), b"v1-new");
-        assert_eq!(tree.find(&key(1)), Some(b"v1-new".as_slice()));
-        assert_eq!(find(&tree.block_map, snap, &key(1)), Some(b"v1".as_slice()));
-        assert_eq!(find(&tree.block_map, snap, &key(2)), Some(b"v2".as_slice()));
+        tree.insert(&key(1), b"v1-new").unwrap();
+        assert_eq!(tree.find(&key(1)).unwrap().as_deref(), Some(b"v1-new".as_slice()));
+        assert_eq!(find(&tree.block_map, snap, &key(1)).unwrap().as_deref(), Some(b"v1".as_slice()));
+        assert_eq!(find(&tree.block_map, snap, &key(2)).unwrap().as_deref(), Some(b"v2".as_slice()));
         tree.verify();
     }
 
@@ -987,10 +1013,10 @@ mod tests {
     fn test_range_scan_empty() {
         let mut tree = Btree::new();
         for i in 0..100u32 {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
         // Range that contains nothing.
-        let results = tree.range_scan(&key(200), &key(300));
+        let results = tree.range_scan(&key(200), &key(300)).unwrap();
         assert!(results.is_empty());
     }
 
@@ -998,9 +1024,9 @@ mod tests {
     fn test_range_scan_single_element() {
         let mut tree = Btree::new();
         for i in 0..100u32 {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
-        let results = tree.range_scan(&key(50), &key(51));
+        let results = tree.range_scan(&key(50), &key(51)).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.as_slice(), &key(50));
     }
@@ -1010,9 +1036,9 @@ mod tests {
         let mut tree = Btree::new();
         let n = 500u32;
         for i in 0..n {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
-        let results = tree.range_scan(&key(0), &key(u32::MAX));
+        let results = tree.range_scan(&key(0), &key(u32::MAX)).unwrap();
         assert_eq!(results.len(), n as usize);
         for (i, (k, v)) in results.iter().enumerate() {
             assert_eq!(k.as_slice(), &key(i as u32));
@@ -1027,10 +1053,10 @@ mod tests {
         let mut tree = Btree::new();
         let n = 10_000u32;
         for i in 0..n {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
         for i in 0..n {
-            assert_eq!(tree.find(&key(i)), Some(val(i).as_slice()));
+            assert_eq!(tree.find(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()));
         }
         assert_eq!(count_keys(&tree.block_map, tree.root_block), n as usize);
 
@@ -1050,12 +1076,12 @@ mod tests {
         for _ in 0..20_000u32 {
             let k = rng.next_u32();
             let v = rng.next_u32();
-            tree.insert(&key(k), &val(v));
+            tree.insert(&key(k), &val(v)).unwrap();
             reference.insert(k, v);
         }
 
         for (&k, &v) in &reference {
-            assert_eq!(tree.find(&key(k)), Some(val(v).as_slice()));
+            assert_eq!(tree.find(&key(k)).unwrap().as_deref(), Some(val(v).as_slice()));
         }
         assert_eq!(count_keys(&tree.block_map, tree.root_block), reference.len());
         tree.verify();
@@ -1070,28 +1096,28 @@ mod tests {
 
         // Insert 0..1000.
         for i in 0..1000u32 {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
             reference.insert(i, i);
         }
         assert_eq!(count_keys(&tree.block_map, tree.root_block), 1000);
 
         // Overwrite 500..600 — count should not change.
         for i in 500..600u32 {
-            tree.insert(&key(i), &val(i + 9999));
+            tree.insert(&key(i), &val(i + 9999)).unwrap();
             reference.insert(i, i + 9999);
         }
         assert_eq!(count_keys(&tree.block_map, tree.root_block), 1000);
 
         // Insert new keys 1000..2000.
         for i in 1000..2000u32 {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
             reference.insert(i, i);
         }
         assert_eq!(count_keys(&tree.block_map, tree.root_block), 2000);
 
         // Verify all values.
         for (&k, &v) in &reference {
-            assert_eq!(tree.find(&key(k)), Some(val(v).as_slice()));
+            assert_eq!(tree.find(&key(k)).unwrap().as_deref(), Some(val(v).as_slice()));
         }
         tree.verify();
     }
@@ -1118,7 +1144,7 @@ mod tests {
         let mut tree = Btree::new();
         // Insert enough keys to create multiple levels.
         for i in 0..5000u32 {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
         let depth = assert_balanced(&tree);
         assert!(depth >= 2, "expected multi-level tree, got depth {depth}");
@@ -1129,7 +1155,7 @@ mod tests {
     fn test_balance_reverse_inserts() {
         let mut tree = Btree::new();
         for i in (0..5000u32).rev() {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
         assert_balanced(&tree);
         tree.verify();
@@ -1141,7 +1167,7 @@ mod tests {
         let mut tree = Btree::new();
         for _ in 0..5000u32 {
             let k = rng.next_u32();
-            tree.insert(&key(k), &val(k));
+            tree.insert(&key(k), &val(k)).unwrap();
         }
         assert_balanced(&tree);
         tree.verify();
@@ -1151,11 +1177,11 @@ mod tests {
     fn test_balance_after_overwrites() {
         let mut tree = Btree::new();
         for i in 0..2000u32 {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
         // Overwrite doesn't change tree structure, balance must hold.
         for i in 0..2000u32 {
-            tree.insert(&key(i), &val(i + 99999));
+            tree.insert(&key(i), &val(i + 99999)).unwrap();
         }
         assert_balanced(&tree);
         tree.verify();
@@ -1166,7 +1192,7 @@ mod tests {
         // Insert one key at a time and verify balance after every insert.
         let mut tree = Btree::new();
         for i in 0..2000u32 {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
             assert_balanced(&tree);
         }
         tree.verify();
@@ -1182,7 +1208,7 @@ mod tests {
 
         for n in [50, 500, 5000, 20000u32] {
             for i in prev_n..n {
-                tree.insert(&key(i), &val(i));
+                tree.insert(&key(i), &val(i)).unwrap();
             }
             let depth = assert_balanced(&tree);
 
@@ -1210,7 +1236,7 @@ mod tests {
         // at least MAX_ENTRIES/2 keys. This is the standard B-tree invariant.
         let mut tree = Btree::new();
         for i in 0..5000u32 {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
         }
 
         let min_keys = crate::block_btree::MAX_ENTRIES / 2;
@@ -1243,7 +1269,7 @@ mod tests {
         let mut snapshots = Vec::new();
 
         for i in 0..3000u32 {
-            tree.insert(&key(i), &val(i));
+            tree.insert(&key(i), &val(i)).unwrap();
             if i % 500 == 499 {
                 snapshots.push(tree.root_block);
             }
