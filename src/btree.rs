@@ -137,17 +137,24 @@ impl Btree {
         let Some((_value, visible_snap)) = self.find_visible_with_snap(key, chain)? else {
             return Ok(false);
         };
-        let kind = if visible_snap == snap {
-            // X deletes a key X itself wrote. The matching live entry will
-            // be overwritten in place (same sortable key) — a Deleted
-            // tombstone here only needs to last until the next compaction.
-            EntryKind::Deleted
+        if visible_snap == snap {
+            // Same-snap delete: the live entry sits at sortable_key(key, snap)
+            // in our own tree. Flip its kind to Deleted in place — nkeys is
+            // unchanged, no new bset is opened, no split can be triggered.
+            let (buf, len) = sortable_key(key, snap);
+            let new_root = flip_kind_in_place(
+                &mut self.block_map,
+                &mut self.next_block_nr,
+                self.root_block,
+                &buf[..len],
+                EntryKind::Deleted,
+            )?;
+            self.root_block = new_root;
         } else {
             // Inherited from an ancestor. Must shadow the ancestor's
-            // still-live entry until the relevant snapshots are deleted.
-            EntryKind::Whiteout
-        };
-        self.insert_with_kind(key, snap, kind, &[])?;
+            // still-live entry with a Whiteout written at our snap.
+            self.insert_with_kind(key, snap, EntryKind::Whiteout, &[])?;
+        }
         Ok(true)
     }
 
@@ -358,12 +365,19 @@ impl<'a> Tx<'a> {
         else {
             return Ok(false);
         };
-        let kind = if visible_snap == snap {
-            EntryKind::Deleted
+        if visible_snap == snap {
+            let (buf, len) = sortable_key(key, snap);
+            let new_root = flip_kind_in_place(
+                &mut self.btree.block_map,
+                &mut self.btree.next_block_nr,
+                self.pending_root,
+                &buf[..len],
+                EntryKind::Deleted,
+            )?;
+            self.pending_root = new_root;
         } else {
-            EntryKind::Whiteout
-        };
-        self.insert_with_kind(key, snap, kind, &[])?;
+            self.insert_with_kind(key, snap, EntryKind::Whiteout, &[])?;
+        }
         Ok(true)
     }
 
@@ -754,6 +768,58 @@ fn find_visible_with_snap(
         }
     }
     Ok(None)
+}
+
+/// COW walk that locates `sortable_key` in a leaf and rewrites its `kind`
+/// byte without changing `nkeys` or the bset layout. Used by `delete_at`
+/// when the visible entry already lives at our own snap_id, so we can flip
+/// its kind to `Deleted` instead of writing a fresh tombstone entry (which
+/// would grow the leaf and may force opening a new bset / a split).
+///
+/// Preconditions:
+/// - `sortable_key` is present in the tree (caller verified via
+///   `find_visible_with_snap`).
+/// - The visible entry's snap_id equals the snap encoded in `sortable_key`.
+///
+/// Picks the highest-seq bset that contains the key — that's the entry the
+/// merged read path would return. Flipping any older copy would be shadowed.
+fn flip_kind_in_place(
+    block_map: &mut HashMap<u64, BtreeNodeRaw>,
+    next_block_nr: &mut u64,
+    block_nr: u64,
+    sortable_key: &[u8],
+    new_kind: EntryKind,
+) -> Result<u64> {
+    let old_node = clone_to_heap(read_block(block_map, block_nr)?);
+    let new_block = *next_block_nr;
+    *next_block_nr += 1;
+    let mut new_node = old_node;
+    if new_node.level() == 0 {
+        // Find the entry with the highest seq among bsets that contain
+        // sortable_key; that's the one merged_find would surface.
+        let mut best: Option<(usize, usize, u64)> = None;
+        for b in 0..new_node.bset_count() {
+            if let Ok(idx) = new_node.bset_search(b, sortable_key) {
+                let seq = new_node.bset_header(b).seq;
+                if best.is_none_or(|(_, _, s)| seq > s) {
+                    best = Some((b, idx, seq));
+                }
+            }
+        }
+        let (b, i, _) = best.expect("flip_kind_in_place: key not found in leaf");
+        new_node.entry_at_mut(b, i).set_kind(new_kind);
+    } else {
+        let child_idx = match new_node.search(sortable_key) {
+            Ok(i) => i + 1,
+            Err(i) => i,
+        };
+        let child_nr = new_node.child_block(child_idx);
+        let new_child =
+            flip_kind_in_place(block_map, next_block_nr, child_nr, sortable_key, new_kind)?;
+        new_node.set_child_block(child_idx, new_child);
+    }
+    block_map.insert(new_block, *new_node);
+    Ok(new_block)
 }
 
 /// COW insert — returns the block number of the (possibly new) root.
@@ -2591,10 +2657,12 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_in_newer_bset_shadows_live_in_older_bset() {
+    fn delete_after_fill_keeps_key_invisible() {
         // Write a key, fill the bset to roll over to a new bset, then delete
-        // the key — the tombstone lands in the newer bset. find must return
-        // None despite the live entry still sitting in the older bset.
+        // the key. With the in-place optimization the tombstone now lives
+        // *inside* the original bset (kind flipped from Live to Deleted)
+        // rather than as a fresh entry in the latest bset, but the
+        // observable behavior is identical: find returns None.
         let mut tree = Btree::new();
         for i in 0..(BSET_SOFT_LIMIT as u32 + 2) {
             tree.insert(&key(i), &val(i)).unwrap();
@@ -2609,6 +2677,73 @@ mod tests {
                 tree.find(&key(i)).unwrap().as_deref(),
                 Some(val(i).as_slice())
             );
+        }
+        tree.verify();
+    }
+
+    #[test]
+    fn inplace_delete_does_not_grow_node() {
+        // Delete-of-own-snap-key flips the existing entry's kind in place
+        // rather than sort-inserting a fresh tombstone. nkeys and
+        // bset_count must therefore be unchanged across the delete.
+        let mut tree = Btree::new();
+        for i in 0..(BSET_SOFT_LIMIT as u32 + 2) {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
+        let nkeys_before = {
+            let blk = tree.root_block;
+            tree.block_map[&blk].nkeys()
+        };
+        let bcnt_before = root_leaf_bset_count(&tree);
+        // key(0) lives in bset 0 (older); the in-place flip should target
+        // that bset directly without touching the latest bset.
+        assert!(tree.delete(&key(0)).unwrap());
+        let nkeys_after = {
+            let blk = tree.root_block;
+            tree.block_map[&blk].nkeys()
+        };
+        let bcnt_after = root_leaf_bset_count(&tree);
+        assert_eq!(
+            nkeys_before, nkeys_after,
+            "in-place delete must not grow nkeys ({nkeys_before} -> {nkeys_after})"
+        );
+        assert_eq!(
+            bcnt_before, bcnt_after,
+            "in-place delete must not open a new bset ({bcnt_before} -> {bcnt_after})"
+        );
+        assert_eq!(tree.find(&key(0)).unwrap(), None);
+        tree.verify();
+    }
+
+    #[test]
+    fn inplace_delete_works_across_multiple_bsets() {
+        // Spread keys across all four bsets, then delete a key that lives
+        // in bset 0. The flip must reach the right entry in the right bset
+        // and survive the merged read path.
+        let mut tree = Btree::new();
+        // Pack each bset to soft-limit so we span 4 bsets without splitting.
+        let n = (BSET_SOFT_LIMIT * BSET_TREE_NR_MAX) as u32;
+        for i in 0..n {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
+        let bcnt_before = root_leaf_bset_count(&tree);
+        assert!(
+            bcnt_before >= 2,
+            "test setup needs multiple bsets, got {bcnt_before}"
+        );
+        // Delete one key from each quartile to exercise different bsets.
+        for i in [0u32, n / 4, n / 2, 3 * n / 4] {
+            assert!(tree.delete(&key(i)).unwrap(), "delete key {i} failed");
+        }
+        // Deleted keys are gone; surviving keys still readable.
+        for i in 0..n {
+            let want_present = ![0u32, n / 4, n / 2, 3 * n / 4].contains(&i);
+            let got = tree.find(&key(i)).unwrap();
+            if want_present {
+                assert_eq!(got.as_deref(), Some(val(i).as_slice()), "key {i} lost");
+            } else {
+                assert_eq!(got, None, "key {i} should be deleted");
+            }
         }
         tree.verify();
     }
