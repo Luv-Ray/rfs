@@ -1,6 +1,29 @@
 use std::collections::HashMap;
 
-use crate::block_btree::{BtreeNodeRaw, MAGIC_NUMBER, MAX_ENTRIES, MAX_INTERNAL_KEYS};
+use crate::block_btree::{
+    BtreeNodeRaw, EntryKind, MAGIC_NUMBER, MAX_ENTRIES, MAX_INTERNAL_KEYS, MAX_KEY_SIZE,
+    MAX_LOGICAL_KEY_SIZE, ROOT_SNAP, SNAP_ID_BYTES, SnapId,
+};
+
+/// Build the sortable byte form of a (logical, snap_id) pair on the stack.
+/// Returns a 32-byte buffer with the logical key in `[..n]` and snap_id_be
+/// in `[n..n+4]`; the live slice is `[..n+4]` where `n = logical.len()`.
+fn sortable_key(logical: &[u8], snap: SnapId) -> ([u8; MAX_KEY_SIZE], usize) {
+    assert!(
+        logical.len() <= MAX_LOGICAL_KEY_SIZE,
+        "logical key too long: {} > {MAX_LOGICAL_KEY_SIZE}",
+        logical.len()
+    );
+    let mut buf = [0u8; MAX_KEY_SIZE];
+    let n = logical.len();
+    buf[..n].copy_from_slice(logical);
+    buf[n..n + SNAP_ID_BYTES].copy_from_slice(&snap.to_be_bytes());
+    (buf, n + SNAP_ID_BYTES)
+}
+
+/// One row of `Btree::range_scan_all`: full entry view with snap_id and kind.
+/// Aliased for readability (clippy nags at the inline form).
+pub type AllSnapRow = (Vec<u8>, SnapId, EntryKind, Vec<u8>);
 
 #[derive(Debug)]
 pub enum Error {
@@ -42,26 +65,216 @@ impl Btree {
         }
     }
 
+    /// Find a key at the root snapshot. For snap-aware lookups use [`find_at`].
     pub fn find(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        find(&self.block_map, self.root_block, key)
+        self.find_at(key, ROOT_SNAP)
+    }
+
+    /// Find the value of `(key, snap)`. For Phase 2 this is exact-match only;
+    /// the ancestor walk that makes parent-snapshot keys visible at a child
+    /// snapshot lands in Phase 4.
+    pub fn find_at(&self, key: &[u8], snap: SnapId) -> Result<Option<Vec<u8>>> {
+        let (buf, len) = sortable_key(key, snap);
+        find(&self.block_map, self.root_block, &buf[..len])
     }
 
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.insert_at(key, ROOT_SNAP, value)
+    }
+
+    pub fn insert_at(&mut self, key: &[u8], snap: SnapId, value: &[u8]) -> Result<()> {
+        self.insert_with_kind(key, snap, EntryKind::Live, value)
+    }
+
+    /// Insert (or overwrite) an entry at `(key, snap)` with the given kind.
+    /// Tombstones (Deleted/Whiteout) typically pass an empty `value`.
+    pub fn insert_with_kind(
+        &mut self,
+        key: &[u8],
+        snap: SnapId,
+        kind: EntryKind,
+        value: &[u8],
+    ) -> Result<()> {
+        let (buf, len) = sortable_key(key, snap);
         let new_root = insert(
             &mut self.block_map,
             &mut self.next_block_nr,
             self.root_block,
-            key,
+            &buf[..len],
             value,
+            kind,
         )?;
         self.root_block = new_root;
         Ok(())
     }
 
+    /// Delete `key` at the root snapshot (no ancestor walk). Convenience for
+    /// tests; production paths should use [`delete_at`].
+    pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
+        self.delete_at(key, ROOT_SNAP, &[ROOT_SNAP])
+    }
+
+    /// Delete `key` at `snap`. The snapshot ancestor chain is required to
+    /// determine whether the visible entry comes from `snap` itself
+    /// (→ KEY_TYPE_deleted, trivial tombstone) or from an ancestor
+    /// (→ KEY_TYPE_whiteout, snapshot tombstone shadowing the ancestor).
+    ///
+    /// Returns `true` if a tombstone was written (a visible Live entry was
+    /// found at `snap`), `false` if `key` was already invisible (no-op).
+    pub fn delete_at(&mut self, key: &[u8], snap: SnapId, chain: &[SnapId]) -> Result<bool> {
+        let Some((_value, visible_snap)) = self.find_visible_with_snap(key, chain)? else {
+            return Ok(false);
+        };
+        let kind = if visible_snap == snap {
+            // X deletes a key X itself wrote. The matching live entry will
+            // be overwritten in place (same sortable key) — a Deleted
+            // tombstone here only needs to last until the next compaction.
+            EntryKind::Deleted
+        } else {
+            // Inherited from an ancestor. Must shadow the ancestor's
+            // still-live entry until the relevant snapshots are deleted.
+            EntryKind::Whiteout
+        };
+        self.insert_with_kind(key, snap, kind, &[])?;
+        Ok(true)
+    }
+
+    /// Like `find_visible` but also returns the snap_id at which the visible
+    /// entry was stored. Used by `delete_at` to pick Deleted vs Whiteout.
+    pub fn find_visible_with_snap(
+        &self,
+        logical: &[u8],
+        chain: &[SnapId],
+    ) -> Result<Option<(Vec<u8>, SnapId)>> {
+        find_visible_with_snap(&self.block_map, self.root_block, logical, chain)
+    }
+
     pub fn range_scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.range_scan_at(start, end, ROOT_SNAP)
+    }
+
+    /// Range-scan over `[start, end)` at the given snap_id.
+    ///
+    /// `snap` is currently unused at the storage level — Phase 4 will use it
+    /// to filter visible-vs-shadowed entries via the ancestor chain. For now
+    /// we expand the logical range to include any snap_id (`snap_id` byte
+    /// suffix `[0;4]` on both ends), which is the same as the old behavior
+    /// when every entry sits at `ROOT_SNAP`.
+    ///
+    /// Returned keys are *logical only* (snap_id stripped).
+    pub fn range_scan_at(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        _snap: SnapId,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        // Build sortable bounds with snap_id bytes set to 0. For any logical
+        // key K and any snap S: `K_logical_bytes ++ S_be >= K_logical_bytes ++ [0;4]`,
+        // so this captures all snap_ids of every logical key in [start, end).
+        let mut start_buf = [0u8; MAX_KEY_SIZE];
+        let n_start = start.len();
+        assert!(n_start <= MAX_LOGICAL_KEY_SIZE);
+        start_buf[..n_start].copy_from_slice(start);
+        let mut end_buf = [0u8; MAX_KEY_SIZE];
+        let n_end = end.len();
+        assert!(n_end <= MAX_LOGICAL_KEY_SIZE);
+        end_buf[..n_end].copy_from_slice(end);
+
         let mut results = Vec::new();
-        range_scan(&self.block_map, self.root_block, start, end, &mut results)?;
+        range_scan(
+            &self.block_map,
+            self.root_block,
+            &start_buf[..n_start + SNAP_ID_BYTES],
+            &end_buf[..n_end + SNAP_ID_BYTES],
+            &mut results,
+        )?;
         Ok(results)
+    }
+
+    /// Find the value visible at `target_snap` by walking its ancestor chain.
+    ///
+    /// `chain` must be the snapshot ancestor chain in ASC-by-specificity order:
+    /// `[target_snap, parent(target_snap), grandparent, ..., tree_root]`. The
+    /// caller is responsible for building it from the snapshot tree (lives in
+    /// `Fs`, not `Btree`) — this method just iterates.
+    ///
+    /// Returns the value of the first ancestor with a `Live` entry. If the
+    /// closest ancestor with an entry has a tombstone (Deleted/Whiteout), the
+    /// chain walk stops and `None` is returned (the tombstone shadows the
+    /// rest of the chain).
+    pub fn find_visible(&self, logical: &[u8], chain: &[SnapId]) -> Result<Option<Vec<u8>>> {
+        find_visible(&self.block_map, self.root_block, logical, chain)
+    }
+
+    /// Raw range scan: returns every entry in `[start, end)` regardless of
+    /// snap_id or kind, including tombstones. Used by `range_scan_visible`
+    /// and by GC / debug dumps. The bcachefs equivalent is the
+    /// `BTREE_ITER_ALL_SNAPSHOTS` iterator mode.
+    pub fn range_scan_all(&self, start: &[u8], end: &[u8]) -> Result<Vec<AllSnapRow>> {
+        let mut start_buf = [0u8; MAX_KEY_SIZE];
+        let n_start = start.len();
+        assert!(n_start <= MAX_LOGICAL_KEY_SIZE);
+        start_buf[..n_start].copy_from_slice(start);
+        let mut end_buf = [0u8; MAX_KEY_SIZE];
+        let n_end = end.len();
+        assert!(n_end <= MAX_LOGICAL_KEY_SIZE);
+        end_buf[..n_end].copy_from_slice(end);
+
+        let mut results = Vec::new();
+        range_scan_all(
+            &self.block_map,
+            self.root_block,
+            &start_buf[..n_start + SNAP_ID_BYTES],
+            &end_buf[..n_end + SNAP_ID_BYTES],
+            &mut results,
+        )?;
+        Ok(results)
+    }
+
+    /// Range scan with snapshot ancestor filtering applied per logical key.
+    ///
+    /// For each distinct logical key in `[start, end)`, returns at most one
+    /// `(logical_key, value)` pair: the value visible at `target_snap`
+    /// according to the ancestor chain. Tombstones shadow rather than emit.
+    pub fn range_scan_visible(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        chain: &[SnapId],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        // chain_set lets us answer "is S on the ancestor chain of target?"
+        // in O(1) during the linear scan. Chain length is at most snapshot
+        // depth (small).
+        let chain_set: std::collections::HashSet<SnapId> = chain.iter().copied().collect();
+        let raw = self.range_scan_all(start, end)?;
+        // raw is in (logical ASC, snap_id ASC) order. For each logical key
+        // group, the FIRST entry whose snap_id is on the chain decides
+        // visibility (Live → emit, tombstone → skip the whole group).
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut current_logical: Option<Vec<u8>> = None;
+        let mut current_decided = false;
+        for (logical, snap, kind, value) in raw {
+            if current_logical.as_deref() != Some(logical.as_slice()) {
+                current_logical = Some(logical.clone());
+                current_decided = false;
+            }
+            if current_decided {
+                continue;
+            }
+            if !chain_set.contains(&snap) {
+                continue;
+            }
+            match kind {
+                EntryKind::Live => {
+                    out.push((logical, value));
+                    current_decided = true;
+                }
+                EntryKind::Deleted | EntryKind::Whiteout => {
+                    current_decided = true;
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn dump(&self) {
@@ -74,6 +287,112 @@ impl Btree {
     #[cfg(test)]
     pub fn verify(&self) {
         verify_node(&self.block_map, self.root_block, None, None);
+    }
+}
+
+// ---------- Transaction (Phase 6) ----------
+//
+// A transaction batches multiple inserts/deletes into a single root-swap
+// commit. While the transaction is open, mutations produce new blocks but
+// the btree's `root_block` is unchanged — readers outside the closure see
+// the old state. On commit, the new root takes effect atomically.
+//
+// On abort (closure returning Err), the btree's `root_block` is unchanged.
+// New blocks allocated during the transaction remain in `block_map` as
+// orphans (unreachable, awaiting future GC).
+//
+// Limitations vs bcachefs `btree_trans`:
+// - No conflict detection (we have no concurrent writers).
+// - No journal — we only track the root pointer.
+// - Errors during commit are not survivable (the closure must succeed
+//   end-to-end or be retried).
+
+pub struct Tx<'a> {
+    btree: &'a mut Btree,
+    /// Root block as seen by operations within this transaction. Starts as
+    /// the btree's current root and is updated by each insert/delete.
+    pending_root: u64,
+}
+
+impl<'a> Tx<'a> {
+    pub fn insert(&mut self, key: &[u8], snap: SnapId, value: &[u8]) -> Result<()> {
+        self.insert_with_kind(key, snap, EntryKind::Live, value)
+    }
+
+    pub fn insert_with_kind(
+        &mut self,
+        key: &[u8],
+        snap: SnapId,
+        kind: EntryKind,
+        value: &[u8],
+    ) -> Result<()> {
+        let (buf, len) = sortable_key(key, snap);
+        let new_root = insert(
+            &mut self.btree.block_map,
+            &mut self.btree.next_block_nr,
+            self.pending_root,
+            &buf[..len],
+            value,
+            kind,
+        )?;
+        self.pending_root = new_root;
+        Ok(())
+    }
+
+    pub fn delete_at(&mut self, key: &[u8], snap: SnapId, chain: &[SnapId]) -> Result<bool> {
+        let Some((_value, visible_snap)) =
+            find_visible_with_snap(&self.btree.block_map, self.pending_root, key, chain)?
+        else {
+            return Ok(false);
+        };
+        let kind = if visible_snap == snap {
+            EntryKind::Deleted
+        } else {
+            EntryKind::Whiteout
+        };
+        self.insert_with_kind(key, snap, kind, &[])?;
+        Ok(true)
+    }
+
+    pub fn find_at(&self, key: &[u8], snap: SnapId) -> Result<Option<Vec<u8>>> {
+        let (buf, len) = sortable_key(key, snap);
+        find(&self.btree.block_map, self.pending_root, &buf[..len])
+    }
+
+    pub fn find_visible(&self, key: &[u8], chain: &[SnapId]) -> Result<Option<Vec<u8>>> {
+        find_visible(&self.btree.block_map, self.pending_root, key, chain)
+    }
+
+    pub fn find_visible_with_snap(
+        &self,
+        key: &[u8],
+        chain: &[SnapId],
+    ) -> Result<Option<(Vec<u8>, SnapId)>> {
+        find_visible_with_snap(&self.btree.block_map, self.pending_root, key, chain)
+    }
+}
+
+impl Btree {
+    /// Run `f` against a fresh transaction. On `Ok(_)` the pending root is
+    /// installed as the btree's new root in a single atomic step. On `Err`
+    /// the btree is left untouched (orphan blocks are leaked; v1 has no GC).
+    pub fn transaction<F, R>(&mut self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Tx<'_>) -> Result<R>,
+    {
+        let mut tx = Tx {
+            pending_root: self.root_block,
+            btree: self,
+        };
+        let result = f(&mut tx);
+        match result {
+            Ok(value) => {
+                let new_root = tx.pending_root;
+                tx.btree.root_block = new_root;
+                Ok(value)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -217,6 +536,19 @@ fn clone_to_heap(node: &BtreeNodeRaw) -> Box<BtreeNodeRaw> {
     b
 }
 
+/// Copy a single leaf entry (key + snap_id + kind + value) from `src[src_idx]`
+/// to `dst[dst_idx]`. Both nodes must be leaves. The full sortable key bytes
+/// (including snap_id) and the entry kind are preserved.
+fn copy_leaf_entry(dst: &mut BtreeNodeRaw, dst_idx: usize, src: &BtreeNodeRaw, src_idx: usize) {
+    debug_assert_eq!(dst.level(), 0);
+    debug_assert_eq!(src.level(), 0);
+    let src_entry = src.entry(src_idx);
+    dst.entry_mut(dst_idx).set_key(src_entry.key_bytes());
+    dst.entry_mut(dst_idx).set_kind(src_entry.kind_enum());
+    let val = src.value_bytes(src_idx).to_vec();
+    dst.set_value(dst_idx, &val);
+}
+
 // ---------- Recursive operations ----------
 
 fn read_block(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64) -> Result<&BtreeNodeRaw> {
@@ -230,41 +562,88 @@ fn find(
     block_nr: u64,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>> {
+    Ok(
+        find_raw(block_map, block_nr, key)?.and_then(|(value, kind)| match kind {
+            EntryKind::Live => Some(value),
+            EntryKind::Deleted | EntryKind::Whiteout => None,
+        }),
+    )
+}
+
+/// Like `find` but returns the entry's value AND its kind tag, so callers can
+/// distinguish "no entry" from "tombstone". Used by `find_visible` to decide
+/// whether to keep walking the ancestor chain or stop.
+fn find_raw(
+    block_map: &HashMap<u64, BtreeNodeRaw>,
+    block_nr: u64,
+    key: &[u8],
+) -> Result<Option<(Vec<u8>, EntryKind)>> {
     let node = read_block(block_map, block_nr)?;
     match node.search(key) {
         Ok(idx) => {
             if node.level() == 0 {
-                Ok(Some(node.value_bytes(idx).to_vec()))
+                let entry = node.entry(idx);
+                Ok(Some((node.value_bytes(idx).to_vec(), entry.kind_enum())))
             } else {
-                // Separator-in-right: the matching key is the separator itself,
-                // so the value lives in the right subtree (child idx+1).
-                find(block_map, node.child_block(idx + 1), key)
+                find_raw(block_map, node.child_block(idx + 1), key)
             }
         }
         Err(idx) => {
             if node.level() == 0 {
                 Ok(None)
             } else {
-                find(block_map, node.child_block(idx), key)
+                find_raw(block_map, node.child_block(idx), key)
             }
         }
     }
 }
 
+/// Walk the snapshot ancestor chain and return the value visible at the
+/// chain's head, or None on tombstone / no entry. Used by both
+/// `Btree::find_visible` and `Tx::find_visible`.
+fn find_visible(
+    block_map: &HashMap<u64, BtreeNodeRaw>,
+    block_nr: u64,
+    logical: &[u8],
+    chain: &[SnapId],
+) -> Result<Option<Vec<u8>>> {
+    Ok(find_visible_with_snap(block_map, block_nr, logical, chain)?.map(|(v, _)| v))
+}
+
+fn find_visible_with_snap(
+    block_map: &HashMap<u64, BtreeNodeRaw>,
+    block_nr: u64,
+    logical: &[u8],
+    chain: &[SnapId],
+) -> Result<Option<(Vec<u8>, SnapId)>> {
+    for &snap in chain {
+        let (buf, len) = sortable_key(logical, snap);
+        match find_raw(block_map, block_nr, &buf[..len])? {
+            Some((value, EntryKind::Live)) => return Ok(Some((value, snap))),
+            Some((_, EntryKind::Deleted | EntryKind::Whiteout)) => return Ok(None),
+            None => continue,
+        }
+    }
+    Ok(None)
+}
+
 /// COW insert — returns the block number of the (possibly new) root.
+/// `kind` is the entry kind (Live for normal inserts, Deleted/Whiteout for
+/// tombstones). On a found-key path the existing entry's kind is replaced.
 fn insert(
     block_map: &mut HashMap<u64, BtreeNodeRaw>,
     next_block_nr: &mut u64,
     block_nr: u64,
     key: &[u8],
     value: &[u8],
+    kind: EntryKind,
 ) -> Result<u64> {
     // COW: clone before mutating so the original block stays intact.
     let old_node = clone_to_heap(read_block(block_map, block_nr)?);
     if old_node.level() == 0 {
-        insert_leaf(block_map, next_block_nr, &old_node, key, value)
+        insert_leaf(block_map, next_block_nr, &old_node, key, value, kind)
     } else {
-        insert_internal(block_map, next_block_nr, &old_node, key, value)
+        insert_internal(block_map, next_block_nr, &old_node, key, value, kind)
     }
 }
 
@@ -274,6 +653,7 @@ fn insert_leaf(
     old_node: &BtreeNodeRaw,
     key: &[u8],
     value: &[u8],
+    kind: EntryKind,
 ) -> Result<u64> {
     // Leaf is full — split first, then insert into the correct child.
     // This may cascade if the child also splits.
@@ -298,7 +678,7 @@ fn insert_leaf(
             (child_idx, root.child_block(child_idx))
         };
         let child_level = read_block(block_map, child_nr)?.level();
-        let new_child_nr = insert(block_map, next_block_nr, child_nr, key, value)?;
+        let new_child_nr = insert(block_map, next_block_nr, child_nr, key, value, kind)?;
 
         let new_child_level = read_block(block_map, new_child_nr)?.level();
         if new_child_level > child_level {
@@ -332,33 +712,34 @@ fn insert_leaf(
 
     match old_node.search(key) {
         Ok(idx) => {
-            // Key exists — COW clone and patch the value in place.
+            // Key exists — COW clone and patch the value + kind in place.
+            // Note: when overwriting a tombstone with a Live insert, kind
+            // flips back to Live; when delete writes a tombstone, kind
+            // flips to Deleted/Whiteout.
             let new_block = *next_block_nr;
             *next_block_nr += 1;
             let mut new_node = clone_to_heap(old_node);
             new_node.set_value(idx, value);
+            new_node.entry_mut(idx).set_kind(kind);
             block_map.insert(new_block, *new_node);
             Ok(new_block)
         }
         Err(idx) => {
             // New key — build a fresh leaf with the entry inserted at idx.
+            // Existing entries are copied with their kind preserved (so a
+            // leaf carrying tombstones survives a neighbor's insert).
             let new_block = *next_block_nr;
             *next_block_nr += 1;
             let mut new_node = new_node_on_heap(0);
             new_node.set_generation(old_node.generation());
             for i in 0..idx {
-                let k = old_node.entry(i).key_bytes();
-                let v = old_node.value_bytes(i);
-                new_node.entry_mut(i).set_key(k);
-                new_node.set_value(i, v);
+                copy_leaf_entry(&mut new_node, i, old_node, i);
             }
             new_node.entry_mut(idx).set_key(key);
             new_node.set_value(idx, value);
+            new_node.entry_mut(idx).set_kind(kind);
             for i in idx..old_node.nkeys() {
-                let k = old_node.entry(i).key_bytes();
-                let v = old_node.value_bytes(i);
-                new_node.entry_mut(i + 1).set_key(k);
-                new_node.set_value(i + 1, v);
+                copy_leaf_entry(&mut new_node, i + 1, old_node, i);
             }
             new_node.set_nkeys(old_node.nkeys() + 1);
             block_map.insert(new_block, *new_node);
@@ -373,6 +754,7 @@ fn insert_internal(
     old_node: &BtreeNodeRaw,
     key: &[u8],
     value: &[u8],
+    kind: EntryKind,
 ) -> Result<u64> {
     let child_idx = match old_node.search(key) {
         Ok(i) => i + 1,
@@ -381,7 +763,7 @@ fn insert_internal(
     let child_nr = old_node.child_block(child_idx);
     let child_level = read_block(block_map, child_nr)?.level();
 
-    let new_child_nr = insert(block_map, next_block_nr, child_nr, key, value)?;
+    let new_child_nr = insert(block_map, next_block_nr, child_nr, key, value, kind)?;
 
     // Child split and grew a level — promote its median key to this level.
     let new_child_level = read_block(block_map, new_child_nr)?.level();
@@ -570,9 +952,19 @@ fn range_scan(
     let node = read_block(block_map, block_nr)?;
     if node.level() == 0 {
         for i in 0..node.nkeys() {
-            let k = node.entry(i).key_bytes();
-            if k >= start && k < end {
-                results.push((k.to_vec(), node.value_bytes(i).to_vec()));
+            let entry = node.entry(i);
+            let sk = entry.key_bytes();
+            if sk >= start && sk < end {
+                if entry.kind_enum() != EntryKind::Live {
+                    // Future-proofing for Phase 4+: tombstones are not visible
+                    // to range_scan callers.
+                    continue;
+                }
+                // Strip the snap_id suffix; callers see logical keys only.
+                results.push((
+                    entry.logical_key_bytes().to_vec(),
+                    node.value_bytes(i).to_vec(),
+                ));
             }
         }
     } else {
@@ -588,6 +980,50 @@ fn range_scan(
             range_scan(block_map, node.child_block(i), start, end, results)?;
             // Separator-in-right: once a separator >= end, all further
             // subtrees are out of range.
+            if i < node.nkeys() && node.entry(i).key_bytes() >= end {
+                return Ok(());
+            }
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Like `range_scan` but emits *every* entry (including tombstones) with
+/// full metadata: `(logical_key, snap_id, kind, value)`. Backs the public
+/// `Btree::range_scan_all` (BTREE_ITER_ALL_SNAPSHOTS in bcachefs).
+fn range_scan_all(
+    block_map: &HashMap<u64, BtreeNodeRaw>,
+    block_nr: u64,
+    start: &[u8],
+    end: &[u8],
+    results: &mut Vec<AllSnapRow>,
+) -> Result<()> {
+    let node = read_block(block_map, block_nr)?;
+    if node.level() == 0 {
+        for i in 0..node.nkeys() {
+            let entry = node.entry(i);
+            let sk = entry.key_bytes();
+            if sk >= start && sk < end {
+                results.push((
+                    entry.logical_key_bytes().to_vec(),
+                    entry.snap_id(),
+                    entry.kind_enum(),
+                    node.value_bytes(i).to_vec(),
+                ));
+            }
+        }
+    } else {
+        let mut i = match node.search(start) {
+            Ok(idx) => idx + 1,
+            Err(idx) => idx,
+        };
+        let nchildren = node.nkeys() + 1;
+        if i >= nchildren {
+            i = nchildren - 1;
+        }
+        while i < nchildren {
+            range_scan_all(block_map, node.child_block(i), start, end, results)?;
             if i < node.nkeys() && node.entry(i).key_bytes() >= end {
                 return Ok(());
             }
@@ -635,6 +1071,18 @@ mod tests {
         (i + 10000).to_be_bytes()
     }
 
+    /// Direct call to the internal `find` against a specific root block.
+    /// Tests use this to look into historical (pre-overwrite) roots that the
+    /// public Btree API doesn't expose. Wraps the snap_id append step.
+    fn find_at_root(
+        block_map: &HashMap<u64, BtreeNodeRaw>,
+        root: u64,
+        logical: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let (buf, len) = sortable_key(logical, ROOT_SNAP);
+        find(block_map, root, &buf[..len])
+    }
+
     #[test]
     fn test_single_insert_and_find() {
         let mut tree = Btree::new();
@@ -676,19 +1124,19 @@ mod tests {
         tree.insert(&key(30), &val(30)).unwrap();
 
         assert_eq!(
-            find(&tree.block_map, old_root_block, &key(10))
+            find_at_root(&tree.block_map, old_root_block, &key(10))
                 .unwrap()
                 .as_deref(),
             Some(val(10).as_slice())
         );
         assert_eq!(
-            find(&tree.block_map, old_root_block, &key(20))
+            find_at_root(&tree.block_map, old_root_block, &key(20))
                 .unwrap()
                 .as_deref(),
             Some(val(20).as_slice())
         );
         assert_eq!(
-            find(&tree.block_map, old_root_block, &key(30))
+            find_at_root(&tree.block_map, old_root_block, &key(30))
                 .unwrap()
                 .as_deref(),
             None
@@ -785,9 +1233,9 @@ mod tests {
         let mut node = BtreeNodeRaw::new(0);
         node.set_nkeys(3);
         node.set_generation(42);
-        node.entry_mut(0).set_key(b"hello");
-        node.entry_mut(1).set_key(b"world");
-        node.entry_mut(2).set_key(b"foo");
+        node.entry_mut(0).set_key_with_snap(b"hello", ROOT_SNAP);
+        node.entry_mut(1).set_key_with_snap(b"world", ROOT_SNAP);
+        node.entry_mut(2).set_key_with_snap(b"foo", ROOT_SNAP);
 
         let bytes: &[u8] = node.as_bytes();
         assert_eq!(bytes.len(), 4096);
@@ -796,9 +1244,10 @@ mod tests {
         assert_eq!(restored.nkeys(), 3);
         assert_eq!(restored.generation(), 42);
         assert_eq!(restored.level(), 0);
-        assert_eq!(restored.entry(0).key_bytes(), b"hello");
-        assert_eq!(restored.entry(1).key_bytes(), b"world");
-        assert_eq!(restored.entry(2).key_bytes(), b"foo");
+        assert_eq!(restored.entry(0).logical_key_bytes(), b"hello");
+        assert_eq!(restored.entry(1).logical_key_bytes(), b"world");
+        assert_eq!(restored.entry(2).logical_key_bytes(), b"foo");
+        assert_eq!(restored.entry(0).snap_id(), ROOT_SNAP);
     }
 
     // ---------- Random-key tests ----------
@@ -949,34 +1398,32 @@ mod tests {
 
     #[test]
     fn test_max_key_size() {
-        use crate::block_btree::MAX_KEY_SIZE;
-
+        // Phase 2 introduced the snap_id suffix on every entry; the
+        // caller-visible "logical" key is bounded by MAX_LOGICAL_KEY_SIZE
+        // and the 4-byte snap_id is appended internally.
         let mut tree = Btree::new();
 
-        // Key at exactly MAX_KEY_SIZE.
-        let full_key = vec![0xABu8; MAX_KEY_SIZE];
+        // Key at exactly MAX_LOGICAL_KEY_SIZE.
+        let full_key = vec![0xABu8; MAX_LOGICAL_KEY_SIZE];
         tree.insert(&full_key, b"full").unwrap();
         assert_eq!(
             tree.find(&full_key).unwrap().as_deref(),
             Some(b"full".as_slice())
         );
 
-        // Key exceeding MAX_KEY_SIZE — should be silently truncated.
-        let long_key = vec![0xCDu8; MAX_KEY_SIZE + 100];
-        tree.insert(&long_key, b"truncated").unwrap();
-        // The stored key is truncated to MAX_KEY_SIZE, so looking up the
-        // truncated version should find it.
-        let truncated_key = vec![0xCDu8; MAX_KEY_SIZE];
-        assert_eq!(
-            tree.find(&truncated_key).unwrap().as_deref(),
-            Some(b"truncated".as_slice())
-        );
-
-        // A key of a different length but same prefix should NOT match.
-        let short_key = vec![0xCDu8; MAX_KEY_SIZE - 1];
+        // A key one byte shorter must not match the longer one.
+        let short_key = vec![0xABu8; MAX_LOGICAL_KEY_SIZE - 1];
         assert_eq!(tree.find(&short_key).unwrap().as_deref(), None);
 
         tree.verify();
+    }
+
+    #[test]
+    #[should_panic(expected = "logical key too long")]
+    fn test_logical_key_overflow_panics() {
+        let mut tree = Btree::new();
+        let too_long = vec![0xCDu8; MAX_LOGICAL_KEY_SIZE + 1];
+        let _ = tree.insert(&too_long, b"x");
     }
 
     #[test]
@@ -1044,7 +1491,7 @@ mod tests {
         for &(last_key, snap_root) in &snapshots {
             for i in 0..=last_key {
                 assert_eq!(
-                    find(&tree.block_map, snap_root, &key(i))
+                    find_at_root(&tree.block_map, snap_root, &key(i))
                         .unwrap()
                         .as_deref(),
                     Some(val(i).as_slice()),
@@ -1053,7 +1500,7 @@ mod tests {
             }
             // Key just beyond the snapshot should not exist.
             assert_eq!(
-                find(&tree.block_map, snap_root, &key(last_key + 1))
+                find_at_root(&tree.block_map, snap_root, &key(last_key + 1))
                     .unwrap()
                     .as_deref(),
                 None,
@@ -1079,11 +1526,15 @@ mod tests {
             Some(b"v1-new".as_slice())
         );
         assert_eq!(
-            find(&tree.block_map, snap, &key(1)).unwrap().as_deref(),
+            find_at_root(&tree.block_map, snap, &key(1))
+                .unwrap()
+                .as_deref(),
             Some(b"v1".as_slice())
         );
         assert_eq!(
-            find(&tree.block_map, snap, &key(2)).unwrap().as_deref(),
+            find_at_root(&tree.block_map, snap, &key(2))
+                .unwrap()
+                .as_deref(),
             Some(b"v2".as_slice())
         );
         tree.verify();
@@ -1374,6 +1825,440 @@ mod tests {
                 assert_eq!(d, first, "snapshot leaf {i} depth {d} != {first}");
             }
         }
+        tree.verify();
+    }
+
+    // ---------- Phase 2: snap_id encoding ----------
+
+    #[test]
+    fn snap_id_distinguishes_entries_with_same_logical_key() {
+        // Two entries sharing a logical key but living at different snap_ids
+        // must coexist; find_at must dispatch by snap_id.
+        let mut tree = Btree::new();
+        tree.insert_at(b"k", ROOT_SNAP, b"v_root").unwrap();
+        tree.insert_at(b"k", 100, b"v_100").unwrap();
+
+        assert_eq!(
+            tree.find_at(b"k", ROOT_SNAP).unwrap().as_deref(),
+            Some(b"v_root".as_slice())
+        );
+        assert_eq!(
+            tree.find_at(b"k", 100).unwrap().as_deref(),
+            Some(b"v_100".as_slice())
+        );
+        // No ancestor walk yet (Phase 4): a snap_id with no entry returns None.
+        assert_eq!(tree.find_at(b"k", 200).unwrap().as_deref(), None);
+        tree.verify();
+    }
+
+    #[test]
+    fn snap_id_sort_order_smaller_first_per_logical_key() {
+        // Within the same logical key, entries are sorted by snap_id ascending
+        // (smaller snap_id = more specific = closer to leaf in the snap tree).
+        let mut tree = Btree::new();
+        tree.insert_at(b"k", ROOT_SNAP, b"v_root").unwrap();
+        tree.insert_at(b"k", 50, b"v_50").unwrap();
+        tree.insert_at(b"k", 200, b"v_200").unwrap();
+
+        // range_scan_at returns logical keys (no snap_id), so all three appear
+        // as the same `b"k"`. With three entries sharing one logical key,
+        // results should have 3 rows. Phase 4 will collapse these via the
+        // ancestor filter.
+        let scan = tree.range_scan_at(b"j", b"l", ROOT_SNAP).unwrap();
+        assert_eq!(scan.len(), 3, "{scan:?}");
+        // Values appear in snap_id ascending order: 50 < 200 < ROOT_SNAP.
+        assert_eq!(scan[0].1, b"v_50");
+        assert_eq!(scan[1].1, b"v_200");
+        assert_eq!(scan[2].1, b"v_root");
+        tree.verify();
+    }
+
+    #[test]
+    fn range_scan_at_returns_logical_keys_only() {
+        // Verify the snap_id suffix is stripped from returned keys.
+        let mut tree = Btree::new();
+        tree.insert_at(b"alpha", 100, b"a").unwrap();
+        tree.insert_at(b"beta", ROOT_SNAP, b"b").unwrap();
+
+        let scan = tree.range_scan(b"a", b"z").unwrap();
+        let keys: Vec<&[u8]> = scan.iter().map(|(k, _)| k.as_slice()).collect();
+        assert_eq!(keys, vec![&b"alpha"[..], b"beta"]);
+    }
+
+    // ---------- Phase 4: ancestor-aware visibility filter ----------
+
+    #[test]
+    fn find_visible_inherits_from_ancestor() {
+        // ROOT_SNAP has K=v_root. Child snap=100 has no entry of its own.
+        // Reading at snap=100 (chain = [100, ROOT_SNAP]) should fall through
+        // to the ancestor's entry.
+        let mut tree = Btree::new();
+        tree.insert_at(b"K", ROOT_SNAP, b"v_root").unwrap();
+
+        let chain_root = vec![ROOT_SNAP];
+        let chain_100 = vec![100, ROOT_SNAP];
+        assert_eq!(
+            tree.find_visible(b"K", &chain_root).unwrap().as_deref(),
+            Some(b"v_root".as_slice())
+        );
+        assert_eq!(
+            tree.find_visible(b"K", &chain_100).unwrap().as_deref(),
+            Some(b"v_root".as_slice())
+        );
+    }
+
+    #[test]
+    fn find_visible_child_overrides_parent() {
+        // Child writes its own value; the more-specific (smaller snap_id)
+        // entry wins for the child but NOT for the parent.
+        let mut tree = Btree::new();
+        tree.insert_at(b"K", ROOT_SNAP, b"v_root").unwrap();
+        tree.insert_at(b"K", 100, b"v_child").unwrap();
+
+        let chain_child = vec![100, ROOT_SNAP];
+        let chain_root = vec![ROOT_SNAP];
+        assert_eq!(
+            tree.find_visible(b"K", &chain_child).unwrap().as_deref(),
+            Some(b"v_child".as_slice())
+        );
+        assert_eq!(
+            tree.find_visible(b"K", &chain_root).unwrap().as_deref(),
+            Some(b"v_root".as_slice()),
+            "parent must NOT see child's override"
+        );
+    }
+
+    #[test]
+    fn find_visible_siblings_isolated() {
+        // Two children of the same parent see only their own writes (and
+        // anything they jointly inherit from the parent).
+        let mut tree = Btree::new();
+        tree.insert_at(b"shared", ROOT_SNAP, b"v_inherited")
+            .unwrap();
+        tree.insert_at(b"a_only", 100, b"v_a").unwrap();
+        tree.insert_at(b"b_only", 80, b"v_b").unwrap();
+
+        // Sibling chains: A descends from ROOT_SNAP via 100; B via 80.
+        let chain_a = vec![100, ROOT_SNAP];
+        let chain_b = vec![80, ROOT_SNAP];
+
+        assert_eq!(
+            tree.find_visible(b"shared", &chain_a).unwrap().as_deref(),
+            Some(b"v_inherited".as_slice())
+        );
+        assert_eq!(
+            tree.find_visible(b"shared", &chain_b).unwrap().as_deref(),
+            Some(b"v_inherited".as_slice())
+        );
+        assert_eq!(
+            tree.find_visible(b"a_only", &chain_a).unwrap().as_deref(),
+            Some(b"v_a".as_slice())
+        );
+        // B's chain does not include 100, so a_only is invisible.
+        assert_eq!(tree.find_visible(b"a_only", &chain_b).unwrap(), None);
+        assert_eq!(tree.find_visible(b"b_only", &chain_a).unwrap(), None);
+        assert_eq!(
+            tree.find_visible(b"b_only", &chain_b).unwrap().as_deref(),
+            Some(b"v_b".as_slice())
+        );
+    }
+
+    #[test]
+    fn range_scan_visible_collapses_per_logical_key() {
+        // Three entries on the same logical key, only the most specific
+        // ancestor is emitted.
+        let mut tree = Btree::new();
+        tree.insert_at(b"K", ROOT_SNAP, b"v_root").unwrap();
+        tree.insert_at(b"K", 100, b"v_100").unwrap();
+        tree.insert_at(b"L", 100, b"v_L").unwrap();
+
+        let chain_50 = vec![50, 100, ROOT_SNAP];
+        let scan = tree.range_scan_visible(b"A", b"Z", &chain_50).unwrap();
+        // Both K (via snap=100) and L (via snap=100) visible exactly once.
+        assert_eq!(scan.len(), 2);
+        assert_eq!(scan[0], (b"K".to_vec(), b"v_100".to_vec()));
+        assert_eq!(scan[1], (b"L".to_vec(), b"v_L".to_vec()));
+    }
+
+    #[test]
+    fn range_scan_all_includes_every_entry() {
+        // raw scan returns every (logical, snap_id) without any filtering.
+        let mut tree = Btree::new();
+        tree.insert_at(b"K", ROOT_SNAP, b"v_root").unwrap();
+        tree.insert_at(b"K", 100, b"v_100").unwrap();
+        tree.insert_at(b"L", 50, b"v_L").unwrap();
+
+        let raw = tree.range_scan_all(b"A", b"Z").unwrap();
+        assert_eq!(raw.len(), 3);
+        // (logical ASC, snap_id ASC): K@100, K@ROOT, L@50.
+        assert_eq!(raw[0].0, b"K");
+        assert_eq!(raw[0].1, 100);
+        assert_eq!(raw[0].2, EntryKind::Live);
+        assert_eq!(raw[0].3, b"v_100");
+        assert_eq!(raw[1].0, b"K");
+        assert_eq!(raw[1].1, ROOT_SNAP);
+        assert_eq!(raw[2].0, b"L");
+        assert_eq!(raw[2].1, 50);
+    }
+
+    // ---------- Phase 5: Delete with Deleted/Whiteout dispatch ----------
+
+    #[test]
+    fn delete_same_snap_writes_deleted_tombstone() {
+        // X writes K=v_X, then X deletes K. Visible entry is X's own, so the
+        // tombstone kind is Deleted (trivial — compactable).
+        let mut tree = Btree::new();
+        let chain = vec![ROOT_SNAP];
+        tree.insert_at(b"K", ROOT_SNAP, b"v_X").unwrap();
+        assert!(tree.delete_at(b"K", ROOT_SNAP, &chain).unwrap());
+
+        // Key invisible at X.
+        assert_eq!(tree.find_visible(b"K", &chain).unwrap(), None);
+        // Raw scan still has the tombstone with kind=Deleted.
+        let raw = tree.range_scan_all(b"J", b"L").unwrap();
+        let kinds: Vec<EntryKind> = raw.iter().map(|(_, _, k, _)| *k).collect();
+        assert_eq!(kinds, vec![EntryKind::Deleted]);
+        tree.verify();
+    }
+
+    #[test]
+    fn delete_cross_snap_writes_whiteout_tombstone() {
+        // Parent has K=v_root. Child snap=100 deletes K — the visible entry
+        // came from an ancestor, so we must shadow it with a Whiteout
+        // (KEY_TYPE_whiteout in bcachefs).
+        let mut tree = Btree::new();
+        tree.insert_at(b"K", ROOT_SNAP, b"v_root").unwrap();
+
+        let chain_100 = vec![100, ROOT_SNAP];
+        assert!(tree.delete_at(b"K", 100, &chain_100).unwrap());
+
+        // Child no longer sees K.
+        assert_eq!(tree.find_visible(b"K", &chain_100).unwrap(), None);
+        // Parent still sees its own entry.
+        let chain_root = vec![ROOT_SNAP];
+        assert_eq!(
+            tree.find_visible(b"K", &chain_root).unwrap().as_deref(),
+            Some(b"v_root".as_slice())
+        );
+        // Tombstone is Whiteout, not Deleted.
+        let raw = tree.range_scan_all(b"J", b"L").unwrap();
+        let by_snap: Vec<(SnapId, EntryKind)> = raw
+            .iter()
+            .map(|(_, snap, kind, _)| (*snap, *kind))
+            .collect();
+        assert_eq!(
+            by_snap,
+            vec![(100, EntryKind::Whiteout), (ROOT_SNAP, EntryKind::Live)]
+        );
+    }
+
+    #[test]
+    fn delete_noop_on_invisible_key() {
+        let mut tree = Btree::new();
+        let chain = vec![ROOT_SNAP];
+        // No insert; key is not visible.
+        assert!(!tree.delete_at(b"missing", ROOT_SNAP, &chain).unwrap());
+        // Nothing was written to the tree.
+        assert_eq!(tree.range_scan_all(b"a", b"z").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn delete_noop_when_already_tombstoned() {
+        // Once K is tombstoned, a second delete is a no-op (find_visible
+        // already returns None, no Live entry to shadow).
+        let mut tree = Btree::new();
+        let chain = vec![ROOT_SNAP];
+        tree.insert_at(b"K", ROOT_SNAP, b"v").unwrap();
+        assert!(tree.delete_at(b"K", ROOT_SNAP, &chain).unwrap());
+        assert!(!tree.delete_at(b"K", ROOT_SNAP, &chain).unwrap());
+    }
+
+    #[test]
+    fn reinsert_after_delete_overwrites_tombstone() {
+        // Re-inserting at the same (key, snap) flips kind back to Live.
+        let mut tree = Btree::new();
+        let chain = vec![ROOT_SNAP];
+        tree.insert_at(b"K", ROOT_SNAP, b"v1").unwrap();
+        tree.delete_at(b"K", ROOT_SNAP, &chain).unwrap();
+        assert_eq!(tree.find_visible(b"K", &chain).unwrap(), None);
+
+        tree.insert_at(b"K", ROOT_SNAP, b"v2").unwrap();
+        assert_eq!(
+            tree.find_visible(b"K", &chain).unwrap().as_deref(),
+            Some(b"v2".as_slice())
+        );
+        // Only one entry exists at (K, ROOT_SNAP); the tombstone was patched.
+        let raw = tree.range_scan_all(b"J", b"L").unwrap();
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].2, EntryKind::Live);
+    }
+
+    #[test]
+    fn delete_then_range_scan_visible_excludes_tombstone() {
+        let mut tree = Btree::new();
+        let chain = vec![ROOT_SNAP];
+        tree.insert_at(b"a", ROOT_SNAP, b"va").unwrap();
+        tree.insert_at(b"b", ROOT_SNAP, b"vb").unwrap();
+        tree.insert_at(b"c", ROOT_SNAP, b"vc").unwrap();
+        tree.delete_at(b"b", ROOT_SNAP, &chain).unwrap();
+
+        let visible = tree.range_scan_visible(b"a", b"d", &chain).unwrap();
+        let keys: Vec<&[u8]> = visible.iter().map(|(k, _)| k.as_slice()).collect();
+        assert_eq!(keys, vec![&b"a"[..], b"c"]);
+    }
+
+    #[test]
+    fn whiteout_does_not_affect_sibling_snapshot() {
+        // Two child snapshots A=100, B=80 of ROOT_SNAP. Parent has K=v_root.
+        // Child A deletes K — A's whiteout must shadow K only on A's chain,
+        // never on B's chain. (Per bcachefs Snapshots doc.)
+        let mut tree = Btree::new();
+        tree.insert_at(b"K", ROOT_SNAP, b"v_root").unwrap();
+        let chain_a = vec![100, ROOT_SNAP];
+        let chain_b = vec![80, ROOT_SNAP];
+
+        tree.delete_at(b"K", 100, &chain_a).unwrap();
+        assert_eq!(tree.find_visible(b"K", &chain_a).unwrap(), None);
+        assert_eq!(
+            tree.find_visible(b"K", &chain_b).unwrap().as_deref(),
+            Some(b"v_root".as_slice()),
+            "sibling B's view of inherited K must be unaffected by A's whiteout"
+        );
+    }
+
+    // ---------- Phase 6: Btree::transaction ----------
+
+    #[test]
+    fn transaction_commits_multiple_ops_atomically() {
+        let mut tree = Btree::new();
+        tree.insert(b"a", b"1").unwrap();
+        let pre_root = tree.root_block;
+
+        tree.transaction(|tx| {
+            tx.insert(b"b", ROOT_SNAP, b"2")?;
+            tx.insert(b"c", ROOT_SNAP, b"3")?;
+            // Reads inside tx see pending state.
+            assert_eq!(
+                tx.find_at(b"b", ROOT_SNAP)?.as_deref(),
+                Some(b"2".as_slice())
+            );
+            // Outside the tx, the original root is still in place.
+            Ok(())
+        })
+        .unwrap();
+
+        // After commit, all three keys are visible.
+        assert_eq!(tree.find(b"a").unwrap().as_deref(), Some(b"1".as_slice()));
+        assert_eq!(tree.find(b"b").unwrap().as_deref(), Some(b"2".as_slice()));
+        assert_eq!(tree.find(b"c").unwrap().as_deref(), Some(b"3".as_slice()));
+        // root_block changed exactly once.
+        assert_ne!(tree.root_block, pre_root);
+        tree.verify();
+    }
+
+    #[test]
+    fn transaction_aborts_leave_root_unchanged() {
+        let mut tree = Btree::new();
+        tree.insert(b"a", b"1").unwrap();
+        let pre_root = tree.root_block;
+
+        let result: Result<()> = tree.transaction(|tx| {
+            tx.insert(b"b", ROOT_SNAP, b"2")?;
+            tx.insert(b"c", ROOT_SNAP, b"3")?;
+            // Simulate a failure: bail out with an error.
+            Err(Error::BlockNotFound(u64::MAX))
+        });
+        assert!(result.is_err());
+
+        // The btree's view is the pre-tx state.
+        assert_eq!(tree.root_block, pre_root);
+        assert_eq!(tree.find(b"a").unwrap().as_deref(), Some(b"1".as_slice()));
+        assert_eq!(tree.find(b"b").unwrap(), None);
+        assert_eq!(tree.find(b"c").unwrap(), None);
+        tree.verify();
+    }
+
+    #[test]
+    fn transaction_atomic_rename() {
+        // Rename = (delete old; insert new). With transaction(), readers
+        // outside the closure see either the pre state OR the post state,
+        // never an intermediate where neither key exists.
+        let mut tree = Btree::new();
+        tree.insert(b"old", b"value").unwrap();
+
+        tree.transaction(|tx| {
+            tx.insert(b"new", ROOT_SNAP, b"value")?;
+            tx.delete_at(b"old", ROOT_SNAP, &[ROOT_SNAP])?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(tree.find(b"old").unwrap(), None);
+        assert_eq!(
+            tree.find(b"new").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        tree.verify();
+    }
+
+    // ---------- Phase 9: randomized insert/delete vs BTreeMap ----------
+
+    #[test]
+    fn random_insert_delete_matches_btreemap() {
+        // Drive a long random sequence of inserts and deletes into both the
+        // Btree and a std BTreeMap, then check that visibility matches at
+        // the end. Catches any tombstone-handling regression that would
+        // otherwise only surface under specific access patterns.
+        use std::collections::BTreeMap;
+
+        let mut tree = Btree::new();
+        let mut model: BTreeMap<u32, u32> = BTreeMap::new();
+        let chain = vec![ROOT_SNAP];
+        let mut rng = Rng(0xCAFE_BABE);
+
+        // Use a small key space so collisions force overwrites and re-inserts.
+        const KEY_SPACE: u32 = 200;
+        const STEPS: u32 = 2000;
+
+        for step in 0..STEPS {
+            let k = (rng.next_u32() % KEY_SPACE) as u32;
+            // Bias toward insert until the model is reasonably populated.
+            let do_delete = step > 200 && (rng.next_u32() % 3 == 0);
+            if do_delete {
+                let removed = tree.delete_at(&k.to_be_bytes(), ROOT_SNAP, &chain).unwrap();
+                let model_had = model.remove(&k).is_some();
+                assert_eq!(removed, model_had, "delete return at step {step}");
+            } else {
+                let v = rng.next_u32();
+                tree.insert_at(&k.to_be_bytes(), ROOT_SNAP, &v.to_be_bytes())
+                    .unwrap();
+                model.insert(k, v);
+            }
+        }
+
+        // End-state consistency: every key in the model must have the
+        // matching value in the btree, and any key not in the model must be
+        // invisible.
+        for k in 0..KEY_SPACE {
+            let from_tree = tree.find(&k.to_be_bytes()).unwrap();
+            let from_model = model.get(&k).copied();
+            match (from_tree, from_model) {
+                (Some(bytes), Some(v)) => assert_eq!(bytes, v.to_be_bytes(), "key {k}"),
+                (None, None) => {}
+                (got, want) => panic!("key {k}: tree={got:?} model={want:?}"),
+            }
+        }
+
+        // Range scan must list exactly the model's keys.
+        let scan = tree
+            .range_scan(&0u32.to_be_bytes(), &KEY_SPACE.to_be_bytes())
+            .unwrap();
+        let scan_keys: Vec<u32> = scan
+            .iter()
+            .map(|(k, _)| u32::from_be_bytes(k.as_slice().try_into().unwrap()))
+            .collect();
+        let model_keys: Vec<u32> = model.keys().copied().collect();
+        assert_eq!(scan_keys, model_keys);
         tree.verify();
     }
 }

@@ -3,8 +3,54 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 const BLOCK_SIZE: usize = 4096;
 pub const MAGIC_NUMBER: u32 = 0x39C5BB39;
 
+/// Total key buffer in DiskEntry: logical bytes followed by 4-byte snap_id (BE).
 pub const MAX_KEY_SIZE: usize = 32;
+/// Maximum length of the logical (caller-visible) portion of a key.
+/// snap_id occupies the next 4 bytes after the logical part, so
+/// `MAX_LOGICAL_KEY_SIZE + 4 == MAX_KEY_SIZE`.
+pub const MAX_LOGICAL_KEY_SIZE: usize = MAX_KEY_SIZE - 4;
 pub const MAX_VALUE_SIZE: usize = 96;
+pub const SNAP_ID_BYTES: usize = 4;
+
+/// Snapshot id type. bcachefs convention: `u32::MAX` is the root, new ids are
+/// allocated downward so a parent's id is always greater than its children's.
+pub type SnapId = u32;
+pub const ROOT_SNAP: SnapId = u32::MAX;
+
+/// Per-entry type tag. Stored in `DiskEntry::kind`.
+///
+/// - `Live`: normal key/value.
+/// - `Deleted`: trivial tombstone (KEY_TYPE_deleted in bcachefs). Produced
+///   when X deletes a key it itself wrote at snap_id == X. Compaction may
+///   drop these unconditionally.
+/// - `Whiteout`: snapshot tombstone (KEY_TYPE_whiteout in bcachefs). Produced
+///   when X deletes a key inherited from an ancestor snapshot. Must shadow
+///   the ancestor's still-live key, so compaction keeps it until the relevant
+///   snapshots are deleted.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    Live = 0,
+    Deleted = 1,
+    Whiteout = 2,
+}
+
+impl EntryKind {
+    pub fn from_u8(b: u8) -> Self {
+        match b {
+            0 => EntryKind::Live,
+            1 => EntryKind::Deleted,
+            2 => EntryKind::Whiteout,
+            // Unknown tags fall back to Live so a corrupted byte doesn't
+            // silently make data disappear; verify_node should catch it.
+            _ => EntryKind::Live,
+        }
+    }
+
+    pub fn is_tombstone(self) -> bool {
+        matches!(self, EntryKind::Deleted | EntryKind::Whiteout)
+    }
+}
 
 // ---------- Node header ----------
 
@@ -56,20 +102,35 @@ impl Payload {
 }
 
 // ---------- Disk entry ----------
+//
+// Layout of `key` buffer:
+//   bytes 0..key_len           = logical key (variable length, up to MAX_LOGICAL_KEY_SIZE)
+//   bytes key_len..key_len+4   = snap_id, big-endian (always present)
+//   bytes key_len+4..MAX_KEY_SIZE = unused, must be 0
+//
+// The "sortable key" returned by `key_bytes()` is the contiguous slice
+// `&key[..key_len + 4]` — logical bytes followed immediately by snap_id_be.
+// Comparing two sortable keys lexicographically gives the (logical, snap_id)
+// ordering: smaller logical first, ties broken by smaller snap_id.
 
 #[repr(C)]
 #[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Copy)]
 pub struct DiskEntry {
     pub key: [u8; MAX_KEY_SIZE],
+    /// Length of the logical portion of `key`. The 4 bytes immediately
+    /// after that are the snap_id. So the sortable key length is `key_len + 4`.
     pub key_len: u8,
     /// Only meaningful in leaf nodes; ignored in internal nodes.
     pub value_len: u8,
-    /// Aligns `payload` to 8 bytes so the child field is naturally aligned.
-    _pad: [u8; 6],
+    /// `EntryKind` discriminant. 0=Live, 1=Deleted, 2=Whiteout.
+    pub kind: u8,
+    /// Padding to keep `payload` 8-byte aligned.
+    _pad: [u8; 5],
     pub payload: Payload,
 }
 
-const _: () = assert!(std::mem::size_of::<DiskEntry>() == MAX_KEY_SIZE + 1 + 7 + MAX_VALUE_SIZE); // 136
+const _: () =
+    assert!(std::mem::size_of::<DiskEntry>() == MAX_KEY_SIZE + 1 + 1 + 1 + 5 + MAX_VALUE_SIZE); // 136
 
 const ENTRY_SIZE: usize = std::mem::size_of::<DiskEntry>();
 const HEADER_SIZE: usize = std::mem::size_of::<NodeHeader>();
@@ -97,15 +158,64 @@ const _: () = assert!(std::mem::size_of::<BtreeNodeRaw>() == BLOCK_SIZE);
 // ---------- Methods ----------
 
 impl DiskEntry {
-    pub fn key_bytes(&self) -> &[u8] {
+    /// Logical key bytes only (no snap_id appended). This is what callers
+    /// outside the btree see.
+    pub fn logical_key_bytes(&self) -> &[u8] {
         &self.key[..self.key_len as usize]
     }
 
-    pub fn set_key(&mut self, bytes: &[u8]) {
-        let len = bytes.len().min(MAX_KEY_SIZE);
-        self.key[..len].copy_from_slice(&bytes[..len]);
-        self.key[len..].fill(0);
-        self.key_len = len as u8;
+    /// Full sortable key bytes: logical || snap_id_be. This is what
+    /// `BtreeNodeRaw::search` and all internal comparisons use.
+    /// Length is `key_len + 4`.
+    pub fn key_bytes(&self) -> &[u8] {
+        let n = self.key_len as usize;
+        &self.key[..n + SNAP_ID_BYTES]
+    }
+
+    /// snap_id of this entry.
+    pub fn snap_id(&self) -> SnapId {
+        let n = self.key_len as usize;
+        SnapId::from_be_bytes(self.key[n..n + SNAP_ID_BYTES].try_into().unwrap())
+    }
+
+    pub fn set_snap_id(&mut self, snap: SnapId) {
+        let n = self.key_len as usize;
+        self.key[n..n + SNAP_ID_BYTES].copy_from_slice(&snap.to_be_bytes());
+    }
+
+    pub fn kind_enum(&self) -> EntryKind {
+        EntryKind::from_u8(self.kind)
+    }
+
+    pub fn set_kind(&mut self, k: EntryKind) {
+        self.kind = k as u8;
+    }
+
+    /// Set the entry's key from a *sortable* byte slice: the last 4 bytes
+    /// are taken as snap_id_be, everything before that is the logical key.
+    /// This matches the slice returned by `key_bytes()` so `set_key(other.key_bytes())`
+    /// copies a key faithfully between entries.
+    pub fn set_key(&mut self, sortable: &[u8]) {
+        assert!(
+            sortable.len() >= SNAP_ID_BYTES,
+            "sortable key must include {SNAP_ID_BYTES}-byte snap_id suffix; got {} bytes",
+            sortable.len()
+        );
+        let total = sortable.len().min(MAX_KEY_SIZE);
+        self.key[..total].copy_from_slice(&sortable[..total]);
+        self.key[total..].fill(0);
+        self.key_len = (total - SNAP_ID_BYTES) as u8;
+    }
+
+    /// Set the entry's key from an explicit (logical, snap_id) pair.
+    /// Use this when constructing entries from caller-provided keys that
+    /// don't include a snap_id suffix.
+    pub fn set_key_with_snap(&mut self, logical: &[u8], snap: SnapId) {
+        let n = logical.len().min(MAX_LOGICAL_KEY_SIZE);
+        self.key[..n].copy_from_slice(&logical[..n]);
+        self.key[n..n + SNAP_ID_BYTES].copy_from_slice(&snap.to_be_bytes());
+        self.key[n + SNAP_ID_BYTES..].fill(0);
+        self.key_len = n as u8;
     }
 
     pub fn empty() -> Self {
@@ -113,7 +223,8 @@ impl DiskEntry {
             key: [0u8; MAX_KEY_SIZE],
             key_len: 0,
             value_len: 0,
-            _pad: [0u8; 6],
+            kind: EntryKind::Live as u8,
+            _pad: [0u8; 5],
             payload: Payload([0u8; MAX_VALUE_SIZE]),
         }
     }

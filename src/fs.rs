@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::block_btree::{MAX_KEY_SIZE, MAX_VALUE_SIZE};
+use crate::block_btree::{MAX_LOGICAL_KEY_SIZE, MAX_VALUE_SIZE, ROOT_SNAP, SnapId};
 use crate::btree::{Btree, Result};
 
 const BLOCK_SIZE: usize = 4096;
@@ -22,13 +22,30 @@ pub const FILE_KIND_DIR: u8 = 2;
 const KIND_INODE: u8 = 1;
 const KIND_DIRENT: u8 = 2;
 const KIND_EXTENT: u8 = 3;
+/// Snapshot tree: maps a snap_id to its parent_id (and other metadata).
+/// Stored at logical key `[KIND_SNAPSHOT, snap_id_be]` with the entry's
+/// own snap_id always set to ROOT_SNAP — snapshot metadata is global, not
+/// versioned by snapshot.
+const KIND_SNAPSHOT: u8 = 0xF0;
+/// Subvolume tree: maps a subvol_id to its current snap_id and root inode.
+/// Stored at logical key `[KIND_SUBVOL, subvol_id_be]` with snap=ROOT_SNAP.
+const KIND_SUBVOL: u8 = 0xF1;
 
 const INODE_KEY_LEN: usize = 1 + 8;
 const DIRENT_PREFIX_LEN: usize = 1 + 8;
 const EXTENT_KEY_LEN: usize = 1 + 8 + 8;
+const SNAPSHOT_KEY_LEN: usize = 1 + 4;
+const SUBVOL_KEY_LEN: usize = 1 + 4;
 
-/// Longest dirent name that still fits in MAX_KEY_SIZE.
-pub const MAX_NAME_LEN: usize = MAX_KEY_SIZE - DIRENT_PREFIX_LEN;
+/// Sentinel meaning "no parent" in the snapshot tree. Real snap_ids are
+/// allocated downward from `ROOT_SNAP = u32::MAX`, so 0 will never collide.
+pub const NO_PARENT_SNAP: SnapId = 0;
+/// Default top-level subvolume id. Created by `Fs::new()`.
+pub const ROOT_SUBVOL: SubvolId = 1;
+pub type SubvolId = u32;
+
+/// Longest dirent name that still fits in the logical-key portion of an entry.
+pub const MAX_NAME_LEN: usize = MAX_LOGICAL_KEY_SIZE - DIRENT_PREFIX_LEN;
 
 fn inode_key(ino: u64) -> [u8; INODE_KEY_LEN] {
     let mut k = [0u8; INODE_KEY_LEN];
@@ -78,6 +95,20 @@ fn extent_offset_from_key(key: &[u8]) -> u64 {
 
 fn dirent_name_from_key(key: &[u8]) -> &[u8] {
     &key[DIRENT_PREFIX_LEN..]
+}
+
+fn snapshot_key(snap: SnapId) -> [u8; SNAPSHOT_KEY_LEN] {
+    let mut k = [0u8; SNAPSHOT_KEY_LEN];
+    k[0] = KIND_SNAPSHOT;
+    k[1..].copy_from_slice(&snap.to_be_bytes());
+    k
+}
+
+fn subvol_key(subvol: SubvolId) -> [u8; SUBVOL_KEY_LEN] {
+    let mut k = [0u8; SUBVOL_KEY_LEN];
+    k[0] = KIND_SUBVOL;
+    k[1..].copy_from_slice(&subvol.to_be_bytes());
+    k
 }
 
 // ---------- Value structs ----------
@@ -132,6 +163,81 @@ pub struct ExtentV1 {
 
 const _: () = assert!(std::mem::size_of::<ExtentV1>() == 16);
 
+/// Per-snapshot metadata (one entry per snap_id in the snapshot tree).
+/// `parent_id == NO_PARENT_SNAP` means the snapshot has no ancestor (root of
+/// a snapshot tree). bcachefs convention: parent ids are always larger than
+/// child ids, since new snap_ids are allocated downward from `ROOT_SNAP`.
+#[repr(C)]
+#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotV1 {
+    pub parent_id: SnapId,
+    /// bit 0 = readonly snapshot view (set on the snapshot side after a
+    /// `snapshot_subvol` call; the original subvolume keeps a writable id).
+    pub flags: u32,
+    _reserved: [u8; 16],
+}
+
+const _: () = assert!(std::mem::size_of::<SnapshotV1>() == 24);
+
+/// Per-subvolume metadata. The `snap_id` is the subvolume's *current*
+/// active snap_id — every fs op performed inside this subvolume reads and
+/// writes at this snap_id.
+#[repr(C)]
+#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubvolV1 {
+    pub snap_id: SnapId,
+    pub flags: u32,
+    pub root_inode: u64,
+    pub parent_subvol: SubvolId,
+    _reserved: [u8; 12],
+}
+
+const _: () = assert!(std::mem::size_of::<SubvolV1>() == 32);
+
+pub const SUBVOL_FLAG_READONLY: u32 = 1 << 0;
+
+// ---------- Fs error type ----------
+
+/// High-level filesystem errors. The lower-level Btree calls return
+/// `btree::Result<T>`; high-level ops (unlink, rmdir, rename, ...) return
+/// `FsResult<T>` so they can also signal POSIX-ish conditions like ENOENT.
+/// `fuse.rs` maps these to libc errnos.
+#[derive(Debug)]
+pub enum FsError {
+    /// Underlying btree returned an error (block missing / I/O / corruption).
+    Btree(crate::btree::Error),
+    /// Path component not found (ENOENT).
+    NotFound,
+    /// Operation expected a directory, found a regular file (ENOTDIR).
+    NotADirectory,
+    /// rmdir on a non-empty directory (ENOTEMPTY).
+    NotEmpty,
+    /// rename / create where the target already exists (EEXIST).
+    AlreadyExists,
+}
+
+impl std::fmt::Display for FsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FsError::Btree(e) => write!(f, "btree: {e}"),
+            FsError::NotFound => f.write_str("not found"),
+            FsError::NotADirectory => f.write_str("not a directory"),
+            FsError::NotEmpty => f.write_str("directory not empty"),
+            FsError::AlreadyExists => f.write_str("already exists"),
+        }
+    }
+}
+
+impl std::error::Error for FsError {}
+
+impl From<crate::btree::Error> for FsError {
+    fn from(e: crate::btree::Error) -> Self {
+        FsError::Btree(e)
+    }
+}
+
+pub type FsResult<T> = std::result::Result<T, FsError>;
+
 // ---------- Fs ----------
 
 pub struct Fs {
@@ -139,16 +245,69 @@ pub struct Fs {
     data_blocks: HashMap<u64, [u8; BLOCK_SIZE]>,
     next_ino: u64,
     next_data_block: u64,
+    /// Smallest snap_id allocated so far minus one. New snapshots take ids
+    /// counting down from `next_snap_id`. bcachefs: parent always > child.
+    #[allow(dead_code)] // wired up in Phase 8 (snapshot_subvol)
+    next_snap_id: SnapId,
+    /// Smallest subvol_id not yet used. Subvol ids count up from ROOT_SUBVOL.
+    #[allow(dead_code)] // wired up in Phase 8 (snapshot_subvol)
+    next_subvol_id: SubvolId,
+    /// The currently active subvolume — every fs op reads/writes at this
+    /// subvol's snap_id. v1 always uses ROOT_SUBVOL; multi-subvol switching
+    /// is a future feature.
+    current_subvol: SubvolId,
 }
 
 impl Fs {
     pub fn new() -> Self {
-        Fs {
+        let mut fs = Fs {
             tree: Btree::new(),
             data_blocks: HashMap::new(),
             next_ino: ROOT_INO,
             next_data_block: 0,
-        }
+            // First child snapshot gets id = ROOT_SNAP - 1.
+            next_snap_id: ROOT_SNAP - 1,
+            next_subvol_id: ROOT_SUBVOL + 1,
+            current_subvol: ROOT_SUBVOL,
+        };
+        // Seed the snapshot tree with the root snapshot. parent=NO_PARENT_SNAP
+        // marks it as the top of its tree. Stored under snap=ROOT_SNAP itself
+        // so the metadata is reachable from any snapshot view.
+        fs.put_snapshot(
+            ROOT_SNAP,
+            &SnapshotV1 {
+                parent_id: NO_PARENT_SNAP,
+                flags: 0,
+                _reserved: [0; 16],
+            },
+        )
+        .expect("seed root snapshot");
+        // Seed the default subvolume.
+        fs.put_subvol(
+            ROOT_SUBVOL,
+            &SubvolV1 {
+                snap_id: ROOT_SNAP,
+                flags: 0,
+                root_inode: ROOT_INO,
+                parent_subvol: 0,
+                _reserved: [0; 12],
+            },
+        )
+        .expect("seed root subvolume");
+        fs
+    }
+
+    /// snap_id active in the currently selected subvolume. Used by every
+    /// fs op as the snap_id to read at and write under.
+    pub fn current_snap(&self) -> SnapId {
+        self.get_subvol(self.current_subvol)
+            .expect("subvol lookup")
+            .expect("current subvolume is missing")
+            .snap_id
+    }
+
+    pub fn current_subvol(&self) -> SubvolId {
+        self.current_subvol
     }
 
     pub fn alloc_ino(&mut self) -> u64 {
@@ -164,31 +323,122 @@ impl Fs {
         nr
     }
 
+    // -- Snapshot tree --
+    //
+    // Snapshot metadata lives in the same physical Btree at prefix
+    // KIND_SNAPSHOT. Every entry is stored at snap=ROOT_SNAP so the
+    // ancestor walk for snapshot lookup itself doesn't recurse — snapshot
+    // metadata is global, not versioned.
+
+    pub fn put_snapshot(&mut self, snap: SnapId, sv: &SnapshotV1) -> Result<()> {
+        self.tree
+            .insert_at(&snapshot_key(snap), ROOT_SNAP, sv.as_bytes())
+    }
+
+    pub fn get_snapshot(&self, snap: SnapId) -> Result<Option<SnapshotV1>> {
+        let bytes = self.tree.find_at(&snapshot_key(snap), ROOT_SNAP)?;
+        Ok(bytes.map(|b| SnapshotV1::read_from_bytes(&b).expect("snapshot value size mismatch")))
+    }
+
+    /// Walk the snapshot ancestor chain starting at `snap`. Yields
+    /// `[snap, parent(snap), grandparent(snap), ...]`, stopping at the first
+    /// snapshot whose `parent_id == NO_PARENT_SNAP` (a tree root) or whose
+    /// metadata is missing (defensive: shouldn't happen in a valid tree).
+    pub fn ancestor_chain(&self, snap: SnapId) -> Result<Vec<SnapId>> {
+        let mut chain = vec![snap];
+        let mut cur = snap;
+        while let Some(meta) = self.get_snapshot(cur)? {
+            if meta.parent_id == NO_PARENT_SNAP {
+                break;
+            }
+            // Defensive: in a well-formed tree parent_id > cur. A self-loop
+            // or downward link would imply corruption; bail out.
+            if meta.parent_id <= cur {
+                break;
+            }
+            chain.push(meta.parent_id);
+            cur = meta.parent_id;
+        }
+        Ok(chain)
+    }
+
+    /// Is `ancestor` on the ancestor chain of `of` (inclusive)?
+    pub fn is_ancestor(&self, ancestor: SnapId, of: SnapId) -> Result<bool> {
+        // Optimization vs the chain walker: ancestors always have id >=
+        // descendant, so if ancestor < of we can short-circuit.
+        if ancestor < of {
+            return Ok(false);
+        }
+        let mut cur = of;
+        loop {
+            if cur == ancestor {
+                return Ok(true);
+            }
+            let Some(meta) = self.get_snapshot(cur)? else {
+                return Ok(false);
+            };
+            if meta.parent_id == NO_PARENT_SNAP || meta.parent_id <= cur {
+                return Ok(false);
+            }
+            cur = meta.parent_id;
+        }
+    }
+
+    // -- Subvolume tree --
+
+    pub fn put_subvol(&mut self, id: SubvolId, sv: &SubvolV1) -> Result<()> {
+        self.tree
+            .insert_at(&subvol_key(id), ROOT_SNAP, sv.as_bytes())
+    }
+
+    pub fn get_subvol(&self, id: SubvolId) -> Result<Option<SubvolV1>> {
+        let bytes = self.tree.find_at(&subvol_key(id), ROOT_SNAP)?;
+        Ok(bytes.map(|b| SubvolV1::read_from_bytes(&b).expect("subvol value size mismatch")))
+    }
+
     // -- Inode --
 
     pub fn put_inode(&mut self, ino: u64, inode: &InodeV1) -> Result<()> {
-        self.tree.insert(&inode_key(ino), inode.as_bytes())
+        let snap = self.current_snap();
+        self.tree.insert_at(&inode_key(ino), snap, inode.as_bytes())
     }
 
     pub fn get_inode(&self, ino: u64) -> Result<Option<InodeV1>> {
-        let bytes = self.tree.find(&inode_key(ino))?;
+        let chain = self.current_chain()?;
+        let bytes = self.tree.find_visible(&inode_key(ino), &chain)?;
         Ok(bytes.map(|b| InodeV1::read_from_bytes(&b).expect("inode value size mismatch")))
+    }
+
+    pub fn delete_inode(&mut self, ino: u64) -> Result<bool> {
+        let snap = self.current_snap();
+        let chain = self.current_chain()?;
+        self.tree.delete_at(&inode_key(ino), snap, &chain)
     }
 
     // -- Dirent --
 
     pub fn put_dirent(&mut self, parent: u64, name: &[u8], d: &DirentV1) -> Result<()> {
-        self.tree.insert(&dirent_key(parent, name), d.as_bytes())
+        let snap = self.current_snap();
+        self.tree
+            .insert_at(&dirent_key(parent, name), snap, d.as_bytes())
     }
 
     pub fn lookup_dirent(&self, parent: u64, name: &[u8]) -> Result<Option<DirentV1>> {
-        let bytes = self.tree.find(&dirent_key(parent, name))?;
+        let chain = self.current_chain()?;
+        let bytes = self.tree.find_visible(&dirent_key(parent, name), &chain)?;
         Ok(bytes.map(|b| DirentV1::read_from_bytes(&b).expect("dirent value size mismatch")))
     }
 
+    pub fn delete_dirent(&mut self, parent: u64, name: &[u8]) -> Result<bool> {
+        let snap = self.current_snap();
+        let chain = self.current_chain()?;
+        self.tree.delete_at(&dirent_key(parent, name), snap, &chain)
+    }
+
     pub fn list_dirents(&self, parent: u64) -> Result<Vec<(Vec<u8>, DirentV1)>> {
+        let chain = self.current_chain()?;
         let (start, end) = dirent_range(parent);
-        let entries = self.tree.range_scan(&start, &end)?;
+        let entries = self.tree.range_scan_visible(&start, &end, &chain)?;
         Ok(entries
             .into_iter()
             .map(|(k, v)| {
@@ -207,6 +457,7 @@ impl Fs {
             "extent data too large: {} > {BLOCK_SIZE}",
             data.len()
         );
+        let snap = self.current_snap();
         let block_nr = self.alloc_data_block();
         let block = self.data_blocks.get_mut(&block_nr).unwrap();
         block[..data.len()].copy_from_slice(data);
@@ -216,12 +467,19 @@ impl Fs {
             data_block: block_nr,
         };
         self.tree
-            .insert(&extent_key(ino, offset), extent.as_bytes())
+            .insert_at(&extent_key(ino, offset), snap, extent.as_bytes())
     }
 
     pub fn get_extent(&self, ino: u64, offset: u64) -> Result<Option<ExtentV1>> {
-        let bytes = self.tree.find(&extent_key(ino, offset))?;
+        let chain = self.current_chain()?;
+        let bytes = self.tree.find_visible(&extent_key(ino, offset), &chain)?;
         Ok(bytes.map(|b| ExtentV1::read_from_bytes(&b).expect("extent value size mismatch")))
+    }
+
+    pub fn delete_extent(&mut self, ino: u64, offset: u64) -> Result<bool> {
+        let snap = self.current_snap();
+        let chain = self.current_chain()?;
+        self.tree.delete_at(&extent_key(ino, offset), snap, &chain)
     }
 
     pub fn read_data_block(&self, block_nr: u64) -> &[u8; BLOCK_SIZE] {
@@ -229,8 +487,9 @@ impl Fs {
     }
 
     pub fn list_extents(&self, ino: u64) -> Result<Vec<(u64, ExtentV1)>> {
+        let chain = self.current_chain()?;
         let (start, end) = extent_range(ino);
-        let entries = self.tree.range_scan(&start, &end)?;
+        let entries = self.tree.range_scan_visible(&start, &end, &chain)?;
         Ok(entries
             .into_iter()
             .map(|(k, v)| {
@@ -239,6 +498,198 @@ impl Fs {
                 (offset, extent)
             })
             .collect())
+    }
+
+    /// The ancestor chain of the currently active subvolume's snap_id.
+    /// Used by every read path to resolve visibility.
+    fn current_chain(&self) -> Result<Vec<SnapId>> {
+        self.ancestor_chain(self.current_snap())
+    }
+
+    // -- High-level POSIX-ish ops (Phase 7) --
+    //
+    // These wrap multi-key changes in a single Btree::transaction so the
+    // outside view sees a single root swap (atomic).
+
+    /// Remove a regular file. Decrements nlink; on the last link, removes
+    /// the inode and all of its extents (data blocks remain in `data_blocks`
+    /// for now — block reclamation is a TODO since snapshots can still hold
+    /// references to them via inherited extent entries).
+    pub fn unlink(&mut self, parent: u64, name: &[u8]) -> FsResult<()> {
+        let snap = self.current_snap();
+        let chain = self.current_chain()?;
+
+        let dirent = self.lookup_dirent(parent, name)?.ok_or(FsError::NotFound)?;
+        let target_ino = dirent.target_ino;
+        let inode = self.get_inode(target_ino)?.ok_or(FsError::NotFound)?;
+
+        // Last-link case: pre-collect extent offsets to delete in tx. Done
+        // here (not inside the closure) because we only have &mut Tx in the
+        // closure, not access to Fs::list_extents.
+        let extents: Vec<u64> = if inode.nlink <= 1 {
+            self.list_extents(target_ino)?
+                .into_iter()
+                .map(|(off, _)| off)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let dirent_k = dirent_key(parent, name);
+        let inode_k = inode_key(target_ino);
+
+        self.tree.transaction(|tx| {
+            tx.delete_at(&dirent_k, snap, &chain)?;
+            if inode.nlink <= 1 {
+                for offset in &extents {
+                    tx.delete_at(&extent_key(target_ino, *offset), snap, &chain)?;
+                }
+                tx.delete_at(&inode_k, snap, &chain)?;
+            } else {
+                let mut updated = inode;
+                updated.nlink -= 1;
+                tx.insert(&inode_k, snap, updated.as_bytes())?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Remove an empty directory. Returns ENOTDIR if the target isn't a
+    /// directory and ENOTEMPTY if it has any visible children.
+    pub fn rmdir(&mut self, parent: u64, name: &[u8]) -> FsResult<()> {
+        let snap = self.current_snap();
+        let chain = self.current_chain()?;
+
+        let dirent = self.lookup_dirent(parent, name)?.ok_or(FsError::NotFound)?;
+        if dirent.kind != FILE_KIND_DIR {
+            return Err(FsError::NotADirectory);
+        }
+        let target_ino = dirent.target_ino;
+
+        // list_dirents already filters tombstones via range_scan_visible,
+        // so any non-empty result means a live child still exists.
+        if !self.list_dirents(target_ino)?.is_empty() {
+            return Err(FsError::NotEmpty);
+        }
+
+        let dirent_k = dirent_key(parent, name);
+        let inode_k = inode_key(target_ino);
+
+        self.tree.transaction(|tx| {
+            tx.delete_at(&dirent_k, snap, &chain)?;
+            tx.delete_at(&inode_k, snap, &chain)?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Move a dirent from `(old_parent, old_name)` to `(new_parent, new_name)`.
+    /// v1 refuses when the destination exists (EEXIST); overwrite-rename
+    /// can be added later.
+    pub fn rename(
+        &mut self,
+        old_parent: u64,
+        old_name: &[u8],
+        new_parent: u64,
+        new_name: &[u8],
+    ) -> FsResult<()> {
+        let snap = self.current_snap();
+        let chain = self.current_chain()?;
+
+        let src_dirent = self
+            .lookup_dirent(old_parent, old_name)?
+            .ok_or(FsError::NotFound)?;
+        if self.lookup_dirent(new_parent, new_name)?.is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+
+        let old_k = dirent_key(old_parent, old_name);
+        let new_k = dirent_key(new_parent, new_name);
+
+        self.tree.transaction(|tx| {
+            tx.insert(&new_k, snap, src_dirent.as_bytes())?;
+            tx.delete_at(&old_k, snap, &chain)?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    // -- Snapshot create (Phase 8) --
+
+    /// Take a writable snapshot of `src` subvolume.
+    ///
+    /// bcachefs flow:
+    /// 1. The src subvol is currently at snap_id S.
+    /// 2. Allocate two new ids `S_w` and `S_ro` (both `< S`).
+    /// 3. Both become children of S in the snapshot tree.
+    /// 4. The src subvol's snap_id flips to `S_w` (it keeps writing here).
+    /// 5. A fresh subvol is created pointing at `S_ro`, marked readonly.
+    ///
+    /// The result: existing data (written at S) is visible from BOTH the
+    /// updated src subvol (via S_w → S in chain) and the new snapshot
+    /// (via S_ro → S in chain). New writes diverge.
+    ///
+    /// Returns the new readonly subvolume's id.
+    pub fn snapshot_subvol(&mut self, src: SubvolId) -> FsResult<SubvolId> {
+        let src_subvol = self.get_subvol(src)?.ok_or(FsError::NotFound)?;
+        let parent_snap = src_subvol.snap_id;
+
+        // Allocate ids. bcachefs allocates snap_ids decreasing so that
+        // parent.id > child.id always holds — assertion enforced in
+        // ancestor_chain.
+        let s_w = self.next_snap_id;
+        let s_ro = self.next_snap_id - 1;
+        self.next_snap_id = self.next_snap_id.saturating_sub(2);
+        let new_subvol_id = self.next_subvol_id;
+        self.next_subvol_id = self.next_subvol_id.saturating_add(1);
+
+        let snap_w = SnapshotV1 {
+            parent_id: parent_snap,
+            flags: 0,
+            _reserved: [0; 16],
+        };
+        let snap_ro = SnapshotV1 {
+            parent_id: parent_snap,
+            flags: 1, // readonly view; not enforced yet but recorded.
+            _reserved: [0; 16],
+        };
+        let mut updated_src = src_subvol;
+        updated_src.snap_id = s_w;
+        let dst_subvol = SubvolV1 {
+            snap_id: s_ro,
+            flags: SUBVOL_FLAG_READONLY,
+            root_inode: src_subvol.root_inode,
+            parent_subvol: src,
+            _reserved: [0; 12],
+        };
+
+        let s_w_key = snapshot_key(s_w);
+        let s_ro_key = snapshot_key(s_ro);
+        let src_subvol_key = subvol_key(src);
+        let dst_subvol_key = subvol_key(new_subvol_id);
+
+        self.tree.transaction(|tx| {
+            tx.insert(&s_w_key, ROOT_SNAP, snap_w.as_bytes())?;
+            tx.insert(&s_ro_key, ROOT_SNAP, snap_ro.as_bytes())?;
+            // Overwrite src subvol with bumped snap_id.
+            tx.insert(&src_subvol_key, ROOT_SNAP, updated_src.as_bytes())?;
+            // Insert the new readonly subvol.
+            tx.insert(&dst_subvol_key, ROOT_SNAP, dst_subvol.as_bytes())?;
+            Ok(())
+        })?;
+
+        Ok(new_subvol_id)
+    }
+
+    /// Switch the active subvolume. All subsequent fs ops read and write
+    /// at the target subvol's snap_id.
+    pub fn switch_subvol(&mut self, id: SubvolId) -> FsResult<()> {
+        if self.get_subvol(id)?.is_none() {
+            return Err(FsError::NotFound);
+        }
+        self.current_subvol = id;
+        Ok(())
     }
 }
 
@@ -387,5 +838,338 @@ mod tests {
         assert_eq!(fs.alloc_ino(), ROOT_INO);
         assert_eq!(fs.alloc_ino(), ROOT_INO + 1);
         assert_eq!(fs.alloc_ino(), ROOT_INO + 2);
+    }
+
+    // ---------- Phase 3: snapshot + subvolume tree ----------
+
+    #[test]
+    fn fs_new_seeds_root_snapshot_and_subvol() {
+        let fs = Fs::new();
+        // The ROOT_SNAP entry exists with no parent.
+        let s = fs.get_snapshot(ROOT_SNAP).unwrap().unwrap();
+        assert_eq!(s.parent_id, NO_PARENT_SNAP);
+        // The default subvolume points at ROOT_SNAP and is the active one.
+        let v = fs.get_subvol(ROOT_SUBVOL).unwrap().unwrap();
+        assert_eq!(v.snap_id, ROOT_SNAP);
+        assert_eq!(v.root_inode, ROOT_INO);
+        assert_eq!(fs.current_subvol(), ROOT_SUBVOL);
+        assert_eq!(fs.current_snap(), ROOT_SNAP);
+    }
+
+    #[test]
+    fn ancestor_chain_walks_to_root() {
+        // Manually build a snapshot tree:
+        //   ROOT_SNAP
+        //      |
+        //     100
+        //      |
+        //     50
+        let mut fs = Fs::new();
+        fs.put_snapshot(
+            100,
+            &SnapshotV1 {
+                parent_id: ROOT_SNAP,
+                flags: 0,
+                _reserved: [0; 16],
+            },
+        )
+        .unwrap();
+        fs.put_snapshot(
+            50,
+            &SnapshotV1 {
+                parent_id: 100,
+                flags: 0,
+                _reserved: [0; 16],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs.ancestor_chain(50).unwrap(), vec![50, 100, ROOT_SNAP]);
+        assert_eq!(fs.ancestor_chain(100).unwrap(), vec![100, ROOT_SNAP]);
+        assert_eq!(fs.ancestor_chain(ROOT_SNAP).unwrap(), vec![ROOT_SNAP]);
+    }
+
+    #[test]
+    fn is_ancestor_inclusive_and_directional() {
+        let mut fs = Fs::new();
+        fs.put_snapshot(
+            100,
+            &SnapshotV1 {
+                parent_id: ROOT_SNAP,
+                flags: 0,
+                _reserved: [0; 16],
+            },
+        )
+        .unwrap();
+        fs.put_snapshot(
+            50,
+            &SnapshotV1 {
+                parent_id: 100,
+                flags: 0,
+                _reserved: [0; 16],
+            },
+        )
+        .unwrap();
+
+        // Self is an ancestor of self (inclusive).
+        assert!(fs.is_ancestor(50, 50).unwrap());
+        // Direct parent and grandparent.
+        assert!(fs.is_ancestor(100, 50).unwrap());
+        assert!(fs.is_ancestor(ROOT_SNAP, 50).unwrap());
+        // Reverse direction is false.
+        assert!(!fs.is_ancestor(50, 100).unwrap());
+        assert!(!fs.is_ancestor(50, ROOT_SNAP).unwrap());
+        // Snapshots on different branches: nothing in between.
+        fs.put_snapshot(
+            80,
+            &SnapshotV1 {
+                parent_id: ROOT_SNAP,
+                flags: 0,
+                _reserved: [0; 16],
+            },
+        )
+        .unwrap();
+        // 80 and 50 are both descendants of ROOT_SNAP but unrelated.
+        assert!(!fs.is_ancestor(80, 50).unwrap());
+        assert!(!fs.is_ancestor(50, 80).unwrap());
+        // Their common ancestor IS an ancestor of both.
+        assert!(fs.is_ancestor(ROOT_SNAP, 80).unwrap());
+        assert!(fs.is_ancestor(ROOT_SNAP, 50).unwrap());
+    }
+
+    #[test]
+    fn snapshot_metadata_does_not_leak_into_user_keyspace() {
+        // Snapshot/subvol entries live in the same physical Btree but with
+        // dedicated kind-byte prefixes, so a list_dirents under the user's
+        // root inode must not see them.
+        let mut fs = Fs::new();
+        fs.put_dirent(ROOT_INO, b"hello", &DirentV1::new(2, FILE_KIND_REGULAR))
+            .unwrap();
+        let dirents = fs.list_dirents(ROOT_INO).unwrap();
+        assert_eq!(dirents.len(), 1);
+        assert_eq!(dirents[0].0, b"hello");
+    }
+
+    // ---------- Phase 7: unlink / rmdir / rename ----------
+
+    fn make_root(fs: &mut Fs) {
+        // alloc_ino() returns ROOT_INO=1 first (matching fuse.rs convention).
+        let r = fs.alloc_ino();
+        debug_assert_eq!(r, ROOT_INO);
+        fs.put_inode(ROOT_INO, &sample_inode(0)).unwrap();
+    }
+
+    fn make_file(fs: &mut Fs, parent: u64, name: &[u8]) -> u64 {
+        let ino = fs.alloc_ino();
+        fs.put_inode(ino, &sample_inode(0)).unwrap();
+        fs.put_dirent(parent, name, &DirentV1::new(ino, FILE_KIND_REGULAR))
+            .unwrap();
+        ino
+    }
+
+    fn make_dir(fs: &mut Fs, parent: u64, name: &[u8]) -> u64 {
+        let ino = fs.alloc_ino();
+        let mut ind = sample_inode(0);
+        ind.mode = 0o040755;
+        fs.put_inode(ino, &ind).unwrap();
+        fs.put_dirent(parent, name, &DirentV1::new(ino, FILE_KIND_DIR))
+            .unwrap();
+        ino
+    }
+
+    #[test]
+    fn unlink_removes_dirent_and_inode_for_last_link() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let ino = make_file(&mut fs, ROOT_INO, b"f");
+        fs.put_extent(ino, 0, b"hello").unwrap();
+        fs.put_extent(ino, 4096, b"world").unwrap();
+
+        fs.unlink(ROOT_INO, b"f").unwrap();
+        // Dirent gone.
+        assert_eq!(fs.lookup_dirent(ROOT_INO, b"f").unwrap(), None);
+        // Inode gone.
+        assert_eq!(fs.get_inode(ino).unwrap(), None);
+        // Extents gone (visible scan returns nothing).
+        assert_eq!(fs.list_extents(ino).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn unlink_nonexistent_returns_not_found() {
+        let mut fs = Fs::new();
+        match fs.unlink(ROOT_INO, b"missing") {
+            Err(FsError::NotFound) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rmdir_empty_dir_succeeds() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let dir_ino = make_dir(&mut fs, ROOT_INO, b"d");
+        fs.rmdir(ROOT_INO, b"d").unwrap();
+        assert_eq!(fs.lookup_dirent(ROOT_INO, b"d").unwrap(), None);
+        assert_eq!(fs.get_inode(dir_ino).unwrap(), None);
+    }
+
+    #[test]
+    fn rmdir_nonempty_returns_not_empty() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let dir_ino = make_dir(&mut fs, ROOT_INO, b"d");
+        let _ = make_file(&mut fs, dir_ino, b"child");
+        match fs.rmdir(ROOT_INO, b"d") {
+            Err(FsError::NotEmpty) => {}
+            other => panic!("expected NotEmpty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rmdir_on_regular_file_returns_not_a_directory() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let _ = make_file(&mut fs, ROOT_INO, b"f");
+        match fs.rmdir(ROOT_INO, b"f") {
+            Err(FsError::NotADirectory) => {}
+            other => panic!("expected NotADirectory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_moves_dirent_atomically() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let ino = make_file(&mut fs, ROOT_INO, b"old");
+        fs.rename(ROOT_INO, b"old", ROOT_INO, b"new").unwrap();
+        assert_eq!(fs.lookup_dirent(ROOT_INO, b"old").unwrap(), None);
+        let d = fs.lookup_dirent(ROOT_INO, b"new").unwrap().unwrap();
+        assert_eq!(d.target_ino, ino);
+    }
+
+    #[test]
+    fn rename_into_other_dir_works() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let ino = make_file(&mut fs, ROOT_INO, b"f");
+        let other_dir = make_dir(&mut fs, ROOT_INO, b"d");
+        fs.rename(ROOT_INO, b"f", other_dir, b"f").unwrap();
+        assert_eq!(fs.lookup_dirent(ROOT_INO, b"f").unwrap(), None);
+        let d = fs.lookup_dirent(other_dir, b"f").unwrap().unwrap();
+        assert_eq!(d.target_ino, ino);
+    }
+
+    #[test]
+    fn rename_refuses_when_dst_exists() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let _ = make_file(&mut fs, ROOT_INO, b"src");
+        let _ = make_file(&mut fs, ROOT_INO, b"dst");
+        match fs.rename(ROOT_INO, b"src", ROOT_INO, b"dst") {
+            Err(FsError::AlreadyExists) => {}
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unlink_then_recreate_with_same_name() {
+        // Tombstone semantics: after delete + insert, same logical key has a
+        // single Live entry visible.
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let _ = make_file(&mut fs, ROOT_INO, b"f");
+        fs.unlink(ROOT_INO, b"f").unwrap();
+        assert_eq!(fs.lookup_dirent(ROOT_INO, b"f").unwrap(), None);
+        let new_ino = make_file(&mut fs, ROOT_INO, b"f");
+        let d = fs.lookup_dirent(ROOT_INO, b"f").unwrap().unwrap();
+        assert_eq!(d.target_ino, new_ino);
+    }
+
+    // ---------- Phase 8: snapshot create ----------
+
+    #[test]
+    fn snapshot_subvol_returns_new_subvol_with_readonly_view() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let _ = make_file(&mut fs, ROOT_INO, b"a");
+
+        let snap_subvol = fs.snapshot_subvol(ROOT_SUBVOL).unwrap();
+        // The new subvol exists, is readonly, and points at a new snap_id.
+        let dst = fs.get_subvol(snap_subvol).unwrap().unwrap();
+        assert_eq!(dst.parent_subvol, ROOT_SUBVOL);
+        assert!(dst.flags & SUBVOL_FLAG_READONLY != 0);
+        // src subvol's snap_id flipped to a fresh writable id.
+        let src = fs.get_subvol(ROOT_SUBVOL).unwrap().unwrap();
+        assert_ne!(src.snap_id, ROOT_SNAP);
+        assert_ne!(src.snap_id, dst.snap_id);
+        // Both new ids are children of the original ROOT_SNAP.
+        let s_meta = fs.get_snapshot(src.snap_id).unwrap().unwrap();
+        let d_meta = fs.get_snapshot(dst.snap_id).unwrap().unwrap();
+        assert_eq!(s_meta.parent_id, ROOT_SNAP);
+        assert_eq!(d_meta.parent_id, ROOT_SNAP);
+    }
+
+    #[test]
+    fn snapshot_preserves_view_of_pre_snap_data() {
+        // Both src and snap subvol see the file that existed before the snap.
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let ino = make_file(&mut fs, ROOT_INO, b"shared");
+
+        let snap_subvol = fs.snapshot_subvol(ROOT_SUBVOL).unwrap();
+
+        // src subvol still sees it.
+        let d = fs.lookup_dirent(ROOT_INO, b"shared").unwrap().unwrap();
+        assert_eq!(d.target_ino, ino);
+
+        // Switch to the snapshot subvol — same view.
+        fs.switch_subvol(snap_subvol).unwrap();
+        let d = fs.lookup_dirent(ROOT_INO, b"shared").unwrap().unwrap();
+        assert_eq!(d.target_ino, ino);
+    }
+
+    #[test]
+    fn writes_after_snap_are_invisible_to_snapshot() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let snap_subvol = fs.snapshot_subvol(ROOT_SUBVOL).unwrap();
+
+        // Write in src after taking the snap.
+        let _ = make_file(&mut fs, ROOT_INO, b"new_file");
+
+        // src sees it.
+        assert!(fs.lookup_dirent(ROOT_INO, b"new_file").unwrap().is_some());
+        // snapshot does NOT see it.
+        fs.switch_subvol(snap_subvol).unwrap();
+        assert!(fs.lookup_dirent(ROOT_INO, b"new_file").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_after_snap_keeps_snapshot_view() {
+        // Create file at ROOT_SNAP, take snap, then delete in src.
+        // Snapshot must still show the file (Whiteout in src shadows, but
+        // the snapshot's chain doesn't include src's new snap_id).
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let _ = make_file(&mut fs, ROOT_INO, b"victim");
+
+        let snap_subvol = fs.snapshot_subvol(ROOT_SUBVOL).unwrap();
+
+        // Delete in src.
+        fs.unlink(ROOT_INO, b"victim").unwrap();
+        assert!(fs.lookup_dirent(ROOT_INO, b"victim").unwrap().is_none());
+
+        // Switch to snapshot — file still visible.
+        fs.switch_subvol(snap_subvol).unwrap();
+        assert!(fs.lookup_dirent(ROOT_INO, b"victim").unwrap().is_some());
+    }
+
+    #[test]
+    fn switch_subvol_rejects_unknown_id() {
+        let mut fs = Fs::new();
+        match fs.switch_subvol(9999) {
+            Err(FsError::NotFound) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 }

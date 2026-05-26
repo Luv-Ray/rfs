@@ -9,13 +9,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
-    OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request, WriteFlags,
+    OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request, WriteFlags,
 };
 use libc::{S_IFDIR, S_IFMT, S_IFREG};
 
 use crate::btree;
-use crate::fs::{DirentV1, FILE_KIND_DIR, FILE_KIND_REGULAR, Fs, InodeV1, MAX_NAME_LEN, ROOT_INO};
+use crate::fs::{
+    DirentV1, FILE_KIND_DIR, FILE_KIND_REGULAR, Fs, FsError, InodeV1, MAX_NAME_LEN, ROOT_INO,
+};
 
 const BLOCK_SIZE: u64 = 4096;
 const BLOCK_SIZE_USIZE: usize = BLOCK_SIZE as usize;
@@ -165,6 +167,17 @@ fn validate_name(name: &OsStr) -> Result<&[u8], Errno> {
         return Err(Errno::ENAMETOOLONG);
     }
     Ok(bytes)
+}
+
+/// Map an FsError to a POSIX errno for FUSE replies.
+fn errno_for_fs_error(e: FsError) -> Errno {
+    match e {
+        FsError::NotFound => Errno::ENOENT,
+        FsError::NotADirectory => Errno::ENOTDIR,
+        FsError::NotEmpty => Errno::ENOTEMPTY,
+        FsError::AlreadyExists => Errno::EEXIST,
+        FsError::Btree(_) => Errno::EIO,
+    }
 }
 
 // ---------- Filesystem trait impl ----------
@@ -461,6 +474,71 @@ impl Filesystem for FuseFs {
             return;
         }
         reply.entry(&TTL, &to_attr(new_ino, &inode), GENERATION);
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
+        let mut fs = self.fs.lock().unwrap();
+        let name_bytes = match validate_name(name) {
+            Ok(b) => b,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        match fs.unlink(parent, name_bytes) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno_for_fs_error(e)),
+        }
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
+        let mut fs = self.fs.lock().unwrap();
+        let name_bytes = match validate_name(name) {
+            Ok(b) => b,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        match fs.rmdir(parent, name_bytes) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno_for_fs_error(e)),
+        }
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let parent = parent.0;
+        let newparent = newparent.0;
+        let mut fs = self.fs.lock().unwrap();
+        let name_bytes = match validate_name(name) {
+            Ok(b) => b,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        let newname_bytes = match validate_name(newname) {
+            Ok(b) => b,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        match fs.rename(parent, name_bytes, newparent, newname_bytes) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno_for_fs_error(e)),
+        }
     }
 
     fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
