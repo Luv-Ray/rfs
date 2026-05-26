@@ -7,3 +7,5 @@ edition = "2024"
 zerocopy = { version = "0.8", features = ["derive"] }
 fuser = { version = "0.17", default-features = false }
 libc = "0.2"
+elsa = "1.10"
+crc32fast = "1.4"

@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::storage::BlockStore;
 
 use crate::block_btree::{
     BSET_SOFT_LIMIT, BSET_TREE_NR_MAX, BtreeNodeRaw, DiskEntry, EntryKind, MAGIC_NUMBER,
@@ -29,16 +31,46 @@ pub type AllSnapRow = (Vec<u8>, SnapId, EntryKind, Vec<u8>);
 #[derive(Debug)]
 pub enum Error {
     /// A block referenced by the tree is missing from the block map.
-    /// On a real block device this would cover both I/O failure and
-    /// an inconsistent tree pointing at an unallocated block.
+    /// In memory-only mode this means the tree pointed at an unallocated
+    /// block; with an image backend, it means the block isn't cached
+    /// AND there's no backing file (i.e. the image was opened in memory-
+    /// -only mode by mistake).
     BlockNotFound(u64),
+    /// I/O error against the backing image file (read, write, fsync,
+    /// open, ftruncate).
+    Io(std::io::Error),
+    /// A persisted block header had the wrong magic number. Most likely
+    /// causes: image truncated, image overwritten by another tool, or
+    /// the allocator handed out the same block_nr twice.
+    BadMagic { block: u64, got: u32, expected: u32 },
+    /// Magic was correct but the per-block CRC didn't match. The block is
+    /// torn / corrupted.
+    ChecksumMismatch { block: u64 },
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::BlockNotFound(nr) => write!(f, "block {nr} not found"),
+            Error::Io(e) => write!(f, "i/o error: {e}"),
+            Error::BadMagic {
+                block,
+                got,
+                expected,
+            } => write!(
+                f,
+                "block {block}: bad magic {got:#010x} (expected {expected:#010x})"
+            ),
+            Error::ChecksumMismatch { block } => {
+                write!(f, "block {block}: checksum mismatch")
+            }
         }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
     }
 }
 
@@ -50,8 +82,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// via their block numbers (key for crash recovery and snapshots).
 pub struct Btree {
     pub root_block: u64,
-    block_map: HashMap<u64, BtreeNodeRaw>,
-    next_block_nr: u64,
+    /// Shared block storage. May be in-memory (cache only) or image-backed.
+    /// Wrapped in `Rc` because `Fs` shares the same store for data blocks.
+    pub store: Arc<BlockStore>,
     /// Monotonically increasing seq assigned to each newly opened bset.
     /// Used by the cross-bset merged iterator to break ties when the same
     /// sortable key appears in multiple bsets (latest write wins).
@@ -59,21 +92,57 @@ pub struct Btree {
 }
 
 impl Btree {
+    /// Create an in-memory tree. The root block (number 1, since block 0 is
+    /// reserved for the superblock) is allocated and seeded with an empty
+    /// bset.
     pub fn new() -> Self {
-        let root_block = 0;
-        let mut block_map = HashMap::new();
-        let mut root = BtreeNodeRaw::new(0);
-        root.start_new_bset(0);
-        block_map.insert(root_block, root);
+        let store = Arc::new(BlockStore::in_memory());
+        Self::initialize_with(store, 1)
+    }
+
+    /// Create a tree backed by the given store, allocating a fresh root.
+    /// Use this when seeding a brand-new image: caller has already created
+    /// the `BlockStore`, and we'll allocate the very first non-superblock
+    /// block to hold the empty root.
+    pub fn create_in(store: Arc<BlockStore>) -> Self {
+        Self::initialize_with(store, 1)
+    }
+
+    /// Reattach to an existing tree whose root and seq counter are stored
+    /// in a superblock. Called by `Fs::open` after parsing the superblock.
+    pub fn reopen(store: Arc<BlockStore>, root_block: u64, next_bset_seq: u64) -> Self {
         Btree {
             root_block,
-            block_map,
-            next_block_nr: 1,
+            store,
+            next_bset_seq,
+        }
+    }
+
+    fn initialize_with(store: Arc<BlockStore>, expected_root: u64) -> Self {
+        let root_block = store.alloc();
+        debug_assert_eq!(
+            root_block, expected_root,
+            "fresh tree should get block {expected_root} as its root"
+        );
+        let mut root = BtreeNodeRaw::new(0);
+        root.start_new_bset(0);
+        store
+            .write_node(root_block, &root)
+            .expect("write root into fresh store");
+        Btree {
+            root_block,
+            store,
             // Seq 0 was consumed by the root's initial bset. Subsequent bsets
             // (from inserts that open a new bset, or from compaction) start
             // at 1.
             next_bset_seq: 1,
         }
+    }
+
+    /// Read-only access to the next bset seq counter (for sync into
+    /// the superblock).
+    pub fn next_bset_seq(&self) -> u64 {
+        self.next_bset_seq
     }
 
     /// Find a key at the root snapshot. For snap-aware lookups use [`find_at`].
@@ -86,7 +155,7 @@ impl Btree {
     /// snapshot lands in Phase 4.
     pub fn find_at(&self, key: &[u8], snap: SnapId) -> Result<Option<Vec<u8>>> {
         let (buf, len) = sortable_key(key, snap);
-        find(&self.block_map, self.root_block, &buf[..len])
+        find(&self.store, self.root_block, &buf[..len])
     }
 
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -108,8 +177,7 @@ impl Btree {
     ) -> Result<()> {
         let (buf, len) = sortable_key(key, snap);
         let new_root = insert(
-            &mut self.block_map,
-            &mut self.next_block_nr,
+            &self.store,
             &mut self.next_bset_seq,
             self.root_block,
             &buf[..len],
@@ -143,8 +211,7 @@ impl Btree {
             // unchanged, no new bset is opened, no split can be triggered.
             let (buf, len) = sortable_key(key, snap);
             let new_root = flip_kind_in_place(
-                &mut self.block_map,
-                &mut self.next_block_nr,
+                &self.store,
                 self.root_block,
                 &buf[..len],
                 EntryKind::Deleted,
@@ -165,7 +232,7 @@ impl Btree {
         logical: &[u8],
         chain: &[SnapId],
     ) -> Result<Option<(Vec<u8>, SnapId)>> {
-        find_visible_with_snap(&self.block_map, self.root_block, logical, chain)
+        find_visible_with_snap(&self.store, self.root_block, logical, chain)
     }
 
     pub fn range_scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -201,7 +268,7 @@ impl Btree {
 
         let mut results = Vec::new();
         range_scan(
-            &self.block_map,
+            &self.store,
             self.root_block,
             &start_buf[..n_start + SNAP_ID_BYTES],
             &end_buf[..n_end + SNAP_ID_BYTES],
@@ -222,7 +289,7 @@ impl Btree {
     /// chain walk stops and `None` is returned (the tombstone shadows the
     /// rest of the chain).
     pub fn find_visible(&self, logical: &[u8], chain: &[SnapId]) -> Result<Option<Vec<u8>>> {
-        find_visible(&self.block_map, self.root_block, logical, chain)
+        find_visible(&self.store, self.root_block, logical, chain)
     }
 
     /// Raw range scan: returns every entry in `[start, end)` regardless of
@@ -241,7 +308,7 @@ impl Btree {
 
         let mut results = Vec::new();
         range_scan_all(
-            &self.block_map,
+            &self.store,
             self.root_block,
             &start_buf[..n_start + SNAP_ID_BYTES],
             &end_buf[..n_end + SNAP_ID_BYTES],
@@ -297,15 +364,18 @@ impl Btree {
     }
 
     pub fn dump(&self) {
-        println!("=== B-tree (next_block_nr={}) ===", self.next_block_nr);
-        dump(&self.block_map, self.root_block, 0);
+        println!(
+            "=== B-tree (next_block_nr={}) ===",
+            self.store.next_block_nr()
+        );
+        dump(&self.store, self.root_block, 0);
         println!("=== end ===");
     }
 
     /// Walk the entire tree and panic if any invariant is violated.
     #[cfg(test)]
     pub fn verify(&self) {
-        verify_node(&self.block_map, self.root_block, None, None);
+        verify_node(&self.store, self.root_block, None, None);
     }
 }
 
@@ -317,7 +387,7 @@ impl Btree {
 // the old state. On commit, the new root takes effect atomically.
 //
 // On abort (closure returning Err), the btree's `root_block` is unchanged.
-// New blocks allocated during the transaction remain in `block_map` as
+// New blocks allocated during the transaction remain in `store` as
 // orphans (unreachable, awaiting future GC).
 //
 // Limitations vs bcachefs `btree_trans`:
@@ -347,8 +417,7 @@ impl<'a> Tx<'a> {
     ) -> Result<()> {
         let (buf, len) = sortable_key(key, snap);
         let new_root = insert(
-            &mut self.btree.block_map,
-            &mut self.btree.next_block_nr,
+            &self.btree.store,
             &mut self.btree.next_bset_seq,
             self.pending_root,
             &buf[..len],
@@ -361,15 +430,14 @@ impl<'a> Tx<'a> {
 
     pub fn delete_at(&mut self, key: &[u8], snap: SnapId, chain: &[SnapId]) -> Result<bool> {
         let Some((_value, visible_snap)) =
-            find_visible_with_snap(&self.btree.block_map, self.pending_root, key, chain)?
+            find_visible_with_snap(&self.btree.store, self.pending_root, key, chain)?
         else {
             return Ok(false);
         };
         if visible_snap == snap {
             let (buf, len) = sortable_key(key, snap);
             let new_root = flip_kind_in_place(
-                &mut self.btree.block_map,
-                &mut self.btree.next_block_nr,
+                &self.btree.store,
                 self.pending_root,
                 &buf[..len],
                 EntryKind::Deleted,
@@ -383,11 +451,11 @@ impl<'a> Tx<'a> {
 
     pub fn find_at(&self, key: &[u8], snap: SnapId) -> Result<Option<Vec<u8>>> {
         let (buf, len) = sortable_key(key, snap);
-        find(&self.btree.block_map, self.pending_root, &buf[..len])
+        find(&self.btree.store, self.pending_root, &buf[..len])
     }
 
     pub fn find_visible(&self, key: &[u8], chain: &[SnapId]) -> Result<Option<Vec<u8>>> {
-        find_visible(&self.btree.block_map, self.pending_root, key, chain)
+        find_visible(&self.btree.store, self.pending_root, key, chain)
     }
 
     pub fn find_visible_with_snap(
@@ -395,7 +463,7 @@ impl<'a> Tx<'a> {
         key: &[u8],
         chain: &[SnapId],
     ) -> Result<Option<(Vec<u8>, SnapId)>> {
-        find_visible_with_snap(&self.btree.block_map, self.pending_root, key, chain)
+        find_visible_with_snap(&self.btree.store, self.pending_root, key, chain)
     }
 }
 
@@ -431,8 +499,8 @@ impl Default for Btree {
 
 /// Count total keys in the subtree rooted at `block_nr`.
 #[cfg(test)]
-fn count_keys(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64) -> usize {
-    let node = &block_map[&block_nr];
+fn count_keys(store: &BlockStore, block_nr: u64) -> usize {
+    let node = store.read_node(block_nr).unwrap();
     if node.level() == 0 {
         // Distinct keys after merge dedup. Multi-bset leaves can store the
         // same key multiple times (older bsets shadowed by newer ones), so
@@ -444,7 +512,7 @@ fn count_keys(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64) -> usize {
         // in the subtrees (separator-in-right convention). Only count leaves.
         let mut total = 0;
         for i in 0..=node.nkeys() {
-            total += count_keys(block_map, node.child_block(i));
+            total += count_keys(store, node.child_block(i));
         }
         total
     }
@@ -453,18 +521,13 @@ fn count_keys(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64) -> usize {
 /// Collect the depth of every leaf node. All leaves must be at the same depth
 /// for the tree to be balanced.
 #[cfg(test)]
-fn collect_leaf_depths(
-    block_map: &HashMap<u64, BtreeNodeRaw>,
-    block_nr: u64,
-    depth: usize,
-    depths: &mut Vec<usize>,
-) {
-    let node = &block_map[&block_nr];
+fn collect_leaf_depths(store: &BlockStore, block_nr: u64, depth: usize, depths: &mut Vec<usize>) {
+    let node = store.read_node(block_nr).unwrap();
     if node.level() == 0 {
         depths.push(depth);
     } else {
         for i in 0..=node.nkeys() {
-            collect_leaf_depths(block_map, node.child_block(i), depth + 1, depths);
+            collect_leaf_depths(store, node.child_block(i), depth + 1, depths);
         }
     }
 }
@@ -473,13 +536,8 @@ fn collect_leaf_depths(
 /// the parent separator (separator-in-right convention: the separator belongs
 /// to the right subtree, so child[i] holds keys in [lo, hi)).
 #[cfg(test)]
-fn verify_node(
-    block_map: &HashMap<u64, BtreeNodeRaw>,
-    block_nr: u64,
-    lo: Option<&[u8]>,
-    hi: Option<&[u8]>,
-) {
-    let node = &block_map[&block_nr];
+fn verify_node(store: &BlockStore, block_nr: u64, lo: Option<&[u8]>, hi: Option<&[u8]>) {
+    let node = store.read_node(block_nr).unwrap();
     let n = node.nkeys();
 
     if node.level() == 0 {
@@ -544,10 +602,10 @@ fn verify_node(
     for i in 0..=n {
         let child_nr = node.child_block(i);
         debug_assert!(
-            block_map.contains_key(&child_nr),
-            "blk={block_nr} child[{i}]={child_nr} not in block_map"
+            store.read_node(child_nr).is_ok(),
+            "blk={block_nr} child[{i}]={child_nr} not in store"
         );
-        let child = &block_map[&child_nr];
+        let child = store.read_node(child_nr).unwrap();
         debug_assert_eq!(
             child.level(),
             node.level() - 1,
@@ -565,7 +623,7 @@ fn verify_node(
         } else {
             Some(node.entry(i).key_bytes())
         };
-        verify_node(block_map, child_nr, child_lo, child_hi);
+        verify_node(store, child_nr, child_lo, child_hi);
     }
 }
 
@@ -690,19 +748,9 @@ fn build_leaf_entry(sortable_key: &[u8], kind: EntryKind, value: &[u8]) -> DiskE
 
 // ---------- Recursive operations ----------
 
-fn read_block(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64) -> Result<&BtreeNodeRaw> {
-    block_map
-        .get(&block_nr)
-        .ok_or(Error::BlockNotFound(block_nr))
-}
-
-fn find(
-    block_map: &HashMap<u64, BtreeNodeRaw>,
-    block_nr: u64,
-    key: &[u8],
-) -> Result<Option<Vec<u8>>> {
+fn find(store: &BlockStore, block_nr: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
     Ok(
-        find_raw(block_map, block_nr, key)?.and_then(|(value, kind)| match kind {
+        find_raw(store, block_nr, key)?.and_then(|(value, kind)| match kind {
             EntryKind::Live => Some(value),
             EntryKind::Deleted | EntryKind::Whiteout => None,
         }),
@@ -712,12 +760,8 @@ fn find(
 /// Like `find` but returns the entry's value AND its kind tag, so callers can
 /// distinguish "no entry" from "tombstone". Used by `find_visible` to decide
 /// whether to keep walking the ancestor chain or stop.
-fn find_raw(
-    block_map: &HashMap<u64, BtreeNodeRaw>,
-    block_nr: u64,
-    key: &[u8],
-) -> Result<Option<(Vec<u8>, EntryKind)>> {
-    let node = read_block(block_map, block_nr)?;
+fn find_raw(store: &BlockStore, block_nr: u64, key: &[u8]) -> Result<Option<(Vec<u8>, EntryKind)>> {
+    let node = store.read_node(block_nr)?;
     if node.level() == 0 {
         // Leaf: cross-bset merged lookup. The highest-seq match wins so a
         // newer write in a later bset shadows the older entry.
@@ -735,8 +779,8 @@ fn find_raw(
         // Internal nodes are always single-bset (they don't accumulate
         // sorted runs the way leaves do).
         match node.search(key) {
-            Ok(idx) => find_raw(block_map, node.child_block(idx + 1), key),
-            Err(idx) => find_raw(block_map, node.child_block(idx), key),
+            Ok(idx) => find_raw(store, node.child_block(idx + 1), key),
+            Err(idx) => find_raw(store, node.child_block(idx), key),
         }
     }
 }
@@ -745,23 +789,23 @@ fn find_raw(
 /// chain's head, or None on tombstone / no entry. Used by both
 /// `Btree::find_visible` and `Tx::find_visible`.
 fn find_visible(
-    block_map: &HashMap<u64, BtreeNodeRaw>,
+    store: &BlockStore,
     block_nr: u64,
     logical: &[u8],
     chain: &[SnapId],
 ) -> Result<Option<Vec<u8>>> {
-    Ok(find_visible_with_snap(block_map, block_nr, logical, chain)?.map(|(v, _)| v))
+    Ok(find_visible_with_snap(store, block_nr, logical, chain)?.map(|(v, _)| v))
 }
 
 fn find_visible_with_snap(
-    block_map: &HashMap<u64, BtreeNodeRaw>,
+    store: &BlockStore,
     block_nr: u64,
     logical: &[u8],
     chain: &[SnapId],
 ) -> Result<Option<(Vec<u8>, SnapId)>> {
     for &snap in chain {
         let (buf, len) = sortable_key(logical, snap);
-        match find_raw(block_map, block_nr, &buf[..len])? {
+        match find_raw(store, block_nr, &buf[..len])? {
             Some((value, EntryKind::Live)) => return Ok(Some((value, snap))),
             Some((_, EntryKind::Deleted | EntryKind::Whiteout)) => return Ok(None),
             None => continue,
@@ -784,15 +828,13 @@ fn find_visible_with_snap(
 /// Picks the highest-seq bset that contains the key — that's the entry the
 /// merged read path would return. Flipping any older copy would be shadowed.
 fn flip_kind_in_place(
-    block_map: &mut HashMap<u64, BtreeNodeRaw>,
-    next_block_nr: &mut u64,
+    store: &BlockStore,
     block_nr: u64,
     sortable_key: &[u8],
     new_kind: EntryKind,
 ) -> Result<u64> {
-    let old_node = clone_to_heap(read_block(block_map, block_nr)?);
-    let new_block = *next_block_nr;
-    *next_block_nr += 1;
+    let old_node = clone_to_heap(store.read_node(block_nr)?);
+    let new_block = store.alloc();
     let mut new_node = old_node;
     if new_node.level() == 0 {
         // Find the entry with the highest seq among bsets that contain
@@ -814,11 +856,10 @@ fn flip_kind_in_place(
             Err(i) => i,
         };
         let child_nr = new_node.child_block(child_idx);
-        let new_child =
-            flip_kind_in_place(block_map, next_block_nr, child_nr, sortable_key, new_kind)?;
+        let new_child = flip_kind_in_place(store, child_nr, sortable_key, new_kind)?;
         new_node.set_child_block(child_idx, new_child);
     }
-    block_map.insert(new_block, *new_node);
+    store.write_node(new_block, &new_node)?;
     Ok(new_block)
 }
 
@@ -826,8 +867,7 @@ fn flip_kind_in_place(
 /// `kind` is the entry kind (Live for normal inserts, Deleted/Whiteout for
 /// tombstones). On a found-key path the existing entry's kind is replaced.
 fn insert(
-    block_map: &mut HashMap<u64, BtreeNodeRaw>,
-    next_block_nr: &mut u64,
+    store: &BlockStore,
     next_bset_seq: &mut u64,
     block_nr: u64,
     key: &[u8],
@@ -835,33 +875,16 @@ fn insert(
     kind: EntryKind,
 ) -> Result<u64> {
     // COW: clone before mutating so the original block stays intact.
-    let old_node = clone_to_heap(read_block(block_map, block_nr)?);
+    let old_node = clone_to_heap(store.read_node(block_nr)?);
     if old_node.level() == 0 {
-        insert_leaf(
-            block_map,
-            next_block_nr,
-            next_bset_seq,
-            &old_node,
-            key,
-            value,
-            kind,
-        )
+        insert_leaf(store, next_bset_seq, &old_node, key, value, kind)
     } else {
-        insert_internal(
-            block_map,
-            next_block_nr,
-            next_bset_seq,
-            &old_node,
-            key,
-            value,
-            kind,
-        )
+        insert_internal(store, next_bset_seq, &old_node, key, value, kind)
     }
 }
 
 fn insert_leaf(
-    block_map: &mut HashMap<u64, BtreeNodeRaw>,
-    next_block_nr: &mut u64,
+    store: &BlockStore,
     next_bset_seq: &mut u64,
     old_node: &BtreeNodeRaw,
     key: &[u8],
@@ -883,64 +906,47 @@ fn insert_leaf(
     // compacts a multi-bset source so the resulting halves are clean
     // single-bset nodes (which the merged read-path also handles trivially).
     if !absorbs_in_place && old_node.nkeys() >= MAX_ENTRIES {
-        let (new_root_block, left_block, right_block) =
-            split_leaf_node(block_map, next_block_nr, next_bset_seq, old_node);
-        block_map
-            .get_mut(&new_root_block)
-            .unwrap()
-            .set_child_block(0, left_block);
-        block_map
-            .get_mut(&new_root_block)
-            .unwrap()
-            .set_child_block(1, right_block);
+        let (mut root_box, root_nr, left_block, right_block) =
+            split_leaf_node(store, next_bset_seq, old_node)?;
+        root_box.set_child_block(0, left_block);
+        root_box.set_child_block(1, right_block);
 
-        let (child_idx, child_nr) = {
-            let root = read_block(block_map, new_root_block)?;
-            let child_idx = match root.search(key) {
-                Ok(i) => i + 1,
-                Err(i) => i,
-            };
-            (child_idx, root.child_block(child_idx))
+        // Decide which half the key should be inserted into based on the
+        // separator (which root_box already knows about).
+        let child_idx = match root_box.search(key) {
+            Ok(i) => i + 1,
+            Err(i) => i,
         };
-        let child_level = read_block(block_map, child_nr)?.level();
-        let new_child_nr = insert(
-            block_map,
-            next_block_nr,
-            next_bset_seq,
-            child_nr,
-            key,
-            value,
-            kind,
-        )?;
+        let child_nr = root_box.child_block(child_idx);
+        let child_level = store.read_node(child_nr)?.level();
+        let new_child_nr = insert(store, next_bset_seq, child_nr, key, value, kind)?;
 
-        let new_child_level = read_block(block_map, new_child_nr)?.level();
+        let new_child_level = store.read_node(new_child_nr)?.level();
         if new_child_level > child_level {
-            // Child itself split — promote its median to the new root.
+            // Child itself split — promote its median to the (still
+            // unwritten) parent. promote_to_parent will write a fresh
+            // parent (possibly cascade-splitting it) and return its nr.
             let (median_key, left, right) = {
-                let new_child = read_block(block_map, new_child_nr)?;
+                let new_child = store.read_node(new_child_nr)?;
                 (
                     new_child.entry(0).key_bytes().to_vec(),
                     new_child.child_block(0),
                     new_child.child_block(1),
                 )
             };
-            let parent = clone_to_heap(read_block(block_map, new_root_block)?);
-            return promote_to_parent(
-                block_map,
-                next_block_nr,
-                &parent,
-                child_idx,
-                &median_key,
-                left,
-                right,
-            );
+            // root_box at this point still has the original child[child_idx]
+            // pointer (left/right_block from the leaf split); promote builds
+            // a brand-new parent node, so we can drop root_nr — it was
+            // allocated speculatively but never written.
+            let _ = root_nr; // intentionally leaked: orphaned alloc, no GC v1
+            return promote_to_parent(store, &root_box, child_idx, &median_key, left, right);
         }
 
-        block_map
-            .get_mut(&new_root_block)
-            .unwrap()
-            .set_child_block(child_idx, new_child_nr);
-        return Ok(new_root_block);
+        // No cascade split: finalize root_box by pointing the child slot
+        // at the (possibly COW-replaced) child and commit to store.
+        root_box.set_child_block(child_idx, new_child_nr);
+        store.write_node(root_nr, &root_box)?;
+        return Ok(root_nr);
     }
 
     // Normal path: COW the node. If the key already lives in the latest
@@ -948,8 +954,7 @@ fn insert_leaf(
     // grow the node (and don't disturb that "latest bset" invariant by
     // opening a new bset). Otherwise ensure the latest bset is writable
     // (open new bset or compact as needed) and sort-insert.
-    let new_block = *next_block_nr;
-    *next_block_nr += 1;
+    let new_block = store.alloc();
     let mut new_node = clone_to_heap(old_node);
     if absorbs_in_place {
         let last_idx = new_node.bset_count() - 1;
@@ -965,13 +970,12 @@ fn insert_leaf(
         // we don't need it: the entry has been written either way.
         let _ = new_node.sort_insert_into_last_bset(&entry);
     }
-    block_map.insert(new_block, *new_node);
+    store.write_node(new_block, &new_node)?;
     Ok(new_block)
 }
 
 fn insert_internal(
-    block_map: &mut HashMap<u64, BtreeNodeRaw>,
-    next_block_nr: &mut u64,
+    store: &BlockStore,
     next_bset_seq: &mut u64,
     old_node: &BtreeNodeRaw,
     key: &[u8],
@@ -983,58 +987,44 @@ fn insert_internal(
         Err(i) => i,
     };
     let child_nr = old_node.child_block(child_idx);
-    let child_level = read_block(block_map, child_nr)?.level();
+    let child_level = store.read_node(child_nr)?.level();
 
-    let new_child_nr = insert(
-        block_map,
-        next_block_nr,
-        next_bset_seq,
-        child_nr,
-        key,
-        value,
-        kind,
-    )?;
+    let new_child_nr = insert(store, next_bset_seq, child_nr, key, value, kind)?;
 
     // Child split and grew a level — promote its median key to this level.
-    let new_child_level = read_block(block_map, new_child_nr)?.level();
+    let new_child_level = store.read_node(new_child_nr)?.level();
     if new_child_level > child_level {
-        let new_child = read_block(block_map, new_child_nr)?;
+        let new_child = store.read_node(new_child_nr)?;
         let median_key = new_child.entry(0).key_bytes().to_vec();
         let left = new_child.child_block(0);
         let right = new_child.child_block(1);
         // promote_to_parent sets all child pointers internally; we must NOT
         // touch the returned block afterward — child_idx is only valid against
         // the old parent, not a potential new root from a cascading split.
-        return promote_to_parent(
-            block_map,
-            next_block_nr,
-            old_node,
-            child_idx,
-            &median_key,
-            left,
-            right,
-        );
+        return promote_to_parent(store, old_node, child_idx, &median_key, left, right);
     }
 
-    let new_block = *next_block_nr;
-    *next_block_nr += 1;
+    let new_block = store.alloc();
     let mut new_node = clone_to_heap(old_node);
     new_node.set_child_block(child_idx, new_child_nr);
-    block_map.insert(new_block, *new_node);
+    store.write_node(new_block, &new_node)?;
     Ok(new_block)
 }
 
 // ---------- Split & promote ----------
 
-/// Split a full leaf into two, creating a new level-1 root.
-/// Returns (new_root_block, left_block, right_block).
-/// Caller must set child pointers on the new root.
+/// Split a full leaf node into two halves and create a parent node.
+///
+/// Returns `(unwritten_root_box, root_nr, left_nr, right_nr)`. The two leaf
+/// halves are already persisted in `store`; the parent node is **not yet
+/// written** so the caller can finish setting `child_block(0/1)` (and any
+/// further child updates after recursing) before the single committing
+/// `store.write_node(root_nr, ...)` call.
 fn split_leaf_node(
-    block_map: &mut HashMap<u64, BtreeNodeRaw>,
-    next_block_nr: &mut u64,
+    store: &BlockStore,
     next_bset_seq: &mut u64,
     node: &BtreeNodeRaw,
-) -> (u64, u64, u64) {
+) -> Result<(Box<BtreeNodeRaw>, u64, u64, u64)> {
     debug_assert!(node.level() == 0);
     debug_assert!(node.nkeys() >= MAX_ENTRIES);
 
@@ -1052,59 +1042,53 @@ fn split_leaf_node(
     let n = canonical.nkeys();
     let mid = n / 2;
     debug_assert!(mid > 0 && mid < n);
-    let median_key = canonical.entry(mid).key_bytes();
+    let median_key_buf = canonical.entry(mid).key_bytes().to_vec();
 
-    let left_block = *next_block_nr;
-    *next_block_nr += 1;
+    let left_block = store.alloc();
     let mut left = clone_to_heap(&canonical);
     left.set_nkeys(mid);
-    block_map.insert(left_block, *left);
+    store.write_node(left_block, &left)?;
 
-    let right_block = *next_block_nr;
-    *next_block_nr += 1;
+    let right_block = store.alloc();
     let mut right = clone_to_heap(&canonical);
     right.bset_entries_mut(0).copy_within(mid..n, 0);
     right.set_nkeys(n - mid);
-    block_map.insert(right_block, *right);
+    store.write_node(right_block, &right)?;
 
-    let root_block = *next_block_nr;
-    *next_block_nr += 1;
+    let root_block = store.alloc();
     let mut root = new_node_on_heap(1);
     root.set_generation(canonical.generation());
     // Internal node with 1 separator + 2 children: claim the size first so
     // entry_mut(0) lands in a valid slot. Children are filled by the caller.
     root.set_nkeys(1);
-    root.entry_mut(0).set_key(median_key);
-    block_map.insert(root_block, *root);
+    root.entry_mut(0).set_key(&median_key_buf);
 
-    (root_block, left_block, right_block)
+    Ok((root, root_block, left_block, right_block))
 }
 
-/// Split a full internal node into two, creating a new root at level+1.
-/// Returns (new_root_block, left_block, right_block).
-/// Caller must set child pointers on the new root.
+/// Split a full internal node into two and create a new parent at level+1.
+/// Returns `(unwritten_root_box, root_nr, left_nr, right_nr)`. As with
+/// `split_leaf_node`, left/right are already written; the new root is left
+/// to the caller to finish + commit.
 fn split_internal_node(
-    block_map: &mut HashMap<u64, BtreeNodeRaw>,
-    next_block_nr: &mut u64,
+    store: &BlockStore,
     node: &BtreeNodeRaw,
-) -> (u64, u64, u64) {
+) -> Result<(Box<BtreeNodeRaw>, u64, u64, u64)> {
     let n = node.nkeys();
     debug_assert!(n >= MAX_INTERNAL_KEYS);
     debug_assert!(node.level() > 0);
     let mid = n / 2;
     debug_assert!(mid > 0 && mid < n);
-    let median_key = node.entry(mid).key_bytes();
+    let median_key_buf = node.entry(mid).key_bytes().to_vec();
 
-    let left_block = *next_block_nr;
-    *next_block_nr += 1;
+    let left_block = store.alloc();
     let mut left = clone_to_heap(node);
     left.set_nkeys(mid);
-    block_map.insert(left_block, *left);
+    store.write_node(left_block, &left)?;
 
     // Separator-in-right: key[mid] goes to the parent only.
     // Right child gets key[mid+1..n] with children c_{mid+1}..c_n.
-    let right_block = *next_block_nr;
-    *next_block_nr += 1;
+    let right_block = store.alloc();
     let mut right = new_node_on_heap(node.level());
     right.set_generation(node.generation());
     // Reserve slots before any entry writes (internal nodes store nkeys+1 entries).
@@ -1117,24 +1101,21 @@ fn split_internal_node(
     for i in 0..=(n - mid - 1) {
         right.set_child_block(i, node.child_block(mid + 1 + i));
     }
-    block_map.insert(right_block, *right);
+    store.write_node(right_block, &right)?;
 
-    let root_block = *next_block_nr;
-    *next_block_nr += 1;
+    let root_block = store.alloc();
     let mut root = new_node_on_heap(node.level() + 1);
     root.set_generation(node.generation());
     root.set_nkeys(1);
-    root.entry_mut(0).set_key(median_key);
-    block_map.insert(root_block, *root);
+    root.entry_mut(0).set_key(&median_key_buf);
 
-    (root_block, left_block, right_block)
+    Ok((root, root_block, left_block, right_block))
 }
 
 /// Insert a split result (median_key + left/right children) into the parent
 /// at child_idx.  Returns the new parent block number (may cascade-split).
 fn promote_to_parent(
-    block_map: &mut HashMap<u64, BtreeNodeRaw>,
-    next_block_nr: &mut u64,
+    store: &BlockStore,
     old_parent: &BtreeNodeRaw,
     child_idx: usize,
     median_key: &[u8],
@@ -1145,8 +1126,7 @@ fn promote_to_parent(
     debug_assert!(child_idx <= old_parent.nkeys());
 
     let old_nkeys = old_parent.nkeys();
-    let new_block = *next_block_nr;
-    *next_block_nr += 1;
+    let new_block = store.alloc();
     let mut new_node = new_node_on_heap(old_parent.level());
     new_node.set_generation(old_parent.generation());
     // Reserve slots first (internal nkeys+1 storage). Capacity overflow is
@@ -1171,33 +1151,31 @@ fn promote_to_parent(
     }
 
     if new_node.nkeys() <= MAX_INTERNAL_KEYS {
-        block_map.insert(new_block, *new_node);
+        store.write_node(new_block, &new_node)?;
         Ok(new_block)
     } else {
-        let (new_root, new_left, new_right) =
-            split_internal_node(block_map, next_block_nr, &new_node);
-        block_map
-            .get_mut(&new_root)
-            .unwrap()
-            .set_child_block(0, new_left);
-        block_map
-            .get_mut(&new_root)
-            .unwrap()
-            .set_child_block(1, new_right);
-        Ok(new_root)
+        // Internal node also overflows: split it. The freshly-built
+        // `new_node` is the source; `new_block` was speculatively allocated
+        // and is now orphaned (no GC v1).
+        let _ = new_block;
+        let (mut root_box, root_nr, new_left, new_right) = split_internal_node(store, &new_node)?;
+        root_box.set_child_block(0, new_left);
+        root_box.set_child_block(1, new_right);
+        store.write_node(root_nr, &root_box)?;
+        Ok(root_nr)
     }
 }
 
 // ---------- Scan & debug ----------
 
 fn range_scan(
-    block_map: &HashMap<u64, BtreeNodeRaw>,
+    store: &BlockStore,
     block_nr: u64,
     start: &[u8],
     end: &[u8],
     results: &mut Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Result<()> {
-    let node = read_block(block_map, block_nr)?;
+    let node = store.read_node(block_nr)?;
     if node.level() == 0 {
         // Walk the merged iterator (cross-bset, latest-seq wins). The iter
         // yields entries in sortable-key ascending order so we can early-out
@@ -1229,7 +1207,7 @@ fn range_scan(
             i = nchildren - 1;
         }
         while i < nchildren {
-            range_scan(block_map, node.child_block(i), start, end, results)?;
+            range_scan(store, node.child_block(i), start, end, results)?;
             // Separator-in-right: once a separator >= end, all further
             // subtrees are out of range.
             if i < node.nkeys() && node.entry(i).key_bytes() >= end {
@@ -1245,13 +1223,13 @@ fn range_scan(
 /// full metadata: `(logical_key, snap_id, kind, value)`. Backs the public
 /// `Btree::range_scan_all` (BTREE_ITER_ALL_SNAPSHOTS in bcachefs).
 fn range_scan_all(
-    block_map: &HashMap<u64, BtreeNodeRaw>,
+    store: &BlockStore,
     block_nr: u64,
     start: &[u8],
     end: &[u8],
     results: &mut Vec<AllSnapRow>,
 ) -> Result<()> {
-    let node = read_block(block_map, block_nr)?;
+    let node = store.read_node(block_nr)?;
     if node.level() == 0 {
         // Cross-bset merged iter, but unlike `range_scan` we keep tombstones.
         // Lower-seq duplicates are dropped by the iterator's tie-break logic.
@@ -1281,7 +1259,7 @@ fn range_scan_all(
             i = nchildren - 1;
         }
         while i < nchildren {
-            range_scan_all(block_map, node.child_block(i), start, end, results)?;
+            range_scan_all(store, node.child_block(i), start, end, results)?;
             if i < node.nkeys() && node.entry(i).key_bytes() >= end {
                 return Ok(());
             }
@@ -1291,8 +1269,8 @@ fn range_scan_all(
     Ok(())
 }
 
-fn dump(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64, indent: usize) {
-    let node = &block_map[&block_nr];
+fn dump(store: &BlockStore, block_nr: u64, indent: usize) {
+    let node = store.read_node(block_nr).unwrap();
     let prefix = "  ".repeat(indent);
     if node.level() == 0 {
         print!(
@@ -1311,7 +1289,7 @@ fn dump(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64, indent: usize) {
             node.nkeys()
         );
         for i in 0..=node.nkeys() {
-            dump(block_map, node.child_block(i), indent + 1);
+            dump(store, node.child_block(i), indent + 1);
             if i < node.nkeys() {
                 println!("{prefix}  -- {:02x?} --", node.entry(i).key_bytes());
             }
@@ -1324,6 +1302,7 @@ fn dump(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64, indent: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn key(i: u32) -> [u8; 4] {
         i.to_be_bytes()
@@ -1336,13 +1315,9 @@ mod tests {
     /// Direct call to the internal `find` against a specific root block.
     /// Tests use this to look into historical (pre-overwrite) roots that the
     /// public Btree API doesn't expose. Wraps the snap_id append step.
-    fn find_at_root(
-        block_map: &HashMap<u64, BtreeNodeRaw>,
-        root: u64,
-        logical: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
+    fn find_at_root(store: &BlockStore, root: u64, logical: &[u8]) -> Result<Option<Vec<u8>>> {
         let (buf, len) = sortable_key(logical, ROOT_SNAP);
-        find(block_map, root, &buf[..len])
+        find(store, root, &buf[..len])
     }
 
     #[test]
@@ -1386,19 +1361,19 @@ mod tests {
         tree.insert(&key(30), &val(30)).unwrap();
 
         assert_eq!(
-            find_at_root(&tree.block_map, old_root_block, &key(10))
+            find_at_root(&tree.store, old_root_block, &key(10))
                 .unwrap()
                 .as_deref(),
             Some(val(10).as_slice())
         );
         assert_eq!(
-            find_at_root(&tree.block_map, old_root_block, &key(20))
+            find_at_root(&tree.store, old_root_block, &key(20))
                 .unwrap()
                 .as_deref(),
             Some(val(20).as_slice())
         );
         assert_eq!(
-            find_at_root(&tree.block_map, old_root_block, &key(30))
+            find_at_root(&tree.store, old_root_block, &key(30))
                 .unwrap()
                 .as_deref(),
             None
@@ -1560,10 +1535,7 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            count_keys(&tree.block_map, tree.root_block),
-            reference.len()
-        );
+        assert_eq!(count_keys(&tree.store, tree.root_block), reference.len());
         tree.verify();
     }
 
@@ -1591,10 +1563,7 @@ mod tests {
                 Some(val(v).as_slice())
             );
         }
-        assert_eq!(
-            count_keys(&tree.block_map, tree.root_block),
-            reference.len()
-        );
+        assert_eq!(count_keys(&tree.store, tree.root_block), reference.len());
         tree.verify();
     }
 
@@ -1611,7 +1580,7 @@ mod tests {
         }
 
         // Tree should have grown beyond level 1.
-        let root = &tree.block_map[&tree.root_block];
+        let root = tree.store.read_node(tree.root_block).unwrap();
         assert!(
             root.level() >= 2,
             "expected multi-level tree, got level {}",
@@ -1625,7 +1594,7 @@ mod tests {
                 Some(val(i).as_slice())
             );
         }
-        assert_eq!(count_keys(&tree.block_map, tree.root_block), n as usize);
+        assert_eq!(count_keys(&tree.store, tree.root_block), n as usize);
         tree.verify();
     }
 
@@ -1638,11 +1607,11 @@ mod tests {
             tree.insert(&key(i), &val(i)).unwrap();
         }
         // Root should still be a leaf.
-        assert_eq!(tree.block_map[&tree.root_block].level(), 0);
+        assert_eq!(tree.store.read_node(tree.root_block).unwrap().level(), 0);
 
         // One more triggers a split.
         tree.insert(&key(max), &val(max)).unwrap();
-        assert_eq!(tree.block_map[&tree.root_block].level(), 1);
+        assert_eq!(tree.store.read_node(tree.root_block).unwrap().level(), 1);
 
         for i in 0..=max {
             assert_eq!(
@@ -1650,10 +1619,7 @@ mod tests {
                 Some(val(i).as_slice())
             );
         }
-        assert_eq!(
-            count_keys(&tree.block_map, tree.root_block),
-            (max + 1) as usize
-        );
+        assert_eq!(count_keys(&tree.store, tree.root_block), (max + 1) as usize);
         tree.verify();
     }
 
@@ -1754,7 +1720,7 @@ mod tests {
         for &(last_key, snap_root) in &snapshots {
             for i in 0..=last_key {
                 assert_eq!(
-                    find_at_root(&tree.block_map, snap_root, &key(i))
+                    find_at_root(&tree.store, snap_root, &key(i))
                         .unwrap()
                         .as_deref(),
                     Some(val(i).as_slice()),
@@ -1763,7 +1729,7 @@ mod tests {
             }
             // Key just beyond the snapshot should not exist.
             assert_eq!(
-                find_at_root(&tree.block_map, snap_root, &key(last_key + 1))
+                find_at_root(&tree.store, snap_root, &key(last_key + 1))
                     .unwrap()
                     .as_deref(),
                 None,
@@ -1789,15 +1755,11 @@ mod tests {
             Some(b"v1-new".as_slice())
         );
         assert_eq!(
-            find_at_root(&tree.block_map, snap, &key(1))
-                .unwrap()
-                .as_deref(),
+            find_at_root(&tree.store, snap, &key(1)).unwrap().as_deref(),
             Some(b"v1".as_slice())
         );
         assert_eq!(
-            find_at_root(&tree.block_map, snap, &key(2))
-                .unwrap()
-                .as_deref(),
+            find_at_root(&tree.store, snap, &key(2)).unwrap().as_deref(),
             Some(b"v2".as_slice())
         );
         tree.verify();
@@ -1857,10 +1819,10 @@ mod tests {
                 Some(val(i).as_slice())
             );
         }
-        assert_eq!(count_keys(&tree.block_map, tree.root_block), n as usize);
+        assert_eq!(count_keys(&tree.store, tree.root_block), n as usize);
 
         // Root should be at least level 2 with this many keys.
-        let root = &tree.block_map[&tree.root_block];
+        let root = tree.store.read_node(tree.root_block).unwrap();
         assert!(root.level() >= 2);
 
         tree.verify();
@@ -1885,10 +1847,7 @@ mod tests {
                 Some(val(v).as_slice())
             );
         }
-        assert_eq!(
-            count_keys(&tree.block_map, tree.root_block),
-            reference.len()
-        );
+        assert_eq!(count_keys(&tree.store, tree.root_block), reference.len());
         tree.verify();
     }
 
@@ -1904,21 +1863,21 @@ mod tests {
             tree.insert(&key(i), &val(i)).unwrap();
             reference.insert(i, i);
         }
-        assert_eq!(count_keys(&tree.block_map, tree.root_block), 1000);
+        assert_eq!(count_keys(&tree.store, tree.root_block), 1000);
 
         // Overwrite 500..600 — count should not change.
         for i in 500..600u32 {
             tree.insert(&key(i), &val(i + 9999)).unwrap();
             reference.insert(i, i + 9999);
         }
-        assert_eq!(count_keys(&tree.block_map, tree.root_block), 1000);
+        assert_eq!(count_keys(&tree.store, tree.root_block), 1000);
 
         // Insert new keys 1000..2000.
         for i in 1000..2000u32 {
             tree.insert(&key(i), &val(i)).unwrap();
             reference.insert(i, i);
         }
-        assert_eq!(count_keys(&tree.block_map, tree.root_block), 2000);
+        assert_eq!(count_keys(&tree.store, tree.root_block), 2000);
 
         // Verify all values.
         for (&k, &v) in &reference {
@@ -1935,7 +1894,7 @@ mod tests {
     /// Verify all leaves are at the same depth and return that depth.
     fn assert_balanced(tree: &Btree) -> usize {
         let mut depths = Vec::new();
-        collect_leaf_depths(&tree.block_map, tree.root_block, 0, &mut depths);
+        collect_leaf_depths(&tree.store, tree.root_block, 0, &mut depths);
         assert!(!depths.is_empty(), "tree has no leaves");
         let first = depths[0];
         for (i, &d) in depths.iter().enumerate() {
@@ -2048,12 +2007,12 @@ mod tests {
         }
 
         let min_keys = crate::block_btree::MAX_ENTRIES / 2;
-        check_leaf_fill(&tree.block_map, tree.root_block, min_keys);
+        check_leaf_fill(&tree.store, tree.root_block, min_keys);
         tree.verify();
     }
 
-    fn check_leaf_fill(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64, min_keys: usize) {
-        let node = &block_map[&block_nr];
+    fn check_leaf_fill(store: &BlockStore, block_nr: u64, min_keys: usize) {
+        let node = store.read_node(block_nr).unwrap();
         if node.level() == 0 {
             assert!(
                 node.nkeys() >= min_keys,
@@ -2062,7 +2021,7 @@ mod tests {
             );
         } else {
             for i in 0..=node.nkeys() {
-                check_leaf_fill(block_map, node.child_block(i), min_keys);
+                check_leaf_fill(store, node.child_block(i), min_keys);
             }
         }
     }
@@ -2082,7 +2041,7 @@ mod tests {
         // Every historical snapshot must also be balanced.
         for &snap in &snapshots {
             let mut depths = Vec::new();
-            collect_leaf_depths(&tree.block_map, snap, 0, &mut depths);
+            collect_leaf_depths(&tree.store, snap, 0, &mut depths);
             let first = depths[0];
             for (i, &d) in depths.iter().enumerate() {
                 assert_eq!(d, first, "snapshot leaf {i} depth {d} != {first}");
@@ -2536,7 +2495,7 @@ mod tests {
     fn root_leaf_bset_count(tree: &Btree) -> usize {
         let mut blk = tree.root_block;
         loop {
-            let node = &tree.block_map[&blk];
+            let node = tree.store.read_node(blk).unwrap();
             if node.level() == 0 {
                 return node.bset_count();
             }
@@ -2640,7 +2599,7 @@ mod tests {
         let trigger = MAX_ENTRIES as u32;
         tree.insert(&key(trigger), &val(trigger)).unwrap();
         // Tree is now level >= 1; root is internal.
-        let root = &tree.block_map[&tree.root_block];
+        let root = tree.store.read_node(tree.root_block).unwrap();
         assert!(
             root.level() >= 1,
             "root should be internal after split, level={}",
@@ -2692,7 +2651,7 @@ mod tests {
         }
         let nkeys_before = {
             let blk = tree.root_block;
-            tree.block_map[&blk].nkeys()
+            tree.store.read_node(blk).unwrap().nkeys()
         };
         let bcnt_before = root_leaf_bset_count(&tree);
         // key(0) lives in bset 0 (older); the in-place flip should target
@@ -2700,7 +2659,7 @@ mod tests {
         assert!(tree.delete(&key(0)).unwrap());
         let nkeys_after = {
             let blk = tree.root_block;
-            tree.block_map[&blk].nkeys()
+            tree.store.read_node(blk).unwrap().nkeys()
         };
         let bcnt_after = root_leaf_bset_count(&tree);
         assert_eq!(

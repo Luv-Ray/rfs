@@ -32,8 +32,27 @@ pub struct FuseFs {
 }
 
 impl FuseFs {
+    /// Pure-RAM filesystem. Bootstraps a root inode.
     pub fn new() -> Self {
-        let mut fs = Fs::new();
+        let fs = Fs::new();
+        Self::bootstrap_root(fs)
+    }
+
+    /// Create a brand-new image file at `path` and mount on top of it.
+    /// Bootstraps a root inode just like `new`.
+    pub fn create_image(path: &std::path::Path) -> btree::Result<Self> {
+        let fs = Fs::create(path)?;
+        Ok(Self::bootstrap_root(fs))
+    }
+
+    /// Mount on top of an existing image. The root inode is already there;
+    /// we do not bootstrap it.
+    pub fn open_image(path: &std::path::Path) -> btree::Result<Self> {
+        let fs = Fs::open(path)?;
+        Ok(FuseFs { fs: Mutex::new(fs) })
+    }
+
+    fn bootstrap_root(mut fs: Fs) -> Self {
         // First alloc returns ROOT_INO=1 by construction; use it for the root.
         let root_ino = fs.alloc_ino();
         debug_assert_eq!(root_ino, ROOT_INO);
@@ -116,7 +135,9 @@ fn do_read(fs: &Fs, ino: u64, offset: u64, size: u32) -> btree::Result<Vec<u8>> 
         }
         let copy_start = offset.max(ext_off);
         let copy_end = end.min(ext_end);
-        let src_block = fs.read_data_block(ext.data_block);
+        let src_block = fs
+            .read_data_block(ext.data_block)
+            .expect("data block missing");
         let src = &src_block[(copy_start - ext_off) as usize..(copy_end - ext_off) as usize];
         let dst_off = (copy_start - offset) as usize;
         out[dst_off..dst_off + src.len()].copy_from_slice(src);
@@ -141,7 +162,9 @@ fn do_write(fs: &mut Fs, ino: u64, offset: u64, data: &[u8]) -> btree::Result<us
         let mut existing_len = 0;
         if let Some(ext) = fs.get_extent(ino, block_off)? {
             existing_len = ext.len as usize;
-            let src = fs.read_data_block(ext.data_block);
+            let src = fs
+                .read_data_block(ext.data_block)
+                .expect("data block missing");
             buf[..existing_len].copy_from_slice(&src[..existing_len]);
         }
         buf[in_block..in_block + take].copy_from_slice(&remaining[..take]);
@@ -582,6 +605,17 @@ impl Filesystem for FuseFs {
         reply: ReplyEmpty,
     ) {
         reply.ok();
+    }
+
+    /// Called by FUSE when the filesystem is being unmounted. Best-effort
+    /// sync: write a final superblock + fsync. On a memory-only mount this
+    /// is a no-op (BlockStore::fsync is None-typed).
+    fn destroy(&mut self) {
+        if let Ok(fs) = self.fs.lock()
+            && let Err(e) = fs.sync()
+        {
+            eprintln!("rfs: sync on unmount failed: {e}");
+        }
     }
 }
 

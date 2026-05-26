@@ -1,6 +1,6 @@
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-const BLOCK_SIZE: usize = 4096;
+pub const BLOCK_SIZE: usize = 4096;
 pub const MAGIC_NUMBER: u32 = 0x39C5BB39;
 
 /// Total key buffer in DiskEntry: logical bytes followed by 4-byte snap_id (BE).

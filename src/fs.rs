@@ -1,11 +1,10 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::block_btree::{MAX_LOGICAL_KEY_SIZE, MAX_VALUE_SIZE, ROOT_SNAP, SnapId};
+use crate::block_btree::{BLOCK_SIZE, MAX_LOGICAL_KEY_SIZE, MAX_VALUE_SIZE, ROOT_SNAP, SnapId};
 use crate::btree::{Btree, Result};
-
-const BLOCK_SIZE: usize = 4096;
+use crate::storage::BlockStore;
 
 pub const ROOT_INO: u64 = 1;
 
@@ -242,9 +241,10 @@ pub type FsResult<T> = std::result::Result<T, FsError>;
 
 pub struct Fs {
     tree: Btree,
-    data_blocks: HashMap<u64, [u8; BLOCK_SIZE]>,
+    /// Shared block storage. Same `Arc` as `tree.store`; held here too so
+    /// `Fs::sync` can reach it without borrowing through the btree.
+    store: Arc<BlockStore>,
     next_ino: u64,
-    next_data_block: u64,
     /// Smallest snap_id allocated so far minus one. New snapshots take ids
     /// counting down from `next_snap_id`. bcachefs: parent always > child.
     #[allow(dead_code)] // wired up in Phase 8 (snapshot_subvol)
@@ -260,11 +260,71 @@ pub struct Fs {
 
 impl Fs {
     pub fn new() -> Self {
+        let tree = Btree::new();
+        let store = tree.store.clone();
+        Self::seed(tree, store, ROOT_INO)
+    }
+
+    /// Build a fresh image-backed filesystem at `path`. Fails if the file
+    /// exists. The superblock is written by [`Fs::sync`]; this constructor
+    /// only initializes in-memory state.
+    pub fn create(path: &std::path::Path) -> Result<Self> {
+        let store = Arc::new(BlockStore::create_image(path)?);
+        let tree = Btree::create_in(store.clone());
+        Ok(Self::seed(tree, store, ROOT_INO))
+    }
+
+    /// Reopen a filesystem from an existing image. Reads + verifies the
+    /// superblock (magic / version / CRC), then reattaches the btree at the
+    /// stored root.
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let store = Arc::new(BlockStore::open_image(path)?);
+        let sb = store.read_superblock()?;
+        store.set_next_block_nr(sb.next_block_nr);
+        let tree = Btree::reopen(store.clone(), sb.root_block, sb.next_bset_seq);
+        Ok(Fs {
+            tree,
+            store,
+            next_ino: sb.next_ino,
+            next_snap_id: sb.next_snap_id,
+            next_subvol_id: sb.next_subvol_id,
+            current_subvol: sb.current_subvol,
+        })
+    }
+
+    /// Persist all live state (`fsync` data + write a fresh superblock).
+    /// Called on `close` and any explicit `Fs::sync` checkpoint.
+    pub fn sync(&self) -> Result<()> {
+        // First flush data blocks + node blocks already written via
+        // BlockStore (their pwrite is done at write time, but we want the
+        // kernel to push them to the device before we publish the new
+        // superblock).
+        self.store.fsync()?;
+        let sb = crate::storage::Superblock {
+            magic: crate::storage::SUPERBLOCK_MAGIC,
+            version: crate::storage::SUPERBLOCK_VERSION,
+            root_block: self.tree.root_block,
+            next_block_nr: self.store.next_block_nr(),
+            next_bset_seq: self.tree.next_bset_seq(),
+            next_ino: self.next_ino,
+            next_snap_id: self.next_snap_id,
+            next_subvol_id: self.next_subvol_id,
+            current_subvol: self.current_subvol,
+            _pad: 0,
+            checksum: 0,
+            _reserved: [0; BLOCK_SIZE - 60],
+        };
+        self.store.write_superblock(&sb)?;
+        // Second fsync makes the new root visible after a crash.
+        self.store.fsync()?;
+        Ok(())
+    }
+
+    fn seed(tree: Btree, store: Arc<BlockStore>, root_ino: u64) -> Self {
         let mut fs = Fs {
-            tree: Btree::new(),
-            data_blocks: HashMap::new(),
-            next_ino: ROOT_INO,
-            next_data_block: 0,
+            tree,
+            store,
+            next_ino: root_ino,
             // First child snapshot gets id = ROOT_SNAP - 1.
             next_snap_id: ROOT_SNAP - 1,
             next_subvol_id: ROOT_SUBVOL + 1,
@@ -316,11 +376,12 @@ impl Fs {
         ino
     }
 
-    fn alloc_data_block(&mut self) -> u64 {
-        let nr = self.next_data_block;
-        self.next_data_block += 1;
-        self.data_blocks.insert(nr, [0u8; BLOCK_SIZE]);
-        nr
+    /// Allocate a fresh 4 KB data block in the shared store. Returns the
+    /// block number; the block is not zeroed on disk (ftruncate-style
+    /// sparse, but with our sequential allocator that's fine — the block
+    /// is always written before being read).
+    fn alloc_data_block(&self) -> u64 {
+        self.store.alloc()
     }
 
     // -- Snapshot tree --
@@ -459,8 +520,9 @@ impl Fs {
         );
         let snap = self.current_snap();
         let block_nr = self.alloc_data_block();
-        let block = self.data_blocks.get_mut(&block_nr).unwrap();
+        let mut block = [0u8; BLOCK_SIZE];
         block[..data.len()].copy_from_slice(data);
+        self.store.write_data(block_nr, &block)?;
         let extent = ExtentV1 {
             len: data.len() as u32,
             _pad: [0; 4],
@@ -482,8 +544,8 @@ impl Fs {
         self.tree.delete_at(&extent_key(ino, offset), snap, &chain)
     }
 
-    pub fn read_data_block(&self, block_nr: u64) -> &[u8; BLOCK_SIZE] {
-        &self.data_blocks[&block_nr]
+    pub fn read_data_block(&self, block_nr: u64) -> Result<&[u8; BLOCK_SIZE]> {
+        self.store.read_data(block_nr)
     }
 
     pub fn list_extents(&self, ino: u64) -> Result<Vec<(u64, ExtentV1)>> {
@@ -768,7 +830,9 @@ mod tests {
         fs.put_extent(5, 0, b"hello").unwrap();
         let ext = fs.get_extent(5, 0).unwrap().unwrap();
         assert_eq!(ext.len, 5);
-        let block = fs.read_data_block(ext.data_block);
+        let block = fs
+            .read_data_block(ext.data_block)
+            .expect("data block missing");
         assert_eq!(&block[..ext.len as usize], b"hello");
     }
 
@@ -792,8 +856,16 @@ mod tests {
         let ino6 = fs.list_extents(6).unwrap();
         assert_eq!(ino5.len(), 1);
         assert_eq!(ino6.len(), 1);
-        assert_eq!(&fs.read_data_block(ino5[0].1.data_block)[..3], b"aaa");
-        assert_eq!(&fs.read_data_block(ino6[0].1.data_block)[..3], b"bbb");
+        assert_eq!(
+            &fs.read_data_block(ino5[0].1.data_block)
+                .expect("data block missing")[..3],
+            b"aaa"
+        );
+        assert_eq!(
+            &fs.read_data_block(ino6[0].1.data_block)
+                .expect("data block missing")[..3],
+            b"bbb"
+        );
     }
 
     #[test]
@@ -1170,6 +1242,163 @@ mod tests {
         match fs.switch_subvol(9999) {
             Err(FsError::NotFound) => {}
             other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    // ---------- Image-backed persistence ----------
+
+    /// Helper: build a unique image path under the test tmpdir. Cleaned up
+    /// at the end of the test (Drop on the returned PathGuard).
+    struct PathGuard(std::path::PathBuf);
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    fn tmp_image_path(label: &str) -> PathGuard {
+        let pid = std::process::id();
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!("rfs-{label}-{pid}-{now_ns}.img"));
+        PathGuard(p)
+    }
+
+    #[test]
+    fn image_round_trip_basic() {
+        // Create a fresh image, write a directory + file + extents,
+        // close, reopen, and verify everything is still there.
+        let img = tmp_image_path("rt-basic");
+        // ---- create + populate
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            // Bootstrap a root inode (FuseFs would do this, but Fs alone
+            // doesn't — alloc_ino()=1 is the root).
+            let root_ino = fs.alloc_ino();
+            fs.put_inode(root_ino, &sample_inode(0)).unwrap();
+            // Add a file inode + dirent + extent.
+            let file_ino = fs.alloc_ino();
+            fs.put_inode(file_ino, &sample_inode(11)).unwrap();
+            fs.put_dirent(
+                root_ino,
+                b"hello.txt",
+                &DirentV1 {
+                    target_ino: file_ino,
+                    kind: FILE_KIND_REGULAR,
+                    _pad: [0; 7],
+                },
+            )
+            .unwrap();
+            fs.put_extent(file_ino, 0, b"hello world").unwrap();
+            fs.sync().unwrap();
+        }
+        // ---- reopen + verify
+        {
+            let fs = Fs::open(&img.0).unwrap();
+            // Inodes survive.
+            let inode = fs.get_inode(2).unwrap().expect("file inode missing");
+            assert_eq!(inode.size, 11);
+            // Dirent survives + points at the file.
+            let dirent = fs
+                .lookup_dirent(1, b"hello.txt")
+                .unwrap()
+                .expect("dirent missing");
+            assert_eq!(dirent.target_ino, 2);
+            assert_eq!(dirent.kind, FILE_KIND_REGULAR);
+            // Extent survives + the data block reads back.
+            let ext = fs.get_extent(2, 0).unwrap().expect("extent missing");
+            assert_eq!(ext.len, 11);
+            let block = fs.read_data_block(ext.data_block).unwrap();
+            assert_eq!(&block[..ext.len as usize], b"hello world");
+        }
+    }
+
+    #[test]
+    fn image_round_trip_preserves_allocator_counters() {
+        // Allocate enough inodes to bump next_ino past ROOT, sync, reopen,
+        // and check the next alloc continues from where it left off.
+        let img = tmp_image_path("rt-alloc");
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            for _ in 0..10 {
+                let _ = fs.alloc_ino();
+            }
+            fs.sync().unwrap();
+        }
+        let mut fs = Fs::open(&img.0).unwrap();
+        let next = fs.alloc_ino();
+        assert_eq!(
+            next, 11,
+            "alloc_ino must resume after persisted counter (10 alloc + ROOT_INO=1)"
+        );
+    }
+
+    #[test]
+    fn open_rejects_bad_magic() {
+        // Create + sync, then corrupt the superblock magic and try to open.
+        let img = tmp_image_path("bad-magic");
+        {
+            let fs = Fs::create(&img.0).unwrap();
+            fs.sync().unwrap();
+        }
+        // Stomp on the magic word.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&img.0)
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0xff; 4]).unwrap();
+        }
+        match Fs::open(&img.0) {
+            Err(crate::btree::Error::BadMagic { block: 0, .. }) => {}
+            Err(other) => panic!("expected BadMagic at block 0, got {other:?}"),
+            Ok(_) => panic!("expected BadMagic, got Ok(Fs)"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_checksum_mismatch_on_node() {
+        // Create + sync, flip a byte inside a node block (the persisted
+        // root_block), then re-read via BlockStore — should surface
+        // ChecksumMismatch with the right block number. We don't go
+        // through Fs here because most Fs ops use `expect()` on a
+        // Result and would panic instead of returning the typed error.
+        let img = tmp_image_path("bad-crc");
+        let root_block;
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            fs.put_inode(1, &sample_inode(0)).unwrap();
+            fs.sync().unwrap();
+            root_block = {
+                let store = crate::storage::BlockStore::open_image(&img.0).unwrap();
+                store.read_superblock().unwrap().root_block
+            };
+        }
+        // Corrupt one byte deep in the body so magic still passes but CRC
+        // does not.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&img.0)
+                .unwrap();
+            f.seek(SeekFrom::Start(root_block * 4096 + 1024)).unwrap();
+            f.write_all(&[0xaa]).unwrap();
+        }
+        // Reopen the store and read the corrupted node.
+        let store = crate::storage::BlockStore::open_image(&img.0).unwrap();
+        match store.read_node(root_block) {
+            Err(crate::btree::Error::ChecksumMismatch { block }) => {
+                assert_eq!(block, root_block);
+            }
+            other => panic!(
+                "expected ChecksumMismatch on block {root_block}, got {:?}",
+                other.map(|_| "Ok(node)")
+            ),
         }
     }
 }
