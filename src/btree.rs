@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use crate::block_btree::{
-    BtreeNodeRaw, EntryKind, MAGIC_NUMBER, MAX_ENTRIES, MAX_INTERNAL_KEYS, MAX_KEY_SIZE,
-    MAX_LOGICAL_KEY_SIZE, ROOT_SNAP, SNAP_ID_BYTES, SnapId,
+    BSET_SOFT_LIMIT, BSET_TREE_NR_MAX, BtreeNodeRaw, DiskEntry, EntryKind, MAGIC_NUMBER,
+    MAX_ENTRIES, MAX_INTERNAL_KEYS, MAX_KEY_SIZE, MAX_LOGICAL_KEY_SIZE, MAX_VALUE_SIZE, MergedIter,
+    ROOT_SNAP, SNAP_ID_BYTES, SnapId, merged_find,
 };
 
 /// Build the sortable byte form of a (logical, snap_id) pair on the stack.
@@ -51,17 +52,27 @@ pub struct Btree {
     pub root_block: u64,
     block_map: HashMap<u64, BtreeNodeRaw>,
     next_block_nr: u64,
+    /// Monotonically increasing seq assigned to each newly opened bset.
+    /// Used by the cross-bset merged iterator to break ties when the same
+    /// sortable key appears in multiple bsets (latest write wins).
+    next_bset_seq: u64,
 }
 
 impl Btree {
     pub fn new() -> Self {
         let root_block = 0;
         let mut block_map = HashMap::new();
-        block_map.insert(root_block, BtreeNodeRaw::new(0));
+        let mut root = BtreeNodeRaw::new(0);
+        root.start_new_bset(0);
+        block_map.insert(root_block, root);
         Btree {
             root_block,
             block_map,
             next_block_nr: 1,
+            // Seq 0 was consumed by the root's initial bset. Subsequent bsets
+            // (from inserts that open a new bset, or from compaction) start
+            // at 1.
+            next_bset_seq: 1,
         }
     }
 
@@ -99,6 +110,7 @@ impl Btree {
         let new_root = insert(
             &mut self.block_map,
             &mut self.next_block_nr,
+            &mut self.next_bset_seq,
             self.root_block,
             &buf[..len],
             value,
@@ -330,6 +342,7 @@ impl<'a> Tx<'a> {
         let new_root = insert(
             &mut self.btree.block_map,
             &mut self.btree.next_block_nr,
+            &mut self.btree.next_bset_seq,
             self.pending_root,
             &buf[..len],
             value,
@@ -406,14 +419,17 @@ impl Default for Btree {
 #[cfg(test)]
 fn count_keys(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64) -> usize {
     let node = &block_map[&block_nr];
-    let n = node.nkeys();
     if node.level() == 0 {
-        n
+        // Distinct keys after merge dedup. Multi-bset leaves can store the
+        // same key multiple times (older bsets shadowed by newer ones), so
+        // raw nkeys() is not what we want — MergedIter yields each unique
+        // key once (the highest-seq entry).
+        MergedIter::new(node).count()
     } else {
         // Internal keys are separators — they duplicate keys that also exist
         // in the subtrees (separator-in-right convention). Only count leaves.
         let mut total = 0;
-        for i in 0..=n {
+        for i in 0..=node.nkeys() {
             total += count_keys(block_map, node.child_block(i));
         }
         total
@@ -458,6 +474,31 @@ fn verify_node(
         debug_assert!(n <= MAX_INTERNAL_KEYS, "internal blk={block_nr} nkeys={n}");
     }
 
+    if node.level() == 0 {
+        // Leaves may have multiple bsets. Each bset is sorted internally;
+        // across bsets the merged view must also be sorted (this falls out
+        // of MergedIter, but we double-check by walking it).
+        let mut prev: Option<Vec<u8>> = None;
+        for (b, i) in MergedIter::new(node) {
+            let k = node.entry_at(b, i).key_bytes().to_vec();
+            if let Some(p) = &prev {
+                debug_assert!(
+                    p.as_slice() < k.as_slice(),
+                    "blk={block_nr} merged-view not strictly sorted: {p:?} >= {k:?}"
+                );
+            }
+            if let Some(lo) = lo {
+                debug_assert!(k.as_slice() >= lo, "blk={block_nr} key {k:?} < lo {lo:?}");
+            }
+            if let Some(hi) = hi {
+                debug_assert!(k.as_slice() < hi, "blk={block_nr} key {k:?} >= hi {hi:?}");
+            }
+            prev = Some(k);
+        }
+        return;
+    }
+
+    // Internal nodes: single-bset, classic separator layout.
     for i in 1..n {
         debug_assert!(
             node.entry(i - 1).key_bytes() < node.entry(i).key_bytes(),
@@ -486,42 +527,43 @@ fn verify_node(
         }
     }
 
-    if node.level() > 0 {
-        for i in 0..=n {
-            let child_nr = node.child_block(i);
-            debug_assert!(
-                block_map.contains_key(&child_nr),
-                "blk={block_nr} child[{i}]={child_nr} not in block_map"
-            );
-            let child = &block_map[&child_nr];
-            debug_assert_eq!(
-                child.level(),
-                node.level() - 1,
-                "blk={block_nr} child[{i}] level mismatch"
-            );
+    for i in 0..=n {
+        let child_nr = node.child_block(i);
+        debug_assert!(
+            block_map.contains_key(&child_nr),
+            "blk={block_nr} child[{i}]={child_nr} not in block_map"
+        );
+        let child = &block_map[&child_nr];
+        debug_assert_eq!(
+            child.level(),
+            node.level() - 1,
+            "blk={block_nr} child[{i}] level mismatch"
+        );
 
-            // Separator-in-right: child[i] holds keys in [separator(i-1), separator(i)).
-            let child_lo = if i == 0 {
-                lo
-            } else {
-                Some(node.entry(i - 1).key_bytes())
-            };
-            let child_hi = if i == n {
-                hi
-            } else {
-                Some(node.entry(i).key_bytes())
-            };
-            verify_node(block_map, child_nr, child_lo, child_hi);
-        }
+        // Separator-in-right: child[i] holds keys in [separator(i-1), separator(i)).
+        let child_lo = if i == 0 {
+            lo
+        } else {
+            Some(node.entry(i - 1).key_bytes())
+        };
+        let child_hi = if i == n {
+            hi
+        } else {
+            Some(node.entry(i).key_bytes())
+        };
+        verify_node(block_map, child_nr, child_lo, child_hi);
     }
 }
 
-/// Heap-allocate a zeroed node (avoids 4KB stack temporaries).
+/// Heap-allocate a zeroed node with a fresh empty bset 0 (avoids 4KB stack
+/// temporaries). The single-bset start makes the node usable by single-bset
+/// code paths (split, promote, compact) immediately.
 fn new_node_on_heap(level: u8) -> Box<BtreeNodeRaw> {
     // SAFETY: repr(C) + FromBytes — zeroed memory is valid; we set header fields below.
     let mut b: Box<BtreeNodeRaw> = unsafe { Box::<BtreeNodeRaw>::new_zeroed().assume_init() };
     b.header.magic = MAGIC_NUMBER;
     b.header.level = level;
+    b.start_new_bset(0);
     b
 }
 
@@ -536,17 +578,100 @@ fn clone_to_heap(node: &BtreeNodeRaw) -> Box<BtreeNodeRaw> {
     b
 }
 
-/// Copy a single leaf entry (key + snap_id + kind + value) from `src[src_idx]`
-/// to `dst[dst_idx]`. Both nodes must be leaves. The full sortable key bytes
-/// (including snap_id) and the entry kind are preserved.
-fn copy_leaf_entry(dst: &mut BtreeNodeRaw, dst_idx: usize, src: &BtreeNodeRaw, src_idx: usize) {
-    debug_assert_eq!(dst.level(), 0);
-    debug_assert_eq!(src.level(), 0);
-    let src_entry = src.entry(src_idx);
-    dst.entry_mut(dst_idx).set_key(src_entry.key_bytes());
-    dst.entry_mut(dst_idx).set_kind(src_entry.kind_enum());
-    let val = src.value_bytes(src_idx).to_vec();
-    dst.set_value(dst_idx, &val);
+// ---------- Multi-bset support helpers ----------
+
+/// Counts how many times `ensure_writable_last_bset` chose the
+/// 4-bsets-full → compact branch. Used by `compaction_path_is_reachable`
+/// to guard against accidentally making that path unreachable via constant
+/// changes (a regression that would silently disable the multi-bset
+/// optimization on full nodes).
+#[cfg(test)]
+static COMPACT_ON_FULL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Allocate the next monotonic bset seq.
+fn alloc_seq(next_bset_seq: &mut u64) -> u64 {
+    let s = *next_bset_seq;
+    *next_bset_seq += 1;
+    s
+}
+
+/// Build a merged-sorted snapshot of every entry in a leaf node, walking
+/// across all of its bsets and collapsing duplicate keys (highest-seq wins).
+/// Used by compaction. Returns owned `DiskEntry` values so the source node
+/// can be modified afterwards without aliasing.
+fn collect_leaf_entries_sorted(node: &BtreeNodeRaw) -> Vec<DiskEntry> {
+    debug_assert_eq!(node.level(), 0);
+    MergedIter::new(node)
+        .map(|(b, i)| *node.entry_at(b, i))
+        .collect()
+}
+
+/// Compact every bset of a leaf node into a single fresh bset. The merged
+/// view (deduplicated by `MergedIter`) is the new content; older shadowed
+/// entries are dropped. The new bset is tagged with `new_seq`.
+///
+/// Always operates on leaves — internals stay single-bset by construction
+/// and never need compaction.
+fn compact_leaf_in_place(node: &mut BtreeNodeRaw, new_seq: u64) {
+    debug_assert_eq!(node.level(), 0);
+    let entries = collect_leaf_entries_sorted(node);
+    let gen_no = node.generation();
+    // Reset the body to a single empty bset; replay entries in sorted order.
+    *node = BtreeNodeRaw::new(0);
+    node.set_generation(gen_no);
+    node.start_new_bset(new_seq);
+    for entry in &entries {
+        node.append_to_last_bset(entry);
+    }
+}
+
+/// Make the latest bset of `leaf` ready to receive a new sort-insert.
+///
+/// Decision tree:
+/// 1. If there's no bset yet → open one.
+/// 2. If the latest bset still has room (< BSET_SOFT_LIMIT entries) →
+///    sort-insert directly.
+/// 3. Otherwise, if `bset_count < BSET_TREE_NR_MAX` → open a new bset.
+/// 4. Otherwise (all four bsets present and the last one is full) → compact
+///    everything into a fresh single bset.
+///
+/// After this, the caller's sort_insert_into_last_bset is guaranteed to
+/// have at least one slot of room (assuming total nkeys < MAX_ENTRIES).
+fn ensure_writable_last_bset(leaf: &mut BtreeNodeRaw, next_bset_seq: &mut u64) {
+    debug_assert_eq!(leaf.level(), 0);
+    if leaf.bset_count() == 0 {
+        leaf.start_new_bset(alloc_seq(next_bset_seq));
+        return;
+    }
+    let last = leaf.bset_count() - 1;
+    let last_h = leaf.bset_header(last);
+    let last_full = (last_h.nkeys as usize) >= BSET_SOFT_LIMIT;
+    if !last_full {
+        return;
+    }
+    if leaf.bset_count() < BSET_TREE_NR_MAX {
+        leaf.start_new_bset(alloc_seq(next_bset_seq));
+        return;
+    }
+    #[cfg(test)]
+    {
+        COMPACT_ON_FULL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    compact_leaf_in_place(leaf, alloc_seq(next_bset_seq));
+}
+
+/// Build a `DiskEntry` for a leaf write from a (sortable_key, kind, value)
+/// triple. Caller has already appended snap_id to the logical key.
+fn build_leaf_entry(sortable_key: &[u8], kind: EntryKind, value: &[u8]) -> DiskEntry {
+    let mut entry = DiskEntry::empty();
+    entry.set_key(sortable_key);
+    entry.set_kind(kind);
+    let len = value.len().min(MAX_VALUE_SIZE);
+    entry.payload.value_mut()[..len].copy_from_slice(&value[..len]);
+    entry.payload.value_mut()[len..].fill(0);
+    entry.value_len = len as u8;
+    entry
 }
 
 // ---------- Recursive operations ----------
@@ -579,21 +704,25 @@ fn find_raw(
     key: &[u8],
 ) -> Result<Option<(Vec<u8>, EntryKind)>> {
     let node = read_block(block_map, block_nr)?;
-    match node.search(key) {
-        Ok(idx) => {
-            if node.level() == 0 {
-                let entry = node.entry(idx);
-                Ok(Some((node.value_bytes(idx).to_vec(), entry.kind_enum())))
-            } else {
-                find_raw(block_map, node.child_block(idx + 1), key)
+    if node.level() == 0 {
+        // Leaf: cross-bset merged lookup. The highest-seq match wins so a
+        // newer write in a later bset shadows the older entry.
+        match merged_find(node, key) {
+            Some(hit) => {
+                let entry = node.entry_at(hit.bset_idx, hit.entry_idx);
+                Ok(Some((
+                    node.value_bytes_at(hit.bset_idx, hit.entry_idx).to_vec(),
+                    entry.kind_enum(),
+                )))
             }
+            None => Ok(None),
         }
-        Err(idx) => {
-            if node.level() == 0 {
-                Ok(None)
-            } else {
-                find_raw(block_map, node.child_block(idx), key)
-            }
+    } else {
+        // Internal nodes are always single-bset (they don't accumulate
+        // sorted runs the way leaves do).
+        match node.search(key) {
+            Ok(idx) => find_raw(block_map, node.child_block(idx + 1), key),
+            Err(idx) => find_raw(block_map, node.child_block(idx), key),
         }
     }
 }
@@ -633,6 +762,7 @@ fn find_visible_with_snap(
 fn insert(
     block_map: &mut HashMap<u64, BtreeNodeRaw>,
     next_block_nr: &mut u64,
+    next_bset_seq: &mut u64,
     block_nr: u64,
     key: &[u8],
     value: &[u8],
@@ -641,25 +771,54 @@ fn insert(
     // COW: clone before mutating so the original block stays intact.
     let old_node = clone_to_heap(read_block(block_map, block_nr)?);
     if old_node.level() == 0 {
-        insert_leaf(block_map, next_block_nr, &old_node, key, value, kind)
+        insert_leaf(
+            block_map,
+            next_block_nr,
+            next_bset_seq,
+            &old_node,
+            key,
+            value,
+            kind,
+        )
     } else {
-        insert_internal(block_map, next_block_nr, &old_node, key, value, kind)
+        insert_internal(
+            block_map,
+            next_block_nr,
+            next_bset_seq,
+            &old_node,
+            key,
+            value,
+            kind,
+        )
     }
 }
 
 fn insert_leaf(
     block_map: &mut HashMap<u64, BtreeNodeRaw>,
     next_block_nr: &mut u64,
+    next_bset_seq: &mut u64,
     old_node: &BtreeNodeRaw,
     key: &[u8],
     value: &[u8],
     kind: EntryKind,
 ) -> Result<u64> {
-    // Leaf is full — split first, then insert into the correct child.
-    // This may cascade if the child also splits.
-    if old_node.nkeys() >= MAX_ENTRIES {
+    // Determine whether the write absorbs in place (overwrite of a key
+    // already living in the latest bset → sort_insert returns Ok, no
+    // growth) or grows the node by one entry (Err path of sort_insert).
+    let absorbs_in_place = if old_node.bset_count() == 0 {
+        false
+    } else {
+        let last = old_node.bset_count() - 1;
+        old_node.bset_search(last, key).is_ok()
+    };
+
+    // Leaf at capacity AND the write would grow it — split first, then
+    // recurse to insert into the correct half. The split internally
+    // compacts a multi-bset source so the resulting halves are clean
+    // single-bset nodes (which the merged read-path also handles trivially).
+    if !absorbs_in_place && old_node.nkeys() >= MAX_ENTRIES {
         let (new_root_block, left_block, right_block) =
-            split_leaf_node(block_map, next_block_nr, old_node);
+            split_leaf_node(block_map, next_block_nr, next_bset_seq, old_node);
         block_map
             .get_mut(&new_root_block)
             .unwrap()
@@ -678,7 +837,15 @@ fn insert_leaf(
             (child_idx, root.child_block(child_idx))
         };
         let child_level = read_block(block_map, child_nr)?.level();
-        let new_child_nr = insert(block_map, next_block_nr, child_nr, key, value, kind)?;
+        let new_child_nr = insert(
+            block_map,
+            next_block_nr,
+            next_bset_seq,
+            child_nr,
+            key,
+            value,
+            kind,
+        )?;
 
         let new_child_level = read_block(block_map, new_child_nr)?.level();
         if new_child_level > child_level {
@@ -710,47 +877,36 @@ fn insert_leaf(
         return Ok(new_root_block);
     }
 
-    match old_node.search(key) {
-        Ok(idx) => {
-            // Key exists — COW clone and patch the value + kind in place.
-            // Note: when overwriting a tombstone with a Live insert, kind
-            // flips back to Live; when delete writes a tombstone, kind
-            // flips to Deleted/Whiteout.
-            let new_block = *next_block_nr;
-            *next_block_nr += 1;
-            let mut new_node = clone_to_heap(old_node);
-            new_node.set_value(idx, value);
-            new_node.entry_mut(idx).set_kind(kind);
-            block_map.insert(new_block, *new_node);
-            Ok(new_block)
-        }
-        Err(idx) => {
-            // New key — build a fresh leaf with the entry inserted at idx.
-            // Existing entries are copied with their kind preserved (so a
-            // leaf carrying tombstones survives a neighbor's insert).
-            let new_block = *next_block_nr;
-            *next_block_nr += 1;
-            let mut new_node = new_node_on_heap(0);
-            new_node.set_generation(old_node.generation());
-            for i in 0..idx {
-                copy_leaf_entry(&mut new_node, i, old_node, i);
-            }
-            new_node.entry_mut(idx).set_key(key);
-            new_node.set_value(idx, value);
-            new_node.entry_mut(idx).set_kind(kind);
-            for i in idx..old_node.nkeys() {
-                copy_leaf_entry(&mut new_node, i + 1, old_node, i);
-            }
-            new_node.set_nkeys(old_node.nkeys() + 1);
-            block_map.insert(new_block, *new_node);
-            Ok(new_block)
-        }
+    // Normal path: COW the node. If the key already lives in the latest
+    // bset (`absorbs_in_place`), patch that entry directly so we don't
+    // grow the node (and don't disturb that "latest bset" invariant by
+    // opening a new bset). Otherwise ensure the latest bset is writable
+    // (open new bset or compact as needed) and sort-insert.
+    let new_block = *next_block_nr;
+    *next_block_nr += 1;
+    let mut new_node = clone_to_heap(old_node);
+    if absorbs_in_place {
+        let last_idx = new_node.bset_count() - 1;
+        let entry_idx = new_node
+            .bset_search(last_idx, key)
+            .expect("absorbs_in_place implies present in last bset");
+        let entry = build_leaf_entry(key, kind, value);
+        *new_node.entry_at_mut(last_idx, entry_idx) = entry;
+    } else {
+        ensure_writable_last_bset(&mut new_node, next_bset_seq);
+        let entry = build_leaf_entry(key, kind, value);
+        // The result distinguishes overwrite-in-place vs new-entry but
+        // we don't need it: the entry has been written either way.
+        let _ = new_node.sort_insert_into_last_bset(&entry);
     }
+    block_map.insert(new_block, *new_node);
+    Ok(new_block)
 }
 
 fn insert_internal(
     block_map: &mut HashMap<u64, BtreeNodeRaw>,
     next_block_nr: &mut u64,
+    next_bset_seq: &mut u64,
     old_node: &BtreeNodeRaw,
     key: &[u8],
     value: &[u8],
@@ -763,7 +919,15 @@ fn insert_internal(
     let child_nr = old_node.child_block(child_idx);
     let child_level = read_block(block_map, child_nr)?.level();
 
-    let new_child_nr = insert(block_map, next_block_nr, child_nr, key, value, kind)?;
+    let new_child_nr = insert(
+        block_map,
+        next_block_nr,
+        next_bset_seq,
+        child_nr,
+        key,
+        value,
+        kind,
+    )?;
 
     // Child split and grew a level — promote its median key to this level.
     let new_child_level = read_block(block_map, new_child_nr)?.level();
@@ -802,34 +966,49 @@ fn insert_internal(
 fn split_leaf_node(
     block_map: &mut HashMap<u64, BtreeNodeRaw>,
     next_block_nr: &mut u64,
+    next_bset_seq: &mut u64,
     node: &BtreeNodeRaw,
 ) -> (u64, u64, u64) {
-    let n = node.nkeys();
-    debug_assert!(n >= MAX_ENTRIES);
     debug_assert!(node.level() == 0);
+    debug_assert!(node.nkeys() >= MAX_ENTRIES);
+
+    // Splits assume a single contiguous sorted run. If `node` is multi-bset,
+    // compact a temp copy down to a single bset first; the entries thereafter
+    // sit in bset 0 in sorted order and the existing copy_within / set_nkeys
+    // logic works as before.
+    let canonical: Box<BtreeNodeRaw> = if node.bset_count() > 1 {
+        let mut tmp = clone_to_heap(node);
+        compact_leaf_in_place(&mut tmp, alloc_seq(next_bset_seq));
+        tmp
+    } else {
+        clone_to_heap(node)
+    };
+    let n = canonical.nkeys();
     let mid = n / 2;
     debug_assert!(mid > 0 && mid < n);
-    let median_key = node.entry(mid).key_bytes();
+    let median_key = canonical.entry(mid).key_bytes();
 
     let left_block = *next_block_nr;
     *next_block_nr += 1;
-    let mut left = clone_to_heap(node);
+    let mut left = clone_to_heap(&canonical);
     left.set_nkeys(mid);
     block_map.insert(left_block, *left);
 
     let right_block = *next_block_nr;
     *next_block_nr += 1;
-    let mut right = clone_to_heap(node);
-    right.entries.copy_within(mid..n, 0);
+    let mut right = clone_to_heap(&canonical);
+    right.bset_entries_mut(0).copy_within(mid..n, 0);
     right.set_nkeys(n - mid);
     block_map.insert(right_block, *right);
 
     let root_block = *next_block_nr;
     *next_block_nr += 1;
     let mut root = new_node_on_heap(1);
-    root.set_generation(node.generation());
-    root.entry_mut(0).set_key(median_key);
+    root.set_generation(canonical.generation());
+    // Internal node with 1 separator + 2 children: claim the size first so
+    // entry_mut(0) lands in a valid slot. Children are filled by the caller.
     root.set_nkeys(1);
+    root.entry_mut(0).set_key(median_key);
     block_map.insert(root_block, *root);
 
     (root_block, left_block, right_block)
@@ -862,12 +1041,13 @@ fn split_internal_node(
     *next_block_nr += 1;
     let mut right = new_node_on_heap(node.level());
     right.set_generation(node.generation());
+    // Reserve slots before any entry writes (internal nodes store nkeys+1 entries).
+    right.set_nkeys(n - mid - 1);
     for i in (mid + 1)..n {
         right
             .entry_mut(i - mid - 1)
             .set_key(node.entry(i).key_bytes());
     }
-    right.set_nkeys(n - mid - 1);
     for i in 0..=(n - mid - 1) {
         right.set_child_block(i, node.child_block(mid + 1 + i));
     }
@@ -877,8 +1057,8 @@ fn split_internal_node(
     *next_block_nr += 1;
     let mut root = new_node_on_heap(node.level() + 1);
     root.set_generation(node.generation());
-    root.entry_mut(0).set_key(median_key);
     root.set_nkeys(1);
+    root.entry_mut(0).set_key(median_key);
     block_map.insert(root_block, *root);
 
     (root_block, left_block, right_block)
@@ -903,6 +1083,9 @@ fn promote_to_parent(
     *next_block_nr += 1;
     let mut new_node = new_node_on_heap(old_parent.level());
     new_node.set_generation(old_parent.generation());
+    // Reserve slots first (internal nkeys+1 storage). Capacity overflow is
+    // checked after the writes via the MAX_INTERNAL_KEYS comparison below.
+    new_node.set_nkeys(old_nkeys + 1);
 
     for i in 0..child_idx {
         new_node
@@ -920,7 +1103,6 @@ fn promote_to_parent(
             .set_key(old_parent.entry(i).key_bytes());
         new_node.set_child_block(i + 2, old_parent.child_block(i + 1));
     }
-    new_node.set_nkeys(old_nkeys + 1);
 
     if new_node.nkeys() <= MAX_INTERNAL_KEYS {
         block_map.insert(new_block, *new_node);
@@ -951,21 +1133,25 @@ fn range_scan(
 ) -> Result<()> {
     let node = read_block(block_map, block_nr)?;
     if node.level() == 0 {
-        for i in 0..node.nkeys() {
-            let entry = node.entry(i);
+        // Walk the merged iterator (cross-bset, latest-seq wins). The iter
+        // yields entries in sortable-key ascending order so we can early-out
+        // once we pass `end`.
+        for (b, i) in MergedIter::new(node) {
+            let entry = node.entry_at(b, i);
             let sk = entry.key_bytes();
-            if sk >= start && sk < end {
-                if entry.kind_enum() != EntryKind::Live {
-                    // Future-proofing for Phase 4+: tombstones are not visible
-                    // to range_scan callers.
-                    continue;
-                }
-                // Strip the snap_id suffix; callers see logical keys only.
-                results.push((
-                    entry.logical_key_bytes().to_vec(),
-                    node.value_bytes(i).to_vec(),
-                ));
+            if sk < start {
+                continue;
             }
+            if sk >= end {
+                break;
+            }
+            if entry.kind_enum() != EntryKind::Live {
+                continue;
+            }
+            results.push((
+                entry.logical_key_bytes().to_vec(),
+                node.value_bytes_at(b, i).to_vec(),
+            ));
         }
     } else {
         let mut i = match node.search(start) {
@@ -1001,17 +1187,23 @@ fn range_scan_all(
 ) -> Result<()> {
     let node = read_block(block_map, block_nr)?;
     if node.level() == 0 {
-        for i in 0..node.nkeys() {
-            let entry = node.entry(i);
+        // Cross-bset merged iter, but unlike `range_scan` we keep tombstones.
+        // Lower-seq duplicates are dropped by the iterator's tie-break logic.
+        for (b, i) in MergedIter::new(node) {
+            let entry = node.entry_at(b, i);
             let sk = entry.key_bytes();
-            if sk >= start && sk < end {
-                results.push((
-                    entry.logical_key_bytes().to_vec(),
-                    entry.snap_id(),
-                    entry.kind_enum(),
-                    node.value_bytes(i).to_vec(),
-                ));
+            if sk < start {
+                continue;
             }
+            if sk >= end {
+                break;
+            }
+            results.push((
+                entry.logical_key_bytes().to_vec(),
+                entry.snap_id(),
+                entry.kind_enum(),
+                node.value_bytes_at(b, i).to_vec(),
+            ));
         }
     } else {
         let mut i = match node.search(start) {
@@ -1037,9 +1229,13 @@ fn dump(block_map: &HashMap<u64, BtreeNodeRaw>, block_nr: u64, indent: usize) {
     let node = &block_map[&block_nr];
     let prefix = "  ".repeat(indent);
     if node.level() == 0 {
-        print!("{prefix}[leaf blk={block_nr} keys=");
-        for i in 0..node.nkeys() {
-            print!(" {:02x?}", node.entry(i).key_bytes());
+        print!(
+            "{prefix}[leaf blk={block_nr} bsets={} keys=",
+            node.bset_count()
+        );
+        // Walk merged-sorted view so debug output is in canonical order.
+        for (b, i) in MergedIter::new(node) {
+            print!(" {:02x?}", node.entry_at(b, i).key_bytes());
         }
         println!("]");
     } else {
@@ -1231,6 +1427,7 @@ mod tests {
         use zerocopy::{FromBytes, IntoBytes};
 
         let mut node = BtreeNodeRaw::new(0);
+        node.start_new_bset(0);
         node.set_nkeys(3);
         node.set_generation(42);
         node.entry_mut(0).set_key_with_snap(b"hello", ROOT_SNAP);
@@ -2260,5 +2457,224 @@ mod tests {
         let model_keys: Vec<u32> = model.keys().copied().collect();
         assert_eq!(scan_keys, model_keys);
         tree.verify();
+    }
+
+    // ---------- Multi-bset specific tests ----------
+    //
+    // These directly probe the multi-bset machinery: the leaf must actually
+    // contain >1 bset after enough inserts, reads must merge across bsets,
+    // newer-bset writes must shadow older-bset entries, and compaction +
+    // split must collapse bsets correctly.
+
+    /// Helper: walk the tree to find the (single) leaf, returning its bset_count.
+    fn root_leaf_bset_count(tree: &Btree) -> usize {
+        let mut blk = tree.root_block;
+        loop {
+            let node = &tree.block_map[&blk];
+            if node.level() == 0 {
+                return node.bset_count();
+            }
+            blk = node.child_block(0);
+        }
+    }
+
+    #[test]
+    fn leaf_grows_to_multiple_bsets() {
+        // Insert past BSET_SOFT_LIMIT but stay below MAX_ENTRIES so the tree
+        // is still a single leaf. We expect bset_count to climb above 1.
+        let mut tree = Btree::new();
+        for i in 0..16u32 {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
+        assert!(
+            root_leaf_bset_count(&tree) >= 2,
+            "expected leaf to span multiple bsets after 16 inserts"
+        );
+        // Reads still see every key.
+        for i in 0..16u32 {
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i).as_slice()),
+                "key {i} not found",
+            );
+        }
+        tree.verify();
+    }
+
+    #[test]
+    fn newer_bset_shadows_older_bset_on_overwrite() {
+        // Force an overwrite to land in a newer bset (not in-place in the
+        // older one). The merged read must return the newer value.
+        let mut tree = Btree::new();
+        // Fill bset 0 above BSET_SOFT_LIMIT so the next overwrite goes to a
+        // fresh bset 1.
+        for i in 0..(BSET_SOFT_LIMIT as u32 + 2) {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
+        // Bset 0 is now full and bset 1 has at least one entry; any further
+        // insert that doesn't already live in the latest bset opens / lands
+        // in a new bset.
+        let new_value = 0xDEADBEEFu32.to_be_bytes();
+        tree.insert(&key(0), &new_value).unwrap();
+        assert!(root_leaf_bset_count(&tree) >= 2);
+        assert_eq!(
+            tree.find(&key(0)).unwrap().as_deref(),
+            Some(new_value.as_slice()),
+            "newer-bset write must shadow older-bset entry",
+        );
+        // Other keys unaffected.
+        for i in 1..(BSET_SOFT_LIMIT as u32 + 2) {
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i).as_slice())
+            );
+        }
+        tree.verify();
+    }
+
+    #[test]
+    fn compaction_collapses_bsets_when_full() {
+        // Push the leaf past the BSET_TREE_NR_MAX threshold; compaction must
+        // fold all bsets back into one.
+        let mut tree = Btree::new();
+        // Each insert at distinct key grows the latest bset; once it crosses
+        // BSET_SOFT_LIMIT, a new bset opens. After enough inserts, all four
+        // bsets fill and compact triggers.
+        let n = (BSET_SOFT_LIMIT * BSET_TREE_NR_MAX) as u32 + 4;
+        for i in 0..n {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
+        // Compaction has bounded bset_count to BSET_TREE_NR_MAX. Just check
+        // the cap holds and reads still work.
+        let bcnt = root_leaf_bset_count(&tree);
+        assert!(
+            bcnt <= BSET_TREE_NR_MAX,
+            "bset_count {bcnt} exceeds BSET_TREE_NR_MAX {BSET_TREE_NR_MAX}"
+        );
+        for i in 0..n {
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i).as_slice())
+            );
+        }
+        tree.verify();
+    }
+
+    #[test]
+    fn split_handles_multi_bset_source() {
+        // Drive the leaf to MAX_ENTRIES via inserts that span multiple bsets,
+        // then push one more to force a split. The split must compact first
+        // so the resulting halves are well-formed single-bset leaves.
+        let mut tree = Btree::new();
+        for i in 0..MAX_ENTRIES as u32 {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
+        // Now the leaf has MAX_ENTRIES entries; the next distinct-key insert
+        // forces a split.
+        let trigger = MAX_ENTRIES as u32;
+        tree.insert(&key(trigger), &val(trigger)).unwrap();
+        // Tree is now level >= 1; root is internal.
+        let root = &tree.block_map[&tree.root_block];
+        assert!(
+            root.level() >= 1,
+            "root should be internal after split, level={}",
+            root.level()
+        );
+        // All keys still readable.
+        for i in 0..=trigger {
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i).as_slice())
+            );
+        }
+        tree.verify();
+    }
+
+    #[test]
+    fn tombstone_in_newer_bset_shadows_live_in_older_bset() {
+        // Write a key, fill the bset to roll over to a new bset, then delete
+        // the key — the tombstone lands in the newer bset. find must return
+        // None despite the live entry still sitting in the older bset.
+        let mut tree = Btree::new();
+        for i in 0..(BSET_SOFT_LIMIT as u32 + 2) {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
+        // Delete key(0). delete_at writes a Deleted tombstone (same-snap).
+        let removed = tree.delete(&key(0)).unwrap();
+        assert!(removed, "delete should report a tombstone written");
+        assert_eq!(tree.find(&key(0)).unwrap(), None, "tombstone must shadow");
+        // Other keys still present.
+        for i in 1..(BSET_SOFT_LIMIT as u32 + 2) {
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i).as_slice())
+            );
+        }
+        tree.verify();
+    }
+
+    #[test]
+    fn merged_iter_respects_seq_for_dup_keys() {
+        // Build a leaf where the same key lives in two bsets (older has
+        // value A, newer has value B). MergedIter must yield exactly one
+        // entry — the one from the newer bset.
+        use crate::block_btree::{BtreeNodeRaw, MergedIter};
+
+        let mut node = BtreeNodeRaw::new(0);
+        // bset 0: seq=10, contains (key1, valA).
+        node.start_new_bset(10);
+        let mut e_a = DiskEntry::empty();
+        e_a.set_key_with_snap(b"k1", ROOT_SNAP);
+        e_a.set_kind(EntryKind::Live);
+        e_a.payload.value_mut()[..1].copy_from_slice(b"A");
+        e_a.value_len = 1;
+        node.append_to_last_bset(&e_a);
+        // bset 1: seq=20, contains (key1, valB).
+        node.start_new_bset(20);
+        let mut e_b = e_a;
+        e_b.payload.value_mut()[..1].copy_from_slice(b"B");
+        node.append_to_last_bset(&e_b);
+
+        let mut iter = MergedIter::new(&node);
+        let (b, i) = iter.next().expect("at least one entry");
+        assert_eq!(b, 1, "newer bset must win");
+        let val_bytes = &node.entry_at(b, i).payload.value()[..1];
+        assert_eq!(val_bytes, b"B");
+        assert!(
+            iter.next().is_none(),
+            "older shadowed entry must not be emitted"
+        );
+    }
+
+    /// Reachability check: drive a workload that should pack four bsets to
+    /// the soft limit and verify the compaction path in
+    /// `ensure_writable_last_bset` actually fires. If a future constant
+    /// change pushes `BSET_SOFT_LIMIT * BSET_TREE_NR_MAX` past `MAX_ENTRIES`
+    /// the path silently becomes unreachable (split fires first) — this
+    /// test catches that regression.
+    #[test]
+    fn compaction_path_is_reachable() {
+        use std::sync::atomic::Ordering;
+
+        let baseline = COMPACT_ON_FULL_HITS.load(Ordering::Relaxed);
+        let mut tree = Btree::new();
+        let mut rng = Rng(0xC0FF_EEFE_EDC0_FFEE);
+        // Mix: small key space + frequent overwrites packs lots of writes
+        // into a single leaf without forcing a structural split, exercising
+        // the multi-bset accumulator until 4 bsets fill.
+        for _ in 0..2000u32 {
+            let k = rng.next_u32() % 50;
+            if rng.next_u32().is_multiple_of(4) {
+                let _ = tree.delete(&key(k));
+            } else {
+                tree.insert(&key(k), &val(rng.next_u32())).unwrap();
+            }
+        }
+        let hits = COMPACT_ON_FULL_HITS.load(Ordering::Relaxed) - baseline;
+        assert!(
+            hits > 0,
+            "ensure_writable_last_bset never compacted; the 4-bsets-full path \
+             is unreachable (likely BSET_SOFT_LIMIT * BSET_TREE_NR_MAX >= MAX_ENTRIES)",
+        );
     }
 }
