@@ -1401,4 +1401,318 @@ mod tests {
             ),
         }
     }
+
+    /// Hammer enough inodes through the btree to force multiple split
+    /// levels (root → internal → internal → leaf), sync, reopen, and
+    /// read every inode back. This is the test that actually exercises
+    /// `find_at` walking down through deep internal nodes sitting at
+    /// `root_block`. The basic round-trip test only ever touches a
+    /// single-leaf tree.
+    #[test]
+    fn image_persist_through_btree_split() {
+        let img = tmp_image_path("split");
+        // 5_000 inodes ≫ MAX_ENTRIES (29) — at MAX_INTERNAL_KEYS = 27 fanout
+        // this forces at least two internal levels (1 leaf can hold ≤29,
+        // 1 internal level can hold ≤27×29 ≈ 783, so 5000 needs
+        // root → internal → internal → leaf). Each insert also walks
+        // through the multi-bset path on the leaf (BSET_SOFT_LIMIT = 7,
+        // BSET_TREE_NR_MAX = 4).
+        const N: u64 = 5_000;
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            // Bootstrap a root inode at ROOT_INO (matches FuseFs).
+            let r = fs.alloc_ino();
+            assert_eq!(r, ROOT_INO);
+            fs.put_inode(ROOT_INO, &sample_inode(0)).unwrap();
+            for i in 0..N {
+                let ino = fs.alloc_ino();
+                // Encode `i` into the size field so we can verify content.
+                fs.put_inode(ino, &sample_inode(i)).unwrap();
+            }
+            fs.sync().unwrap();
+        }
+        // Reopen and read every single one. If reopen lost or mis-walked
+        // any internal pointer, some `get_inode` will return None or a
+        // wrong size.
+        let fs = Fs::open(&img.0).unwrap();
+        // First non-root ino is 2 (alloc_ino started at 1 = ROOT_INO).
+        for i in 0..N {
+            let ino = 2 + i;
+            let got = fs
+                .get_inode(ino)
+                .unwrap()
+                .unwrap_or_else(|| panic!("ino {ino} missing after reopen"));
+            assert_eq!(got.size, i, "wrong content for ino {ino}");
+        }
+        // Out-of-range still returns None (no false positives from the
+        // walk).
+        assert!(fs.get_inode(2 + N).unwrap().is_none());
+    }
+
+    /// Delete (in-place tombstone + cross-snap whiteout) survives sync.
+    /// Reopen and check the deleted name really stays gone.
+    #[test]
+    fn image_persist_after_delete() {
+        let img = tmp_image_path("delete");
+        // 2_000 entries forces the dirent btree well beyond a single
+        // leaf; deleting half of them leaves 1_000 tombstones interleaved
+        // with 1_000 live entries across many leaves and at least one
+        // internal level. After reopen the visibility filter must walk
+        // the whole tree correctly.
+        const N: u32 = 2_000;
+        let parent_ino;
+        let kept: Vec<u32> = (1..N).step_by(2).collect();
+        let removed: Vec<u32> = (0..N).step_by(2).collect();
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            make_root(&mut fs);
+            parent_ino = make_dir(&mut fs, ROOT_INO, b"d");
+            // Create N files under d/.
+            let mut inos = Vec::with_capacity(N as usize);
+            for i in 0..N {
+                let name = format!("f{i:05}");
+                inos.push(make_file(&mut fs, parent_ino, name.as_bytes()));
+            }
+            // Delete even-indexed names: in-place delete (visible_snap ==
+            // current_snap) flips kind to Deleted.
+            for &i in &removed {
+                let name = format!("f{i:05}");
+                let removed_ok = fs.delete_dirent(parent_ino, name.as_bytes()).unwrap();
+                assert!(removed_ok, "delete_dirent must report removed=true");
+                assert!(fs.delete_inode(inos[i as usize]).unwrap());
+            }
+            fs.sync().unwrap();
+        }
+        // ---- reopen + verify visibility.
+        let fs = Fs::open(&img.0).unwrap();
+        for &i in &removed {
+            let name = format!("f{i:05}");
+            let look = fs.lookup_dirent(parent_ino, name.as_bytes()).unwrap();
+            assert!(
+                look.is_none(),
+                "deleted name {name} should be invisible after reopen, got {look:?}"
+            );
+        }
+        for &i in &kept {
+            let name = format!("f{i:05}");
+            let look = fs.lookup_dirent(parent_ino, name.as_bytes()).unwrap();
+            assert!(
+                look.is_some(),
+                "live name {name} should still be there after reopen"
+            );
+        }
+        // listdir reflects only the kept names.
+        let names = fs.list_dirents(parent_ino).unwrap();
+        assert_eq!(
+            names.len(),
+            kept.len(),
+            "list_dirents should return only kept names (got {} of {})",
+            names.len(),
+            kept.len()
+        );
+    }
+
+    /// Snapshot a subvol, write under both ids, sync, reopen, and verify
+    /// the on-disk superblock's snap/subvol counters and current_subvol
+    /// were reloaded so switch_subvol works on the persisted ids.
+    #[test]
+    fn image_persist_snapshot_and_subvol() {
+        let img = tmp_image_path("snap");
+        let new_subvol;
+        // ---- create + populate root + take a snapshot + write divergent
+        // data on each side + sync.
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            make_root(&mut fs);
+            // Root subvol writes "alpha" under ROOT_INO.
+            fs.put_extent(ROOT_INO, 0, b"alpha-pre-snap").unwrap();
+            // Snapshot: src (current ROOT_SUBVOL) keeps writing under a
+            // new snap_id; new readonly subvol gets the old data.
+            new_subvol = fs.snapshot_subvol(crate::fs::ROOT_SUBVOL).unwrap();
+            // Active subvol is still ROOT_SUBVOL; write divergent data
+            // under it (visible only to the writable side).
+            fs.put_extent(ROOT_INO, 0, b"alpha-post-snap").unwrap();
+            fs.sync().unwrap();
+        }
+        // ---- reopen + check both sides.
+        let mut fs = Fs::open(&img.0).unwrap();
+        // Active subvol after reopen must be the persisted current_subvol
+        // (== ROOT_SUBVOL).
+        let post = fs.get_extent(ROOT_INO, 0).unwrap().expect("extent missing");
+        let blk = fs.read_data_block(post.data_block).unwrap();
+        assert_eq!(
+            &blk[..post.len as usize],
+            b"alpha-post-snap",
+            "active subvol should see post-snap write"
+        );
+        // Switch to the readonly snapshot subvol and re-read — should
+        // see pre-snap content. This proves next_snap_id /
+        // next_subvol_id / the snapshot tree all survived.
+        fs.switch_subvol(new_subvol).unwrap();
+        let pre = fs.get_extent(ROOT_INO, 0).unwrap().expect("extent missing");
+        let blk = fs.read_data_block(pre.data_block).unwrap();
+        assert_eq!(
+            &blk[..pre.len as usize],
+            b"alpha-pre-snap",
+            "readonly snapshot subvol should see pre-snap write"
+        );
+    }
+
+    /// Overwrite the same extent slot many times across multiple sync
+    /// cycles, then reopen and check the latest payload wins. Catches
+    /// any bug where the metadata reload picks up a stale data_block_nr
+    /// or where COW-overwrite of the extent key path fails after several
+    /// rounds of allocator advancement.
+    #[test]
+    fn image_persist_extent_overwrite_rmw() {
+        let img = tmp_image_path("rmw");
+        // 50 overwrites split across 5 sync barriers (10 writes per
+        // sync). Each write allocates a fresh data block_nr — so the
+        // image grows by ≥50 data blocks plus btree COW overhead. The
+        // reload must always settle on the very last write.
+        const TOTAL_WRITES: u32 = 50;
+        const SYNCS: u32 = 5;
+        const PER_SYNC: u32 = TOTAL_WRITES / SYNCS;
+        let file_ino;
+        let mut last_payload = String::new();
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            make_root(&mut fs);
+            file_ino = make_file(&mut fs, ROOT_INO, b"f");
+            for round in 0..SYNCS {
+                for w in 0..PER_SYNC {
+                    let n = round * PER_SYNC + w;
+                    last_payload = format!("v{n:04}-payload-with-some-bytes");
+                    fs.put_extent(file_ino, 0, last_payload.as_bytes()).unwrap();
+                }
+                fs.sync().unwrap();
+            }
+        }
+        let fs = Fs::open(&img.0).unwrap();
+        let ext = fs
+            .get_extent(file_ino, 0)
+            .unwrap()
+            .expect("extent missing after reopen");
+        assert_eq!(ext.len, last_payload.len() as u32);
+        let blk = fs.read_data_block(ext.data_block).unwrap();
+        assert_eq!(
+            &blk[..ext.len as usize],
+            last_payload.as_bytes(),
+            "post-reopen read must return the last written payload"
+        );
+        // After reopen, allocator must continue past every block we
+        // ever wrote (≥ TOTAL_WRITES data blocks + at least as many
+        // btree COWs). next_block_nr should be well beyond
+        // TOTAL_WRITES.
+        let next = fs.store.next_block_nr();
+        assert!(
+            next >= TOTAL_WRITES as u64,
+            "next_block_nr must be >= {TOTAL_WRITES} after {TOTAL_WRITES} writes, got {next}"
+        );
+    }
+
+    /// 1_000 sibling files in one directory: pushes the dirent btree to
+    /// many leaves under the same `(KIND_DIRENT, parent_ino)` key prefix
+    /// and verifies `list_dirents` after reopen returns every name in
+    /// sorted order. This is the dirent-side analog of
+    /// `image_persist_through_btree_split`, which only stresses inode
+    /// keys.
+    #[test]
+    fn image_persist_dense_dirents() {
+        let img = tmp_image_path("dense-dir");
+        const N: u32 = 1_000;
+        let parent_ino;
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            make_root(&mut fs);
+            parent_ino = make_dir(&mut fs, ROOT_INO, b"d");
+            for i in 0..N {
+                let name = format!("file-{i:05}");
+                make_file(&mut fs, parent_ino, name.as_bytes());
+            }
+            fs.sync().unwrap();
+        }
+        let fs = Fs::open(&img.0).unwrap();
+        let names = fs.list_dirents(parent_ino).unwrap();
+        assert_eq!(
+            names.len(),
+            N as usize,
+            "expected {N} dirents after reopen, got {}",
+            names.len()
+        );
+        // list_dirents must come back sorted (range scan order). Spot
+        // check + monotonicity.
+        for (i, (name, _dirent)) in names.iter().enumerate() {
+            let want = format!("file-{i:05}");
+            assert_eq!(name.as_slice(), want.as_bytes(), "name at idx {i} mismatch");
+        }
+        // Random lookups also work.
+        for &i in &[0u32, 1, 7, 199, 500, 999] {
+            let name = format!("file-{i:05}");
+            let dirent = fs
+                .lookup_dirent(parent_ino, name.as_bytes())
+                .unwrap()
+                .unwrap_or_else(|| panic!("lookup of {name} returned None"));
+            assert_eq!(dirent.kind, FILE_KIND_REGULAR);
+        }
+    }
+
+    /// Image file size must grow monotonically across sync cycles
+    /// (allocator never reuses block_nrs without GC, and `next_block_nr`
+    /// is persisted in the superblock). Catches any regression where
+    /// reopen mis-restores the counter and we start handing out already-
+    /// occupied block numbers.
+    #[test]
+    fn image_size_grows_monotonically_across_syncs() {
+        let img = tmp_image_path("grow");
+        let mut sizes = Vec::new();
+        let mut last_next_block = 0u64;
+        // 4 sync rounds, ~250 writes per round (= 1_000 total). Each
+        // round we record next_block_nr + on-disk file size; both must
+        // be strictly increasing.
+        const ROUNDS: u32 = 4;
+        const PER_ROUND: u32 = 250;
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            make_root(&mut fs);
+            for round in 0..ROUNDS {
+                for i in 0..PER_ROUND {
+                    let n = round * PER_ROUND + i;
+                    let name = format!("g-{n:05}");
+                    make_file(&mut fs, ROOT_INO, name.as_bytes());
+                }
+                fs.sync().unwrap();
+                let next = fs.store.next_block_nr();
+                let size = std::fs::metadata(&img.0).unwrap().len();
+                assert!(
+                    next > last_next_block,
+                    "next_block_nr did not grow: {last_next_block} -> {next}"
+                );
+                last_next_block = next;
+                sizes.push(size);
+            }
+        }
+        // sizes monotonically non-decreasing (grow on every round; could
+        // plateau briefly if all writes fit existing file extent, but
+        // with 250 new files per round it must grow).
+        for w in sizes.windows(2) {
+            assert!(
+                w[1] >= w[0],
+                "image size regressed across sync: {} -> {}",
+                w[0],
+                w[1]
+            );
+        }
+        assert!(
+            sizes.last().unwrap() > sizes.first().unwrap(),
+            "image size did not grow at all over {ROUNDS} rounds: {sizes:?}"
+        );
+        // After reopen, allocator must resume past last_next_block.
+        let fs = Fs::open(&img.0).unwrap();
+        assert_eq!(
+            fs.store.next_block_nr(),
+            last_next_block,
+            "reopened allocator must resume at the persisted next_block_nr"
+        );
+    }
 }

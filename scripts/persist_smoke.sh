@@ -116,6 +116,34 @@ mount_image
 eq "round-2 added file survives 2nd reopen" "appended in round 2" "$(cat "$mountpoint/d/round2_only.txt")"
 eq "round-1 greeting still there"           "hello from round 1"  "$(cat "$mountpoint/d/greeting.txt")"
 
+# Mutating ops to test on the next round.
+rm "$mountpoint/d/greeting.txt"                              # unlink
+mv "$mountpoint/d/round2_only.txt" "$mountpoint/renamed.txt" # cross-dir rename
+echo "first-half-AAAA-second-half" > "$mountpoint/rmw.txt"
+# Partial-block overwrite: replace "AAAA" -> "ZZZZ" mid-file.
+printf 'ZZZZ' | dd of="$mountpoint/rmw.txt" bs=1 seek=11 count=4 conv=notrunc status=none
+mkdir "$mountpoint/empty_then_rmdir" && rmdir "$mountpoint/empty_then_rmdir"
+unmount
+
+# ===== Round 4: verify mutations from round 3 also persist =====
+printf 'Round 4: verify unlink / rename / RMW / rmdir cross-mount...\n'
+mount_image
+
+eq "unlink survived: greeting.txt is gone"   "missing" \
+    "$([[ -e "$mountpoint/d/greeting.txt" ]] && echo present || echo missing)"
+eq "rename survived: src is gone"            "missing" \
+    "$([[ -e "$mountpoint/d/round2_only.txt" ]] && echo present || echo missing)"
+eq "rename survived: dst has content"        "appended in round 2" \
+    "$(cat "$mountpoint/renamed.txt")"
+eq "RMW within block survived reopen"        "first-half-ZZZZ-second-half" \
+    "$(cat "$mountpoint/rmw.txt")"
+eq "rmdir of empty dir survived"             "missing" \
+    "$([[ -e "$mountpoint/empty_then_rmdir" ]] && echo present || echo missing)"
+# Larger read-back to confirm the binary blob is bit-identical even
+# after several mount cycles.
+eq "12KB binary still bit-identical (round 4)" "$big_sha_before" \
+    "$(sha256sum "$mountpoint/big.bin" | cut -d' ' -f1)"
+
 unmount
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

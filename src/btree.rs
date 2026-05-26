@@ -583,16 +583,16 @@ fn verify_node(store: &BlockStore, block_nr: u64, lo: Option<&[u8]>, hi: Option<
 
     for i in 0..n {
         let k = node.entry(i).key_bytes();
-        if let Some(lo) = lo {
-            if k < lo {
-                panic!(
-                    "blk={block_nr} level={} nkeys={n} key[{i}]={k:?} < lo={lo:?}\n\
-                     first_key={:?} last_key={:?}",
-                    node.level(),
-                    node.entry(0).key_bytes(),
-                    node.entry(n - 1).key_bytes(),
-                );
-            }
+        if let Some(lo) = lo
+            && k < lo
+        {
+            panic!(
+                "blk={block_nr} level={} nkeys={n} key[{i}]={k:?} < lo={lo:?}\n\
+                 first_key={:?} last_key={:?}",
+                node.level(),
+                node.entry(0).key_bytes(),
+                node.entry(n - 1).key_bytes(),
+            );
         }
         if let Some(hi) = hi {
             debug_assert!(k < hi, "blk={block_nr} key[{i}]={k:?} >= hi={hi:?}");
@@ -1352,37 +1352,61 @@ mod tests {
 
     #[test]
     fn test_cow_preserves_old_root() {
+        // Fill the root leaf to capacity (MAX_ENTRIES = 29), record the
+        // root_block of that just-full single-leaf state, then push one
+        // more key — this forces the leaf to split and the root to grow
+        // into an internal node. The old root_block is still in the
+        // store (COW = old block stays); reading at it must give back
+        // exactly the pre-split snapshot.
         let mut tree = Btree::new();
-        tree.insert(&key(10), &val(10)).unwrap();
-        tree.insert(&key(20), &val(20)).unwrap();
+        let n = MAX_ENTRIES as u32;
+        for i in 0..n {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
 
         let old_root_block = tree.root_block;
-
-        tree.insert(&key(30), &val(30)).unwrap();
-
+        // Pre-split, the root is still a single leaf.
         assert_eq!(
-            find_at_root(&tree.store, old_root_block, &key(10))
-                .unwrap()
-                .as_deref(),
-            Some(val(10).as_slice())
-        );
-        assert_eq!(
-            find_at_root(&tree.store, old_root_block, &key(20))
-                .unwrap()
-                .as_deref(),
-            Some(val(20).as_slice())
-        );
-        assert_eq!(
-            find_at_root(&tree.store, old_root_block, &key(30))
-                .unwrap()
-                .as_deref(),
-            None
+            tree.store.read_node(old_root_block).unwrap().level(),
+            0,
+            "root should still be a leaf at MAX_ENTRIES = {n}"
         );
 
-        assert_eq!(
-            tree.find(&key(30)).unwrap().as_deref(),
-            Some(val(30).as_slice())
+        // This insert overflows the leaf and forces a split. After it,
+        // the *current* root is an internal node at a fresh block; the
+        // old block is frozen.
+        tree.insert(&key(n), &val(n)).unwrap();
+        assert_ne!(tree.root_block, old_root_block);
+        assert!(
+            tree.store.read_node(tree.root_block).unwrap().level() >= 1,
+            "new root should be internal after split"
         );
+
+        // Reading via the frozen old root must see all n keys it had
+        // when we recorded it, and must NOT see the post-split insert.
+        for i in 0..n {
+            assert_eq!(
+                find_at_root(&tree.store, old_root_block, &key(i))
+                    .unwrap()
+                    .as_deref(),
+                Some(val(i).as_slice()),
+                "frozen old root lost key {i}"
+            );
+        }
+        assert_eq!(
+            find_at_root(&tree.store, old_root_block, &key(n))
+                .unwrap()
+                .as_deref(),
+            None,
+            "frozen old root must not see post-snap key"
+        );
+        // Modern view sees everything including key n.
+        for i in 0..=n {
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i).as_slice())
+            );
+        }
         tree.verify();
     }
 
@@ -1743,25 +1767,46 @@ mod tests {
 
     #[test]
     fn test_cow_after_overwrite() {
+        // Build a btree large enough that the root is internal (forced
+        // by inserting MAX_ENTRIES + a few more), snapshot the root_block,
+        // then overwrite every old key with a new value. The frozen
+        // snapshot must still see the original values; the modern tree
+        // must see the overwritten values. This exercises COW correctness
+        // across multiple leaves under one internal node.
         let mut tree = Btree::new();
-        tree.insert(&key(1), b"v1").unwrap();
-        tree.insert(&key(2), b"v2").unwrap();
+        let n = MAX_ENTRIES as u32 + 10; // ≥ 39, forces ≥1 split
+        for i in 0..n {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
+        // Root must be internal at this point.
         let snap = tree.root_block;
+        assert!(
+            tree.store.read_node(snap).unwrap().level() >= 1,
+            "expected internal root after {n} inserts, level={}",
+            tree.store.read_node(snap).unwrap().level()
+        );
 
-        // Overwrite key(1) — old snapshot should still see "v1".
-        tree.insert(&key(1), b"v1-new").unwrap();
-        assert_eq!(
-            tree.find(&key(1)).unwrap().as_deref(),
-            Some(b"v1-new".as_slice())
-        );
-        assert_eq!(
-            find_at_root(&tree.store, snap, &key(1)).unwrap().as_deref(),
-            Some(b"v1".as_slice())
-        );
-        assert_eq!(
-            find_at_root(&tree.store, snap, &key(2)).unwrap().as_deref(),
-            Some(b"v2".as_slice())
-        );
+        // Overwrite every key with a new value.
+        for i in 0..n {
+            tree.insert(&key(i), &val(i + 1_000_000)).unwrap();
+        }
+
+        // Modern view: everyone sees the new value.
+        for i in 0..n {
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i + 1_000_000).as_slice()),
+                "modern key {i} should see new value"
+            );
+        }
+        // Frozen snapshot: every key still has its original value.
+        for i in 0..n {
+            assert_eq!(
+                find_at_root(&tree.store, snap, &key(i)).unwrap().as_deref(),
+                Some(val(i).as_slice()),
+                "snap key {i} regressed: COW leaked through"
+            );
+        }
         tree.verify();
     }
 
@@ -2352,28 +2397,58 @@ mod tests {
 
     #[test]
     fn transaction_commits_multiple_ops_atomically() {
+        // Drive a single transaction with enough inserts to force splits
+        // inside the tx. The tx must commit atomically — readers outside
+        // see exactly the pre-tx state until the closure returns Ok, then
+        // see all 200+ keys at once. root_block changes exactly once.
         let mut tree = Btree::new();
         tree.insert(b"a", b"1").unwrap();
         let pre_root = tree.root_block;
 
+        const TX_KEYS: u32 = 200; // ≫ MAX_ENTRIES = 29
+
         tree.transaction(|tx| {
-            tx.insert(b"b", ROOT_SNAP, b"2")?;
-            tx.insert(b"c", ROOT_SNAP, b"3")?;
-            // Reads inside tx see pending state.
+            for i in 0..TX_KEYS {
+                let k = format!("k{i:05}");
+                let v = format!("v{i:05}");
+                tx.insert(k.as_bytes(), ROOT_SNAP, v.as_bytes())?;
+            }
+            // Reads inside tx see all pending writes (spot check across
+            // the range so we know the in-tx walk finds keys that landed
+            // in different leaves after split).
+            for &i in &[0u32, 1, 27, 28, 29, 100, TX_KEYS - 1] {
+                let k = format!("k{i:05}");
+                let v = format!("v{i:05}");
+                assert_eq!(
+                    tx.find_at(k.as_bytes(), ROOT_SNAP)?.as_deref(),
+                    Some(v.as_bytes()),
+                    "in-tx find of k{i:05} missed"
+                );
+            }
+            // Outside-the-tx state: pre_root is still the published root,
+            // so a reader at pre_root sees only "a".
             assert_eq!(
-                tx.find_at(b"b", ROOT_SNAP)?.as_deref(),
-                Some(b"2".as_slice())
+                find_at_root(&tx.btree.store, pre_root, b"a")?.as_deref(),
+                Some(b"1".as_slice())
             );
-            // Outside the tx, the original root is still in place.
+            assert_eq!(find_at_root(&tx.btree.store, pre_root, b"k00000")?, None);
             Ok(())
         })
         .unwrap();
 
-        // After commit, all three keys are visible.
+        // After commit, every key is visible from the modern root.
         assert_eq!(tree.find(b"a").unwrap().as_deref(), Some(b"1".as_slice()));
-        assert_eq!(tree.find(b"b").unwrap().as_deref(), Some(b"2".as_slice()));
-        assert_eq!(tree.find(b"c").unwrap().as_deref(), Some(b"3".as_slice()));
-        // root_block changed exactly once.
+        for i in 0..TX_KEYS {
+            let k = format!("k{i:05}");
+            let v = format!("v{i:05}");
+            assert_eq!(
+                tree.find(k.as_bytes()).unwrap().as_deref(),
+                Some(v.as_bytes()),
+                "post-commit find of k{i:05} missed"
+            );
+        }
+        // root_block changed exactly once (the tx commits as one atomic
+        // root swap, even though many splits happened inside it).
         assert_ne!(tree.root_block, pre_root);
         tree.verify();
     }
@@ -2443,9 +2518,9 @@ mod tests {
         const STEPS: u32 = 2000;
 
         for step in 0..STEPS {
-            let k = (rng.next_u32() % KEY_SPACE) as u32;
+            let k = rng.next_u32() % KEY_SPACE;
             // Bias toward insert until the model is reasonably populated.
-            let do_delete = step > 200 && (rng.next_u32() % 3 == 0);
+            let do_delete = step > 200 && rng.next_u32().is_multiple_of(3);
             if do_delete {
                 let removed = tree.delete_at(&k.to_be_bytes(), ROOT_SNAP, &chain).unwrap();
                 let model_had = model.remove(&k).is_some();
