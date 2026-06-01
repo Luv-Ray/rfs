@@ -213,6 +213,9 @@ pub enum FsError {
     NotEmpty,
     /// rename / create where the target already exists (EEXIST).
     AlreadyExists,
+    /// An id space (snap_id / subvol_id) is exhausted (ENOSPC). Without a
+    /// GC to recycle freed ids there is no way to satisfy the request.
+    Exhausted,
 }
 
 impl std::fmt::Display for FsError {
@@ -223,6 +226,7 @@ impl std::fmt::Display for FsError {
             FsError::NotADirectory => f.write_str("not a directory"),
             FsError::NotEmpty => f.write_str("directory not empty"),
             FsError::AlreadyExists => f.write_str("already exists"),
+            FsError::Exhausted => f.write_str("id space exhausted"),
         }
     }
 }
@@ -699,12 +703,18 @@ impl Fs {
 
         // Allocate ids. bcachefs allocates snap_ids decreasing so that
         // parent.id > child.id always holds — assertion enforced in
-        // ancestor_chain.
+        // ancestor_chain. We need two fresh snap_ids (writable + readonly)
+        // and one subvol_id. Use checked arithmetic: there is no GC yet, so
+        // once an id space is exhausted we must refuse rather than wrap or
+        // saturate (which would silently hand out a duplicate id).
         let s_w = self.next_snap_id;
-        let s_ro = self.next_snap_id - 1;
-        self.next_snap_id = self.next_snap_id.saturating_sub(2);
+        let s_ro = self.next_snap_id.checked_sub(1).ok_or(FsError::Exhausted)?;
+        let next_snap_id = self.next_snap_id.checked_sub(2).ok_or(FsError::Exhausted)?;
         let new_subvol_id = self.next_subvol_id;
-        self.next_subvol_id = self.next_subvol_id.saturating_add(1);
+        let next_subvol_id = self
+            .next_subvol_id
+            .checked_add(1)
+            .ok_or(FsError::Exhausted)?;
 
         let snap_w = SnapshotV1 {
             parent_id: parent_snap,
@@ -740,6 +750,11 @@ impl Fs {
             tx.insert(&dst_subvol_key, ROOT_SNAP, dst_subvol.as_bytes())?;
             Ok(())
         })?;
+
+        // Commit the bumped counters only after the transaction lands, so a
+        // failed transaction doesn't burn ids.
+        self.next_snap_id = next_snap_id;
+        self.next_subvol_id = next_subvol_id;
 
         Ok(new_subvol_id)
     }
@@ -1179,6 +1194,41 @@ mod tests {
         let d_meta = fs.get_snapshot(dst.snap_id).unwrap().unwrap();
         assert_eq!(s_meta.parent_id, ROOT_SNAP);
         assert_eq!(d_meta.parent_id, ROOT_SNAP);
+    }
+
+    #[test]
+    fn snapshot_subvol_snap_id_exhaustion_is_an_error() {
+        // Drive next_snap_id down to where there aren't two ids left to hand
+        // out. snapshot_subvol must refuse with Exhausted rather than
+        // saturate and silently reuse id 0.
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        // Only one id left below: checked_sub(1) is fine, checked_sub(2) is not.
+        fs.next_snap_id = 1;
+        let before_snap = fs.next_snap_id;
+        let before_subvol = fs.next_subvol_id;
+
+        let err = fs.snapshot_subvol(ROOT_SUBVOL).unwrap_err();
+        assert!(matches!(err, FsError::Exhausted));
+        // Counters must be untouched after the failed allocation.
+        assert_eq!(fs.next_snap_id, before_snap);
+        assert_eq!(fs.next_subvol_id, before_subvol);
+    }
+
+    #[test]
+    fn snapshot_subvol_subvol_id_exhaustion_is_an_error() {
+        // snap_id space is fine but subvol_id is at the top; checked_add(1)
+        // overflows and must surface as Exhausted, leaving state untouched.
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        fs.next_subvol_id = SubvolId::MAX;
+        let before_snap = fs.next_snap_id;
+        let before_subvol = fs.next_subvol_id;
+
+        let err = fs.snapshot_subvol(ROOT_SUBVOL).unwrap_err();
+        assert!(matches!(err, FsError::Exhausted));
+        assert_eq!(fs.next_snap_id, before_snap);
+        assert_eq!(fs.next_subvol_id, before_subvol);
     }
 
     #[test]

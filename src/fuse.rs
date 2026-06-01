@@ -199,6 +199,7 @@ fn errno_for_fs_error(e: FsError) -> Errno {
         FsError::NotADirectory => Errno::ENOTDIR,
         FsError::NotEmpty => Errno::ENOTEMPTY,
         FsError::AlreadyExists => Errno::EEXIST,
+        FsError::Exhausted => Errno::ENOSPC,
         FsError::Btree(_) => Errno::EIO,
     }
 }
