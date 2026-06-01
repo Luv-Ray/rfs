@@ -522,9 +522,9 @@ impl BtreeNodeRaw {
         &mut self,
         entry: &DiskEntry,
     ) -> std::result::Result<usize, usize> {
-        let bset_idx = self.bset_count();
-        assert!(bset_idx > 0, "no current bset; call start_new_bset first");
-        let bset_idx = bset_idx - 1;
+        let bset_cnt = self.bset_count();
+        assert!(bset_cnt > 0, "no current bset; call start_new_bset first");
+        let bset_idx = bset_cnt - 1;
         let off = bset_offset(self, bset_idx);
         let h = read_bset_header(self, off);
 
@@ -541,9 +541,12 @@ impl BtreeNodeRaw {
                 let new_nkeys = (h.nkeys as usize) + 1;
                 {
                     let entries = entries_at_mut(self, off, new_nkeys);
-                    for i in (insert_at + 1..new_nkeys).rev() {
-                        entries[i] = entries[i - 1];
-                    }
+                    // Shift [insert_at .. new_nkeys - 1) right by one slot.
+                    // copy_within uses ptr::copy (memmove semantics), safe for
+                    // overlapping ranges — better than a reverse element-wise
+                    // loop, which LLVM's loop-idiom pass doesn't reliably fold
+                    // into a single memmove for non-trivial element types.
+                    entries.copy_within(insert_at..new_nkeys - 1, insert_at + 1);
                     entries[insert_at] = *entry;
                 }
                 write_bset_header(
@@ -573,17 +576,27 @@ impl BtreeNodeRaw {
         entries[..n].binary_search_by(|e| e.key_bytes().cmp(key))
     }
 
-    // ---------- Single-bset compatibility shims ----------
+    // ---------- Single-bset convenience accessors ----------
     //
-    // Internals are always single-bset. Newly-built leaves (out of split or
-    // compact) are also single-bset until the next insert grows them. These
-    // wrappers let the existing recursive btree.rs code keep using a flat
-    // `entry(i)` / `search` / `child_block(i)` API in those paths.
+    // Two classes of node accesses are *structurally* single-bset and don't
+    // need to think in (bset_idx, entry_idx) pairs:
     //
-    // Code that needs to handle a multi-bset leaf must use the explicit
-    // `_at` / merged variants instead.
+    //   1. Internal nodes. Every modification rebuilds them from scratch
+    //      (clone-then-patch in `promote_to_parent` / `insert_internal`),
+    //      so they always carry exactly one bset by construction.
+    //   2. Freshly-built leaves out of `split_*` / compaction. They start
+    //      life with one sorted bset; only the next insert may grow them
+    //      into a multi-bset node.
+    //
+    // For both, callers are clearer when they don't have to thread a `0`
+    // through every access. These wrappers forward `entry(i)` / `search(key)`
+    // / `child_block(i)` to their `_at(0, ...)` counterparts and assert the
+    // single-bset precondition in debug builds.
+    //
+    // Code that may operate on a multi-bset leaf must use the explicit
+    // `_at` accessors or the merged iterator instead.
 
-    /// COMPAT: returns the i-th entry assuming a single-bset layout.
+    /// Returns the i-th entry. Single-bset nodes only — see section comment.
     pub fn entry(&self, i: usize) -> &DiskEntry {
         debug_assert_eq!(
             self.bset_count(),
@@ -594,15 +607,14 @@ impl BtreeNodeRaw {
         self.entry_at(0, i)
     }
 
-    /// COMPAT: mutable variant of `entry`.
+    /// Mutable variant of `entry`.
     pub fn entry_mut(&mut self, i: usize) -> &mut DiskEntry {
         debug_assert_eq!(self.bset_count(), 1);
         self.entry_at_mut(0, i)
     }
 
-    /// COMPAT: search assuming a single-bset layout. Internals route to
-    /// `search_internal` (skipping the rightmost-child slot); leaves do a
-    /// straight bset_search on bset 0.
+    /// Binary-search a single-bset node. Internals route to `search_internal`
+    /// (skipping the rightmost-child slot); leaves run `bset_search` on bset 0.
     pub fn search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
         debug_assert_eq!(
             self.bset_count(),
@@ -637,11 +649,11 @@ impl BtreeNodeRaw {
         self.set_value_at(0, i, val);
     }
 
-    /// COMPAT: set the "number of search keys" for a single-bset node.
-    /// For leaves this is the entry count; for internals the underlying
-    /// bset stores `n + 1` entries (the extra rightmost-child slot).
-    /// Used by build-from-scratch paths (split/promote) that pre-write
-    /// entries into the body and then commit the count.
+    /// Commit the entry count for a freshly-built single-bset node.
+    /// For leaves this is the live entry count; for internals the underlying
+    /// bset stores `n + 1` entries (extra rightmost-child slot). Used by
+    /// build-from-scratch paths (split / promote) that pre-write entries
+    /// into the body and then publish the count in one shot.
     pub fn set_nkeys(&mut self, n: usize) {
         debug_assert_eq!(self.bset_count(), 1, "set_nkeys requires bset_count==1");
         let stored = if self.level() > 0 { n + 1 } else { n };
