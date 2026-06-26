@@ -265,6 +265,9 @@ pub struct Fs {
     /// Sequence number of the next journal entry to write. Starts at 1 on
     /// a fresh image; restored from the last valid entry or superblock on open.
     next_journal_seq: u64,
+    /// The journal_seq last written to the superblock (checkpoint). Used to
+    /// detect ring-near-full and force a checkpoint before wraparound.
+    last_checkpoint_seq: u64,
 }
 
 impl Fs {
@@ -282,15 +285,13 @@ impl Fs {
     /// immediately openable.
     pub fn create(path: &std::path::Path) -> Result<Self> {
         let store = Arc::new(BlockStore::create_image(path)?);
-        // Extend the file to cover the journal region before handing it to Journal.
-        {
-            let f = store.try_clone_file()?;
-            f.set_len(
-                (crate::storage::FIRST_JOURNAL_BLOCK + crate::storage::JOURNAL_BLOCKS)
-                    * crate::block_btree::BLOCK_SIZE as u64,
-            )?;
-        }
-        let journal = crate::journal::Journal::new(store.try_clone_file()?);
+        let file = store.try_clone_file()?;
+        // Extend the file to cover the journal region.
+        file.set_len(
+            (crate::storage::FIRST_JOURNAL_BLOCK + crate::storage::JOURNAL_BLOCKS)
+                * crate::block_btree::BLOCK_SIZE as u64,
+        )?;
+        let journal = crate::journal::Journal::new(file);
         let tree = Btree::create_in(store.clone());
         let mut fs = Self::seed(tree, store, ROOT_INO);
         fs.journal = Some(journal);
@@ -347,16 +348,27 @@ impl Fs {
             current_subvol,
             journal: Some(journal),
             next_journal_seq,
+            last_checkpoint_seq: sb.journal_seq,
         })
     }
 
     /// Write a journal entry capturing the current fs state, then fsync data.
     /// No-op for in-memory (RAM-only) filesystems. Called by the FUSE layer
     /// after any write operation to provide crash recovery without a full sync.
+    ///
+    /// Forces a checkpoint when the ring is near capacity to prevent wraparound
+    /// from overwriting un-checkpointed entries.
     pub fn journal_commit(&mut self) -> Result<()> {
-        let Some(ref journal) = self.journal else {
+        if self.journal.is_none() {
             return Ok(());
-        };
+        }
+
+        // If the ring is near capacity, force a checkpoint first so that
+        // recovery's scan start (sb.journal_seq + 1) stays within the ring.
+        if self.next_journal_seq.saturating_sub(self.last_checkpoint_seq) >= crate::storage::JOURNAL_CAPACITY - 64 {
+            self.sync()?;
+        }
+
         let seq = self.next_journal_seq;
         self.next_journal_seq += 1;
         let mut entry = crate::storage::JournalEntry {
@@ -373,7 +385,7 @@ impl Fs {
             _reserved: [0; 68],
         };
         entry.checksum = entry.compute_checksum();
-        journal.append(&entry)?;
+        self.journal.as_ref().unwrap().append(&entry)?;
         self.store.fsync()?;
         Ok(())
     }
@@ -381,12 +393,13 @@ impl Fs {
     /// Persist all live state (`fsync` data + write a fresh superblock).
     /// Records `journal_seq` so that on next open, replay starts after this
     /// checkpoint. Called on `close` and any explicit `Fs::sync` call.
-    pub fn sync(&self) -> Result<()> {
+    pub fn sync(&mut self) -> Result<()> {
         // First flush data blocks + node blocks already written via
         // BlockStore (their pwrite is done at write time, but we want the
         // kernel to push them to the device before we publish the new
         // superblock).
         self.store.fsync()?;
+        let journal_seq = self.next_journal_seq.saturating_sub(1);
         let sb = crate::storage::Superblock {
             magic: crate::storage::SUPERBLOCK_MAGIC,
             version: crate::storage::SUPERBLOCK_VERSION,
@@ -394,7 +407,7 @@ impl Fs {
             next_block_nr: self.store.next_block_nr(),
             next_bset_seq: self.tree.next_bset_seq(),
             next_ino: self.next_ino,
-            journal_seq: self.next_journal_seq.saturating_sub(1),
+            journal_seq,
             next_snap_id: self.next_snap_id,
             next_subvol_id: self.next_subvol_id,
             current_subvol: self.current_subvol,
@@ -404,6 +417,7 @@ impl Fs {
         self.store.write_superblock(&sb)?;
         // Second fsync makes the new root visible after a crash.
         self.store.fsync()?;
+        self.last_checkpoint_seq = journal_seq;
         Ok(())
     }
 
@@ -418,6 +432,7 @@ impl Fs {
             current_subvol: ROOT_SUBVOL,
             journal: None,
             next_journal_seq: 0,
+            last_checkpoint_seq: 0,
         };
         // Seed the snapshot tree with the root snapshot. parent=NO_PARENT_SNAP
         // marks it as the top of its tree. Stored under snap=ROOT_SNAP itself
@@ -1475,7 +1490,7 @@ mod tests {
         // Create + sync, then corrupt the superblock magic and try to open.
         let img = tmp_image_path("bad-magic");
         {
-            let fs = Fs::create(&img.0).unwrap();
+            let mut fs = Fs::create(&img.0).unwrap();
             fs.sync().unwrap();
         }
         // Stomp on the magic word.
@@ -2002,6 +2017,36 @@ mod tests {
             assert!(
                 fs.get_inode(3).unwrap().is_none(),
                 "inode 3 must NOT be visible: journal entry at seq 2 was corrupt"
+            );
+        }
+    }
+
+    #[test]
+    fn journal_ring_full_forces_checkpoint() {
+        let img = tmp_image_path("jnl-ringfull");
+
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            // Commit enough journal entries to trigger the ring-full guard.
+            // Threshold is JOURNAL_CAPACITY - 64 = 1920.
+            for _ in 0..1925 {
+                fs.put_inode(2, &sample_inode(0)).unwrap();
+                fs.journal_commit().unwrap();
+            }
+            // After the forced checkpoint, last_checkpoint_seq should have advanced.
+            assert!(
+                fs.last_checkpoint_seq > 0,
+                "ring-full guard must have triggered a checkpoint"
+            );
+            // Drop without explicit sync — the forced checkpoint already
+            // persisted state. Recovery should still work.
+        }
+
+        {
+            let fs = Fs::open(&img.0).unwrap();
+            assert!(
+                fs.get_inode(2).unwrap().is_some(),
+                "inode 2 must survive after ring-full forced checkpoint + recovery"
             );
         }
     }

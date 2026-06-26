@@ -9,9 +9,9 @@
 //!   from disk on a miss.
 //! - Allocator is unified: btree nodes and file data blocks share one
 //!   monotonically-increasing `next_block_nr`. Block 0 is reserved for the
-//!   superblock; node blocks have a `MAGIC_NUMBER` + CRC at the head and
-//!   data blocks are raw 4 KB payloads (no per-block CRC for now).
-//! - No GC, no journal, no crash recovery: see README TODO.
+//!   superblock; blocks 1..64 are the journal ring; node blocks have a
+//!   `MAGIC_NUMBER` + CRC at the head and data blocks are raw 4 KB payloads.
+//! - Journal: append-only ring buffer providing crash recovery — see journal.rs.
 
 use std::fs::{File, OpenOptions};
 use std::io;

@@ -642,7 +642,7 @@ impl Filesystem for FuseFs {
     /// sync: write a final superblock + fsync. On a memory-only mount this
     /// is a no-op (BlockStore::fsync is None-typed).
     fn destroy(&mut self) {
-        if let Ok(fs) = self.fs.lock()
+        if let Ok(mut fs) = self.fs.lock()
             && let Err(e) = fs.sync()
         {
             eprintln!("rfs: sync on unmount failed: {e}");
