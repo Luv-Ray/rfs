@@ -382,6 +382,10 @@ impl Filesystem for FuseFs {
             reply.error(Errno::EIO);
             return;
         }
+        if fs.journal_commit().is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
         reply.written(written as u32);
     }
 
@@ -434,6 +438,10 @@ impl Filesystem for FuseFs {
         }
         let d = DirentV1::new(new_ino, FILE_KIND_REGULAR);
         if fs.put_dirent(parent, name_bytes, &d).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        if fs.journal_commit().is_err() {
             reply.error(Errno::EIO);
             return;
         }
@@ -497,6 +505,10 @@ impl Filesystem for FuseFs {
             reply.error(Errno::EIO);
             return;
         }
+        if fs.journal_commit().is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
         reply.entry(&TTL, &to_attr(new_ino, &inode), GENERATION);
     }
 
@@ -511,7 +523,13 @@ impl Filesystem for FuseFs {
             }
         };
         match fs.unlink(parent, name_bytes) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                if fs.journal_commit().is_err() {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+                reply.ok();
+            }
             Err(e) => reply.error(errno_for_fs_error(e)),
         }
     }
@@ -527,7 +545,13 @@ impl Filesystem for FuseFs {
             }
         };
         match fs.rmdir(parent, name_bytes) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                if fs.journal_commit().is_err() {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+                reply.ok();
+            }
             Err(e) => reply.error(errno_for_fs_error(e)),
         }
     }
@@ -560,7 +584,13 @@ impl Filesystem for FuseFs {
             }
         };
         match fs.rename(parent, name_bytes, newparent, newname_bytes) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                if fs.journal_commit().is_err() {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+                reply.ok();
+            }
             Err(e) => reply.error(errno_for_fs_error(e)),
         }
     }
