@@ -311,12 +311,12 @@ impl Fs {
             next_block_nr: self.store.next_block_nr(),
             next_bset_seq: self.tree.next_bset_seq(),
             next_ino: self.next_ino,
+            journal_seq: 0,
             next_snap_id: self.next_snap_id,
             next_subvol_id: self.next_subvol_id,
             current_subvol: self.current_subvol,
-            _pad: 0,
             checksum: 0,
-            _reserved: [0; BLOCK_SIZE - 60],
+            _reserved: [0; BLOCK_SIZE - 64],
         };
         self.store.write_superblock(&sb)?;
         // Second fsync makes the new root visible after a crash.

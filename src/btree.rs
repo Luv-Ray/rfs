@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::storage::BlockStore;
+use crate::storage::{BlockStore, FIRST_DATA_BLOCK_NR};
 
 use crate::block_btree::{
     BSET_SOFT_LIMIT, BSET_TREE_NR_MAX, BtreeNodeRaw, DiskEntry, EntryKind, MAGIC_NUMBER,
@@ -92,20 +92,20 @@ pub struct Btree {
 }
 
 impl Btree {
-    /// Create an in-memory tree. The root block (number 1, since block 0 is
-    /// reserved for the superblock) is allocated and seeded with an empty
+    /// Create an in-memory tree. The root block is allocated first from the
+    /// store (which starts at `FIRST_DATA_BLOCK_NR`) and seeded with an empty
     /// bset.
     pub fn new() -> Self {
         let store = Arc::new(BlockStore::in_memory());
-        Self::initialize_with(store, 1)
+        Self::initialize_with(store, FIRST_DATA_BLOCK_NR)
     }
 
     /// Create a tree backed by the given store, allocating a fresh root.
     /// Use this when seeding a brand-new image: caller has already created
-    /// the `BlockStore`, and we'll allocate the very first non-superblock
-    /// block to hold the empty root.
+    /// the `BlockStore`, and we'll allocate the very first non-superblock/
+    /// non-journal block to hold the empty root.
     pub fn create_in(store: Arc<BlockStore>) -> Self {
-        Self::initialize_with(store, 1)
+        Self::initialize_with(store, FIRST_DATA_BLOCK_NR)
     }
 
     /// Reattach to an existing tree whose root and seq counter are stored

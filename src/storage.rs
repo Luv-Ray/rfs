@@ -27,20 +27,33 @@ use crate::btree::{Error, Result};
 
 /// Block 0 is always the superblock.
 pub const SUPERBLOCK_BLOCK_NR: u64 = 0;
+
+/// Journal occupies blocks 1..64 (inclusive).
+pub const JOURNAL_MAGIC: u32 = 0x524A_4E4C; // "RJNL"
+pub const JOURNAL_BLOCKS: u64 = 64;
+pub const FIRST_JOURNAL_BLOCK: u64 = 1;
+pub const ENTRIES_PER_BLOCK: usize = 31;
+pub const JOURNAL_CAPACITY: u64 = JOURNAL_BLOCKS * ENTRIES_PER_BLOCK as u64; // 1984
+
 /// First block number that may hold a node or data block. Block 0 is the
-/// superblock, so allocator starts here.
-pub const FIRST_DATA_BLOCK_NR: u64 = 1;
+/// superblock, blocks 1..64 are the journal ring buffer.
+pub const FIRST_DATA_BLOCK_NR: u64 = FIRST_JOURNAL_BLOCK + JOURNAL_BLOCKS; // 65
 
 /// Magic number stamped at the head of the superblock.
 pub const SUPERBLOCK_MAGIC: u32 = 0x5246_5342; // "RFSB"
 /// On-disk format version; bumped on incompatible layout changes.
-pub const SUPERBLOCK_VERSION: u32 = 1;
+pub const SUPERBLOCK_VERSION: u32 = 2;
 
 /// Superblock — the single source of truth for "where the live tree is".
 ///
 /// Written at block 0. CRC covers every byte except `checksum` itself.
 /// On open we verify magic + version + checksum; if any fails we refuse to
 /// mount rather than silently load a corrupt root.
+///
+/// Layout (64 bytes of named fields, no implicit padding):
+///   magic:4  version:4  root_block:8  next_block_nr:8  next_bset_seq:8
+///   next_ino:8  journal_seq:8  next_snap_id:4  next_subvol_id:4
+///   current_subvol:4  checksum:4  _reserved:4032
 #[repr(C)]
 #[derive(KnownLayout, zerocopy::Immutable, IntoBytes, FromBytes, Clone, Copy)]
 pub struct Superblock {
@@ -54,16 +67,18 @@ pub struct Superblock {
     pub next_bset_seq: u64,
     /// First inode number not yet handed out by `Fs::alloc_ino`.
     pub next_ino: u64,
+    /// Sequence number of the last journal entry that was checkpointed into
+    /// this superblock. 0 means no journal entries have been checkpointed.
+    pub journal_seq: u64,
     /// Smallest snap_id allocated so far minus one (snap ids count down).
     pub next_snap_id: u32,
     /// Smallest subvol id not yet used (count up).
     pub next_subvol_id: u32,
     /// Currently active subvolume id.
     pub current_subvol: u32,
-    pub _pad: u32,
     /// CRC32 over the rest of the superblock (computed with this field == 0).
     pub checksum: u32,
-    pub _reserved: [u8; BLOCK_SIZE - 60],
+    pub _reserved: [u8; BLOCK_SIZE - 64],
 }
 
 const _: () = assert!(std::mem::size_of::<Superblock>() == BLOCK_SIZE);
@@ -78,12 +93,12 @@ impl Superblock {
             next_block_nr,
             next_bset_seq: 1,
             next_ino: 0,
+            journal_seq: 0,
             next_snap_id: u32::MAX - 1,
             next_subvol_id: 1,
             current_subvol: 0,
-            _pad: 0,
             checksum: 0,
-            _reserved: [0; BLOCK_SIZE - 60],
+            _reserved: [0; BLOCK_SIZE - 64],
         }
     }
 
@@ -128,6 +143,47 @@ impl Superblock {
         let mut out = [0u8; BLOCK_SIZE];
         out.copy_from_slice(self.as_bytes());
         out
+    }
+}
+
+/// A single journal entry, written to a journal block. Each block holds
+/// `ENTRIES_PER_BLOCK` (31) entries tightly packed; the block's remaining
+/// 128 bytes are unused padding.
+///
+/// `magic` and `checksum` guard against torn/partial writes. `seq` is a
+/// monotonically-increasing counter; the replay scanner uses it to find the
+/// highest valid entry.
+#[repr(C)]
+#[derive(KnownLayout, zerocopy::Immutable, IntoBytes, FromBytes, Clone, Copy)]
+pub struct JournalEntry {
+    pub magic: u32,
+    pub checksum: u32,
+    pub seq: u64,
+    pub root_block: u64,
+    pub next_block_nr: u64,
+    pub next_bset_seq: u64,
+    pub next_ino: u64,
+    pub next_snap_id: u32,
+    pub next_subvol_id: u32,
+    pub current_subvol: u32,
+    pub _reserved: [u8; 68],
+}
+
+const _: () = assert!(std::mem::size_of::<JournalEntry>() == 128);
+
+impl JournalEntry {
+    /// Compute a CRC32 over the entry with `checksum` treated as zero.
+    pub fn compute_checksum(&self) -> u32 {
+        let mut copy = *self;
+        copy.checksum = 0;
+        crc32fast::hash(copy.as_bytes())
+    }
+
+    /// Return `true` iff magic, seq, and checksum all pass.
+    pub fn is_valid(&self, expected_seq: u64) -> bool {
+        self.magic == JOURNAL_MAGIC
+            && self.seq == expected_seq
+            && self.checksum == self.compute_checksum()
     }
 }
 
@@ -361,4 +417,49 @@ fn verify_node_in_place(nr: u64, node: &BtreeNodeRaw) -> Result<()> {
         return Err(Error::ChecksumMismatch { block: nr });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    #[test]
+    fn journal_entry_crc_roundtrip() {
+        let mut entry = JournalEntry {
+            magic: JOURNAL_MAGIC,
+            checksum: 0,
+            seq: 42,
+            root_block: 100,
+            next_block_nr: 200,
+            next_bset_seq: 10,
+            next_ino: 50,
+            next_snap_id: u32::MAX - 5,
+            next_subvol_id: 3,
+            current_subvol: 1,
+            _reserved: [0; 68],
+        };
+        entry.checksum = entry.compute_checksum();
+        assert!(entry.is_valid(42));
+        assert!(!entry.is_valid(43)); // wrong seq
+    }
+
+    #[test]
+    fn journal_entry_detects_corruption() {
+        let mut entry = JournalEntry {
+            magic: JOURNAL_MAGIC,
+            checksum: 0,
+            seq: 1,
+            root_block: 65,
+            next_block_nr: 66,
+            next_bset_seq: 1,
+            next_ino: 2,
+            next_snap_id: u32::MAX - 1,
+            next_subvol_id: 1,
+            current_subvol: 1,
+            _reserved: [0; 68],
+        };
+        entry.checksum = entry.compute_checksum();
+        entry.root_block = 999; // corrupt
+        assert!(!entry.is_valid(1));
+    }
 }
