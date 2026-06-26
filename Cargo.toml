@@ -9,3 +9,6 @@ fuser = { version = "0.17", default-features = false }
 libc = "0.2"
 elsa = "1.10"
 crc32fast = "1.4"
+
+[dev-dependencies]
+tempfile = { version = "3.27.0", registry = "artifactory" }

@@ -15,9 +15,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
+name = "bitflags"
+version = "2.13.0"
+source = "sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/"
+checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "cfg-if"
+version = "1.0.4"
+source = "sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
@@ -32,7 +44,7 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
- "cfg-if",
+ "cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -51,13 +63,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "errno"
+version = "0.3.14"
+source = "sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc 0.2.186 (sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/)",
+ "windows-sys",
+]
+
+[[package]]
+name = "fastrand"
+version = "2.4.1"
+source = "sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/"
+checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+
+[[package]]
 name = "fuser"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80a5eca878900c2e39e9e52fd797954b7fc39eeefc8558257114bfea6a698fcf"
 dependencies = [
- "bitflags",
- "libc",
+ "bitflags 2.11.1",
+ "libc 0.2.186 (registry+https://github.com/rust-lang/crates.io-index)",
  "log",
  "memchr",
  "nix",
@@ -68,6 +96,17 @@ dependencies = [
  "ref-cast",
  "smallvec",
  "zerocopy",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if 1.0.4 (sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/)",
+ "libc 0.2.186 (sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/)",
+ "r-efi",
 ]
 
 [[package]]
@@ -91,6 +130,18 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "libc"
+version = "0.2.186"
+source = "sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lock_api"
@@ -128,10 +179,10 @@ version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
 dependencies = [
- "bitflags",
- "cfg-if",
+ "bitflags 2.11.1",
+ "cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "cfg_aliases",
- "libc",
+ "libc 0.2.186 (registry+https://github.com/rust-lang/crates.io-index)",
  "memoffset",
 ]
 
@@ -158,12 +209,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "once_cell"
+version = "1.21.4"
+source = "sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/"
+checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
 name = "page_size"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
 dependencies = [
- "libc",
+ "libc 0.2.186 (registry+https://github.com/rust-lang/crates.io-index)",
  "winapi",
 ]
 
@@ -183,11 +240,11 @@ version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
- "cfg-if",
- "libc",
+ "cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libc 0.2.186 (registry+https://github.com/rust-lang/crates.io-index)",
  "redox_syscall",
  "smallvec",
- "windows-link",
+ "windows-link 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -224,12 +281,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
- "bitflags",
+ "bitflags 2.11.1",
 ]
 
 [[package]]
@@ -259,8 +322,22 @@ dependencies = [
  "crc32fast",
  "elsa",
  "fuser",
- "libc",
+ "libc 0.2.186 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tempfile",
  "zerocopy",
+]
+
+[[package]]
+name = "rustix"
+version = "1.1.4"
+source = "sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags 2.13.0",
+ "errno",
+ "libc 0.2.186 (sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/)",
+ "linux-raw-sys",
+ "windows-sys",
 ]
 
 [[package]]
@@ -316,6 +393,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom",
+ "once_cell",
+ "rustix",
+ "windows-sys",
 ]
 
 [[package]]
@@ -381,6 +471,21 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-link"
+version = "0.2.1"
+source = "sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/"
+checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+dependencies = [
+ "windows-link 0.2.1 (sparse+https://pkgs.d.xiaomi.net/artifactory/api/cargo/cargo-crates-remote/index/)",
+]
 
 [[package]]
 name = "winnow"
