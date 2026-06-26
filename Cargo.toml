@@ -11,4 +11,4 @@ elsa = "1.10"
 crc32fast = "1.4"
 
 [dev-dependencies]
-tempfile = { version = "3.27.0", registry = "artifactory" }
+tempfile = "3.27.0"
