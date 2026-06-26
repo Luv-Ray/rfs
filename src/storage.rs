@@ -396,6 +396,14 @@ impl BlockStore {
         }
         Ok(())
     }
+
+    /// Clone the backing file handle. Returns an error for memory-only stores.
+    pub fn try_clone_file(&self) -> Result<std::fs::File> {
+        match &self.backing {
+            Backing::Memory => Err(Error::Io(std::io::Error::other("no backing file"))),
+            Backing::Image { file } => Ok(file.try_clone()?),
+        }
+    }
 }
 
 /// Verify a node already in our `BtreeNodeRaw` representation: magic at

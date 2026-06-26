@@ -247,7 +247,7 @@ pub struct Fs {
     tree: Btree,
     /// Shared block storage. Same `Arc` as `tree.store`; held here too so
     /// `Fs::sync` can reach it without borrowing through the btree.
-    store: Arc<BlockStore>,
+    pub store: Arc<BlockStore>,
     next_ino: u64,
     /// Smallest snap_id allocated so far minus one. New snapshots take ids
     /// counting down from `next_snap_id`. bcachefs: parent always > child.
@@ -260,44 +260,127 @@ pub struct Fs {
     /// subvol's snap_id. v1 always uses ROOT_SUBVOL; multi-subvol switching
     /// is a future feature.
     current_subvol: SubvolId,
+    /// Journal handle. `None` for in-memory (RAM-only) filesystems.
+    journal: Option<crate::journal::Journal>,
+    /// Sequence number of the next journal entry to write. Starts at 1 on
+    /// a fresh image; restored from the last valid entry or superblock on open.
+    next_journal_seq: u64,
 }
 
 impl Fs {
     pub fn new() -> Self {
         let tree = Btree::new();
         let store = tree.store.clone();
-        Self::seed(tree, store, ROOT_INO)
+        let mut fs = Self::seed(tree, store, ROOT_INO);
+        fs.journal = None;
+        fs.next_journal_seq = 0;
+        fs
     }
 
     /// Build a fresh image-backed filesystem at `path`. Fails if the file
-    /// exists. The superblock is written by [`Fs::sync`]; this constructor
-    /// only initializes in-memory state.
+    /// exists. Writes an initial superblock via [`Fs::sync`] so the image is
+    /// immediately openable.
     pub fn create(path: &std::path::Path) -> Result<Self> {
         let store = Arc::new(BlockStore::create_image(path)?);
+        // Extend the file to cover the journal region before handing it to Journal.
+        {
+            let f = store.try_clone_file()?;
+            f.set_len(
+                (crate::storage::FIRST_JOURNAL_BLOCK + crate::storage::JOURNAL_BLOCKS)
+                    * crate::block_btree::BLOCK_SIZE as u64,
+            )?;
+        }
+        let journal = crate::journal::Journal::new(store.try_clone_file()?);
         let tree = Btree::create_in(store.clone());
-        Ok(Self::seed(tree, store, ROOT_INO))
+        let mut fs = Self::seed(tree, store, ROOT_INO);
+        fs.journal = Some(journal);
+        fs.next_journal_seq = 1;
+        // Write the initial superblock so Fs::open can find it.
+        fs.sync()?;
+        Ok(fs)
     }
 
     /// Reopen a filesystem from an existing image. Reads + verifies the
-    /// superblock (magic / version / CRC), then reattaches the btree at the
-    /// stored root.
+    /// superblock (magic / version / CRC), scans the journal for entries
+    /// newer than the last checkpoint, and restores the most recent state.
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let store = Arc::new(BlockStore::open_image(path)?);
         let sb = store.read_superblock()?;
-        store.set_next_block_nr(sb.next_block_nr);
-        let tree = Btree::reopen(store.clone(), sb.root_block, sb.next_bset_seq);
+
+        let journal = crate::journal::Journal::new(store.try_clone_file()?);
+        let recovered = journal.scan_from(sb.journal_seq + 1)?;
+
+        let (root_block, next_block_nr, next_bset_seq, next_ino, next_snap_id,
+             next_subvol_id, current_subvol, next_journal_seq) =
+            if let Some(ref entry) = recovered {
+                (
+                    entry.root_block,
+                    entry.next_block_nr,
+                    entry.next_bset_seq,
+                    entry.next_ino,
+                    entry.next_snap_id,
+                    entry.next_subvol_id,
+                    entry.current_subvol,
+                    entry.seq + 1,
+                )
+            } else {
+                (
+                    sb.root_block,
+                    sb.next_block_nr,
+                    sb.next_bset_seq,
+                    sb.next_ino,
+                    sb.next_snap_id,
+                    sb.next_subvol_id,
+                    sb.current_subvol,
+                    sb.journal_seq + 1,
+                )
+            };
+
+        store.set_next_block_nr(next_block_nr);
+        let tree = Btree::reopen(store.clone(), root_block, next_bset_seq);
         Ok(Fs {
             tree,
             store,
-            next_ino: sb.next_ino,
-            next_snap_id: sb.next_snap_id,
-            next_subvol_id: sb.next_subvol_id,
-            current_subvol: sb.current_subvol,
+            next_ino,
+            next_snap_id,
+            next_subvol_id,
+            current_subvol,
+            journal: Some(journal),
+            next_journal_seq,
         })
     }
 
+    /// Write a journal entry capturing the current fs state, then fsync data.
+    /// No-op for in-memory (RAM-only) filesystems. Called by the FUSE layer
+    /// after any write operation to provide crash recovery without a full sync.
+    pub fn journal_commit(&mut self) -> Result<()> {
+        let Some(ref journal) = self.journal else {
+            return Ok(());
+        };
+        let seq = self.next_journal_seq;
+        self.next_journal_seq += 1;
+        let mut entry = crate::storage::JournalEntry {
+            magic: crate::storage::JOURNAL_MAGIC,
+            checksum: 0,
+            seq,
+            root_block: self.tree.root_block,
+            next_block_nr: self.store.next_block_nr(),
+            next_bset_seq: self.tree.next_bset_seq(),
+            next_ino: self.next_ino,
+            next_snap_id: self.next_snap_id,
+            next_subvol_id: self.next_subvol_id,
+            current_subvol: self.current_subvol,
+            _reserved: [0; 68],
+        };
+        entry.checksum = entry.compute_checksum();
+        journal.append(&entry)?;
+        self.store.fsync()?;
+        Ok(())
+    }
+
     /// Persist all live state (`fsync` data + write a fresh superblock).
-    /// Called on `close` and any explicit `Fs::sync` checkpoint.
+    /// Records `journal_seq` so that on next open, replay starts after this
+    /// checkpoint. Called on `close` and any explicit `Fs::sync` call.
     pub fn sync(&self) -> Result<()> {
         // First flush data blocks + node blocks already written via
         // BlockStore (their pwrite is done at write time, but we want the
@@ -311,10 +394,10 @@ impl Fs {
             next_block_nr: self.store.next_block_nr(),
             next_bset_seq: self.tree.next_bset_seq(),
             next_ino: self.next_ino,
-            journal_seq: 0,
             next_snap_id: self.next_snap_id,
             next_subvol_id: self.next_subvol_id,
             current_subvol: self.current_subvol,
+            journal_seq: self.next_journal_seq.saturating_sub(1),
             checksum: 0,
             _reserved: [0; BLOCK_SIZE - 64],
         };
@@ -333,6 +416,8 @@ impl Fs {
             next_snap_id: ROOT_SNAP - 1,
             next_subvol_id: ROOT_SUBVOL + 1,
             current_subvol: ROOT_SUBVOL,
+            journal: None,
+            next_journal_seq: 0,
         };
         // Seed the snapshot tree with the root snapshot. parent=NO_PARENT_SNAP
         // marks it as the top of its tree. Stored under snap=ROOT_SNAP itself
@@ -1764,5 +1849,80 @@ mod tests {
             last_next_block,
             "reopened allocator must resume at the persisted next_block_nr"
         );
+    }
+
+    // ---------- Journal recovery ----------
+
+    #[test]
+    fn journal_recovery_restores_state() {
+        let img = tmp_image_path("jnl-recovery");
+
+        // Create image, write some data, journal-commit, do NOT sync (no checkpoint).
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            let inode = sample_inode(99);
+            fs.put_inode(2, &inode).unwrap();
+            fs.journal_commit().unwrap();
+            // Drop without sync — simulates crash after journal commit.
+        }
+
+        // Reopen — recovery should find the journal entry and see inode 2.
+        {
+            let fs = Fs::open(&img.0).unwrap();
+            let got = fs.get_inode(2).unwrap();
+            assert!(got.is_some(), "inode 2 must be visible after journal recovery");
+        }
+    }
+
+    #[test]
+    fn journal_partial_entry_ignored() {
+        let img = tmp_image_path("jnl-partial");
+
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            // Write inode 2 and commit a valid journal entry at seq 1.
+            fs.put_inode(2, &sample_inode(11)).unwrap();
+            fs.journal_commit().unwrap();
+
+            // Write inode 3 (uncommitted — btree reflects it, but we will
+            // stomp the journal entry for seq 2 with a bad CRC).
+            fs.put_inode(3, &sample_inode(22)).unwrap();
+
+            // Build a corrupt journal entry at seq 2.
+            let bad_entry = crate::storage::JournalEntry {
+                magic: crate::storage::JOURNAL_MAGIC,
+                checksum: 0xDEAD_BEEF, // deliberately wrong CRC
+                seq: 2,
+                root_block: 999,
+                next_block_nr: 999,
+                next_bset_seq: 999,
+                next_ino: 999,
+                next_snap_id: 0,
+                next_subvol_id: 0,
+                current_subvol: 0,
+                _reserved: [0; 68],
+            };
+            use zerocopy::IntoBytes;
+            use std::os::unix::fs::FileExt;
+            let file = fs.store.try_clone_file().unwrap();
+            let offset = crate::journal::Journal::entry_offset(2);
+            file.write_all_at(bad_entry.as_bytes(), offset).unwrap();
+            // Drop without sync — superblock still reflects the initial sync
+            // from create(). The journal has seq 1 valid + seq 2 corrupt.
+        }
+
+        // Recovery should stop at seq 1. The btree root from seq 1 only saw
+        // inode 2, so inode 3 must be unreachable.
+        {
+            let fs = Fs::open(&img.0).unwrap();
+            assert!(
+                fs.get_inode(2).unwrap().is_some(),
+                "inode 2 must be visible: was in valid journal entry at seq 1"
+            );
+            assert!(
+                fs.get_inode(3).unwrap().is_none(),
+                "inode 3 must NOT be visible: journal entry at seq 2 was corrupt"
+            );
+        }
     }
 }
