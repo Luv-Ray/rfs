@@ -1875,6 +1875,86 @@ mod tests {
     }
 
     #[test]
+    fn journal_survives_crash_across_multiple_ops() {
+        let img = tmp_image_path("jnl-multi-op");
+
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+
+            // Multiple ops each journal-committed.
+            fs.put_inode(2, &InodeV1 {
+                mode: 0o040755, uid: 0, gid: 0, nlink: 1, size: 0,
+                atime: 0, mtime: 0, ctime: 0, parent_ino: ROOT_INO,
+            }).unwrap();
+            fs.put_dirent(2, b"hello", &DirentV1::new(3, FILE_KIND_REGULAR)).unwrap();
+            fs.journal_commit().unwrap();
+
+            fs.put_inode(3, &InodeV1 {
+                mode: 0o100644, uid: 0, gid: 0, nlink: 1, size: 0,
+                atime: 0, mtime: 0, ctime: 0, parent_ino: 2,
+            }).unwrap();
+            fs.journal_commit().unwrap();
+
+            // NO sync — crash simulation. All state is in the journal only.
+        }
+
+        {
+            let fs = Fs::open(&img.0).unwrap();
+            assert!(
+                fs.get_inode(2).unwrap().is_some(),
+                "inode 2 must survive journal recovery"
+            );
+            assert!(
+                fs.get_inode(3).unwrap().is_some(),
+                "inode 3 must survive journal recovery"
+            );
+            assert!(
+                fs.lookup_dirent(2, b"hello").unwrap().is_some(),
+                "dirent 'hello' under inode 2 must survive journal recovery"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_advances_journal_seq() {
+        let img = tmp_image_path("jnl-checkpoint");
+
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+
+            // Write inode 2 and journal-commit, then checkpoint (sync).
+            fs.put_inode(2, &InodeV1 {
+                mode: 0o100644, uid: 0, gid: 0, nlink: 1, size: 0,
+                atime: 0, mtime: 0, ctime: 0, parent_ino: ROOT_INO,
+            }).unwrap();
+            fs.journal_commit().unwrap();
+            fs.sync().unwrap(); // checkpoint — superblock now records journal_seq = 1
+
+            // Write inode 3 and journal-commit; crash without a second sync.
+            fs.put_inode(3, &InodeV1 {
+                mode: 0o100644, uid: 0, gid: 0, nlink: 1, size: 0,
+                atime: 0, mtime: 0, ctime: 0, parent_ino: ROOT_INO,
+            }).unwrap();
+            fs.journal_commit().unwrap();
+            // Drop without sync — inode 3 is in journal only (seq 2, after checkpoint at seq 1).
+        }
+
+        {
+            let fs = Fs::open(&img.0).unwrap();
+            // inode 2 was included in the checkpoint so the superblock covers it.
+            assert!(
+                fs.get_inode(2).unwrap().is_some(),
+                "inode 2 must be visible: included in checkpoint superblock"
+            );
+            // inode 3 was journaled after the checkpoint; recovery replays seq 2.
+            assert!(
+                fs.get_inode(3).unwrap().is_some(),
+                "inode 3 must be visible: recovered from journal entry at seq 2"
+            );
+        }
+    }
+
+    #[test]
     fn journal_partial_entry_ignored() {
         let img = tmp_image_path("jnl-partial");
 
