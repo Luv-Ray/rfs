@@ -311,31 +311,38 @@ impl Fs {
         let journal = crate::journal::Journal::new(store.try_clone_file()?);
         let recovered = journal.scan_from(sb.journal_seq + 1)?;
 
-        let (root_block, next_block_nr, next_bset_seq, next_ino, next_snap_id,
-             next_subvol_id, current_subvol, next_journal_seq) =
-            if let Some(ref entry) = recovered {
-                (
-                    entry.root_block,
-                    entry.next_block_nr,
-                    entry.next_bset_seq,
-                    entry.next_ino,
-                    entry.next_snap_id,
-                    entry.next_subvol_id,
-                    entry.current_subvol,
-                    entry.seq + 1,
-                )
-            } else {
-                (
-                    sb.root_block,
-                    sb.next_block_nr,
-                    sb.next_bset_seq,
-                    sb.next_ino,
-                    sb.next_snap_id,
-                    sb.next_subvol_id,
-                    sb.current_subvol,
-                    sb.journal_seq + 1,
-                )
-            };
+        let (
+            root_block,
+            next_block_nr,
+            next_bset_seq,
+            next_ino,
+            next_snap_id,
+            next_subvol_id,
+            current_subvol,
+            next_journal_seq,
+        ) = if let Some(ref entry) = recovered {
+            (
+                entry.root_block,
+                entry.next_block_nr,
+                entry.next_bset_seq,
+                entry.next_ino,
+                entry.next_snap_id,
+                entry.next_subvol_id,
+                entry.current_subvol,
+                entry.seq + 1,
+            )
+        } else {
+            (
+                sb.root_block,
+                sb.next_block_nr,
+                sb.next_bset_seq,
+                sb.next_ino,
+                sb.next_snap_id,
+                sb.next_subvol_id,
+                sb.current_subvol,
+                sb.journal_seq + 1,
+            )
+        };
 
         store.set_next_block_nr(next_block_nr);
         let tree = Btree::reopen(store.clone(), root_block, next_bset_seq);
@@ -365,7 +372,11 @@ impl Fs {
 
         // If the ring is near capacity, force a checkpoint first so that
         // recovery's scan start (sb.journal_seq + 1) stays within the ring.
-        if self.next_journal_seq.saturating_sub(self.last_checkpoint_seq) >= crate::storage::JOURNAL_CAPACITY - 64 {
+        if self
+            .next_journal_seq
+            .saturating_sub(self.last_checkpoint_seq)
+            >= crate::storage::JOURNAL_CAPACITY - 64
+        {
             self.sync()?;
         }
 
@@ -648,7 +659,7 @@ impl Fs {
         self.tree.delete_at(&extent_key(ino, offset), snap, &chain)
     }
 
-    pub fn read_data_block(&self, block_nr: u64) -> Result<&[u8; BLOCK_SIZE]> {
+    pub fn read_data_block(&self, block_nr: u64) -> Result<[u8; BLOCK_SIZE]> {
         self.store.read_data(block_nr)
     }
 
@@ -1541,7 +1552,7 @@ mod tests {
         }
         // Reopen the store and read the corrupted node.
         let store = crate::storage::BlockStore::open_image(&img.0).unwrap();
-        match store.read_node(root_block) {
+        match store.read_node_copy(root_block) {
             Err(crate::btree::Error::ChecksumMismatch { block }) => {
                 assert_eq!(block, root_block);
             }
@@ -1885,7 +1896,10 @@ mod tests {
         {
             let fs = Fs::open(&img.0).unwrap();
             let got = fs.get_inode(2).unwrap();
-            assert!(got.is_some(), "inode 2 must be visible after journal recovery");
+            assert!(
+                got.is_some(),
+                "inode 2 must be visible after journal recovery"
+            );
         }
     }
 
@@ -1897,17 +1911,40 @@ mod tests {
             let mut fs = Fs::create(&img.0).unwrap();
 
             // Multiple ops each journal-committed.
-            fs.put_inode(2, &InodeV1 {
-                mode: 0o040755, uid: 0, gid: 0, nlink: 1, size: 0,
-                atime: 0, mtime: 0, ctime: 0, parent_ino: ROOT_INO,
-            }).unwrap();
-            fs.put_dirent(2, b"hello", &DirentV1::new(3, FILE_KIND_REGULAR)).unwrap();
+            fs.put_inode(
+                2,
+                &InodeV1 {
+                    mode: 0o040755,
+                    uid: 0,
+                    gid: 0,
+                    nlink: 1,
+                    size: 0,
+                    atime: 0,
+                    mtime: 0,
+                    ctime: 0,
+                    parent_ino: ROOT_INO,
+                },
+            )
+            .unwrap();
+            fs.put_dirent(2, b"hello", &DirentV1::new(3, FILE_KIND_REGULAR))
+                .unwrap();
             fs.journal_commit().unwrap();
 
-            fs.put_inode(3, &InodeV1 {
-                mode: 0o100644, uid: 0, gid: 0, nlink: 1, size: 0,
-                atime: 0, mtime: 0, ctime: 0, parent_ino: 2,
-            }).unwrap();
+            fs.put_inode(
+                3,
+                &InodeV1 {
+                    mode: 0o100644,
+                    uid: 0,
+                    gid: 0,
+                    nlink: 1,
+                    size: 0,
+                    atime: 0,
+                    mtime: 0,
+                    ctime: 0,
+                    parent_ino: 2,
+                },
+            )
+            .unwrap();
             fs.journal_commit().unwrap();
 
             // NO sync — crash simulation. All state is in the journal only.
@@ -1938,18 +1975,40 @@ mod tests {
             let mut fs = Fs::create(&img.0).unwrap();
 
             // Write inode 2 and journal-commit, then checkpoint (sync).
-            fs.put_inode(2, &InodeV1 {
-                mode: 0o100644, uid: 0, gid: 0, nlink: 1, size: 0,
-                atime: 0, mtime: 0, ctime: 0, parent_ino: ROOT_INO,
-            }).unwrap();
+            fs.put_inode(
+                2,
+                &InodeV1 {
+                    mode: 0o100644,
+                    uid: 0,
+                    gid: 0,
+                    nlink: 1,
+                    size: 0,
+                    atime: 0,
+                    mtime: 0,
+                    ctime: 0,
+                    parent_ino: ROOT_INO,
+                },
+            )
+            .unwrap();
             fs.journal_commit().unwrap();
             fs.sync().unwrap(); // checkpoint — superblock now records journal_seq = 1
 
             // Write inode 3 and journal-commit; crash without a second sync.
-            fs.put_inode(3, &InodeV1 {
-                mode: 0o100644, uid: 0, gid: 0, nlink: 1, size: 0,
-                atime: 0, mtime: 0, ctime: 0, parent_ino: ROOT_INO,
-            }).unwrap();
+            fs.put_inode(
+                3,
+                &InodeV1 {
+                    mode: 0o100644,
+                    uid: 0,
+                    gid: 0,
+                    nlink: 1,
+                    size: 0,
+                    atime: 0,
+                    mtime: 0,
+                    ctime: 0,
+                    parent_ino: ROOT_INO,
+                },
+            )
+            .unwrap();
             fs.journal_commit().unwrap();
             // Drop without sync — inode 3 is in journal only (seq 2, after checkpoint at seq 1).
         }
@@ -1997,8 +2056,8 @@ mod tests {
                 current_subvol: 0,
                 _reserved: [0; 68],
             };
-            use zerocopy::IntoBytes;
             use std::os::unix::fs::FileExt;
+            use zerocopy::IntoBytes;
             let file = fs.store.try_clone_file().unwrap();
             let offset = crate::journal::Journal::entry_offset(2);
             file.write_all_at(bad_entry.as_bytes(), offset).unwrap();

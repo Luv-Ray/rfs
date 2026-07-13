@@ -500,13 +500,13 @@ impl Default for Btree {
 /// Count total keys in the subtree rooted at `block_nr`.
 #[cfg(test)]
 fn count_keys(store: &BlockStore, block_nr: u64) -> usize {
-    let node = store.read_node(block_nr).unwrap();
+    let node = store.read_node_copy(block_nr).unwrap();
     if node.level() == 0 {
         // Distinct keys after merge dedup. Multi-bset leaves can store the
         // same key multiple times (older bsets shadowed by newer ones), so
         // raw nkeys() is not what we want — MergedIter yields each unique
         // key once (the highest-seq entry).
-        MergedIter::new(node).count()
+        MergedIter::new(&node).count()
     } else {
         // Internal keys are separators — they duplicate keys that also exist
         // in the subtrees (separator-in-right convention). Only count leaves.
@@ -522,7 +522,7 @@ fn count_keys(store: &BlockStore, block_nr: u64) -> usize {
 /// for the tree to be balanced.
 #[cfg(test)]
 fn collect_leaf_depths(store: &BlockStore, block_nr: u64, depth: usize, depths: &mut Vec<usize>) {
-    let node = store.read_node(block_nr).unwrap();
+    let node = store.read_node_copy(block_nr).unwrap();
     if node.level() == 0 {
         depths.push(depth);
     } else {
@@ -537,7 +537,7 @@ fn collect_leaf_depths(store: &BlockStore, block_nr: u64, depth: usize, depths: 
 /// to the right subtree, so child[i] holds keys in [lo, hi)).
 #[cfg(test)]
 fn verify_node(store: &BlockStore, block_nr: u64, lo: Option<&[u8]>, hi: Option<&[u8]>) {
-    let node = store.read_node(block_nr).unwrap();
+    let node = store.read_node_copy(block_nr).unwrap();
     let n = node.nkeys();
 
     if node.level() == 0 {
@@ -551,7 +551,7 @@ fn verify_node(store: &BlockStore, block_nr: u64, lo: Option<&[u8]>, hi: Option<
         // across bsets the merged view must also be sorted (this falls out
         // of MergedIter, but we double-check by walking it).
         let mut prev: Option<Vec<u8>> = None;
-        for (b, i) in MergedIter::new(node) {
+        for (b, i) in MergedIter::new(&node) {
             let k = node.entry_at(b, i).key_bytes().to_vec();
             if let Some(p) = &prev {
                 debug_assert!(
@@ -602,10 +602,10 @@ fn verify_node(store: &BlockStore, block_nr: u64, lo: Option<&[u8]>, hi: Option<
     for i in 0..=n {
         let child_nr = node.child_block(i);
         debug_assert!(
-            store.read_node(child_nr).is_ok(),
+            store.read_node_copy(child_nr).is_ok(),
             "blk={block_nr} child[{i}]={child_nr} not in store"
         );
-        let child = store.read_node(child_nr).unwrap();
+        let child = store.read_node_copy(child_nr).unwrap();
         debug_assert_eq!(
             child.level(),
             node.level() - 1,
@@ -761,27 +761,39 @@ fn find(store: &BlockStore, block_nr: u64, key: &[u8]) -> Result<Option<Vec<u8>>
 /// distinguish "no entry" from "tombstone". Used by `find_visible` to decide
 /// whether to keep walking the ancestor chain or stop.
 fn find_raw(store: &BlockStore, block_nr: u64, key: &[u8]) -> Result<Option<(Vec<u8>, EntryKind)>> {
-    let node = store.read_node(block_nr)?;
-    if node.level() == 0 {
-        // Leaf: cross-bset merged lookup. The highest-seq match wins so a
-        // newer write in a later bset shadows the older entry.
-        match merged_find(node, key) {
-            Some(hit) => {
-                let entry = node.entry_at(hit.bset_idx, hit.entry_idx);
-                Ok(Some((
-                    node.value_bytes_at(hit.bset_idx, hit.entry_idx).to_vec(),
-                    entry.kind_enum(),
-                )))
+    // One node visit under the cache lock: either resolve the result (leaf)
+    // or compute the child block number to descend into. We recurse *after*
+    // the closure returns, so the lock is not held across the recursion.
+    enum Step {
+        Found(Option<(Vec<u8>, EntryKind)>),
+        Descend(u64),
+    }
+    let step = store.with_node(block_nr, |node| {
+        if node.level() == 0 {
+            // Leaf: cross-bset merged lookup. The highest-seq match wins so a
+            // newer write in a later bset shadows the older entry.
+            match merged_find(node, key) {
+                Some(hit) => {
+                    let entry = node.entry_at(hit.bset_idx, hit.entry_idx);
+                    Step::Found(Some((
+                        node.value_bytes_at(hit.bset_idx, hit.entry_idx).to_vec(),
+                        entry.kind_enum(),
+                    )))
+                }
+                None => Step::Found(None),
             }
-            None => Ok(None),
+        } else {
+            // Internal nodes are always single-bset (they don't accumulate
+            // sorted runs the way leaves do).
+            match node.search(key) {
+                Ok(idx) => Step::Descend(node.child_block(idx + 1)),
+                Err(idx) => Step::Descend(node.child_block(idx)),
+            }
         }
-    } else {
-        // Internal nodes are always single-bset (they don't accumulate
-        // sorted runs the way leaves do).
-        match node.search(key) {
-            Ok(idx) => find_raw(store, node.child_block(idx + 1), key),
-            Err(idx) => find_raw(store, node.child_block(idx), key),
-        }
+    })?;
+    match step {
+        Step::Found(res) => Ok(res),
+        Step::Descend(child) => find_raw(store, child, key),
     }
 }
 
@@ -833,7 +845,7 @@ fn flip_kind_in_place(
     sortable_key: &[u8],
     new_kind: EntryKind,
 ) -> Result<u64> {
-    let old_node = clone_to_heap(store.read_node(block_nr)?);
+    let old_node = store.with_node(block_nr, clone_to_heap)?;
     let new_block = store.alloc();
     let mut new_node = old_node;
     if new_node.level() == 0 {
@@ -875,7 +887,7 @@ fn insert(
     kind: EntryKind,
 ) -> Result<u64> {
     // COW: clone before mutating so the original block stays intact.
-    let old_node = clone_to_heap(store.read_node(block_nr)?);
+    let old_node = store.with_node(block_nr, clone_to_heap)?;
     if old_node.level() == 0 {
         insert_leaf(store, next_bset_seq, &old_node, key, value, kind)
     } else {
@@ -918,22 +930,21 @@ fn insert_leaf(
             Err(i) => i,
         };
         let child_nr = root_box.child_block(child_idx);
-        let child_level = store.read_node(child_nr)?.level();
+        let child_level = store.with_node(child_nr, |n| n.level())?;
         let new_child_nr = insert(store, next_bset_seq, child_nr, key, value, kind)?;
 
-        let new_child_level = store.read_node(new_child_nr)?.level();
+        let new_child_level = store.with_node(new_child_nr, |n| n.level())?;
         if new_child_level > child_level {
             // Child itself split — promote its median to the (still
             // unwritten) parent. promote_to_parent will write a fresh
             // parent (possibly cascade-splitting it) and return its nr.
-            let (median_key, left, right) = {
-                let new_child = store.read_node(new_child_nr)?;
+            let (median_key, left, right) = store.with_node(new_child_nr, |new_child| {
                 (
                     new_child.entry(0).key_bytes().to_vec(),
                     new_child.child_block(0),
                     new_child.child_block(1),
                 )
-            };
+            })?;
             // root_box at this point still has the original child[child_idx]
             // pointer (left/right_block from the leaf split); promote builds
             // a brand-new parent node, so we can drop root_nr — it was
@@ -987,17 +998,20 @@ fn insert_internal(
         Err(i) => i,
     };
     let child_nr = old_node.child_block(child_idx);
-    let child_level = store.read_node(child_nr)?.level();
+    let child_level = store.with_node(child_nr, |n| n.level())?;
 
     let new_child_nr = insert(store, next_bset_seq, child_nr, key, value, kind)?;
 
     // Child split and grew a level — promote its median key to this level.
-    let new_child_level = store.read_node(new_child_nr)?.level();
+    let new_child_level = store.with_node(new_child_nr, |n| n.level())?;
     if new_child_level > child_level {
-        let new_child = store.read_node(new_child_nr)?;
-        let median_key = new_child.entry(0).key_bytes().to_vec();
-        let left = new_child.child_block(0);
-        let right = new_child.child_block(1);
+        let (median_key, left, right) = store.with_node(new_child_nr, |new_child| {
+            (
+                new_child.entry(0).key_bytes().to_vec(),
+                new_child.child_block(0),
+                new_child.child_block(1),
+            )
+        })?;
         // promote_to_parent sets all child pointers internally; we must NOT
         // touch the returned block afterward — child_idx is only valid against
         // the old parent, not a potential new root from a cascading split.
@@ -1175,45 +1189,69 @@ fn range_scan(
     end: &[u8],
     results: &mut Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Result<()> {
-    let node = store.read_node(block_nr)?;
-    if node.level() == 0 {
-        // Walk the merged iterator (cross-bset, latest-seq wins). The iter
-        // yields entries in sortable-key ascending order so we can early-out
-        // once we pass `end`.
-        for (b, i) in MergedIter::new(node) {
-            let entry = node.entry_at(b, i);
-            let sk = entry.key_bytes();
-            if sk < start {
-                continue;
+    // Leaf: collect matching rows under the lock. Internal: collect the
+    // (child block, following separator) plan under the lock, then recurse
+    // outside it. `InternalPlan` carries each child to descend and the
+    // separator key immediately to its right (None for the last child).
+    enum Node {
+        LeafRows,
+        Internal(Vec<(u64, Option<Vec<u8>>)>),
+    }
+    let plan = store.with_node(block_nr, |node| {
+        if node.level() == 0 {
+            // Walk the merged iterator (cross-bset, latest-seq wins). The iter
+            // yields entries in sortable-key ascending order so we can
+            // early-out once we pass `end`.
+            for (b, i) in MergedIter::new(node) {
+                let entry = node.entry_at(b, i);
+                let sk = entry.key_bytes();
+                if sk < start {
+                    continue;
+                }
+                if sk >= end {
+                    break;
+                }
+                if entry.kind_enum() != EntryKind::Live {
+                    continue;
+                }
+                results.push((
+                    entry.logical_key_bytes().to_vec(),
+                    node.value_bytes_at(b, i).to_vec(),
+                ));
             }
-            if sk >= end {
-                break;
+            Node::LeafRows
+        } else {
+            let mut i = match node.search(start) {
+                Ok(idx) => idx + 1,
+                Err(idx) => idx,
+            };
+            let nchildren = node.nkeys() + 1;
+            if i >= nchildren {
+                i = nchildren - 1;
             }
-            if entry.kind_enum() != EntryKind::Live {
-                continue;
+            let mut plan = Vec::new();
+            while i < nchildren {
+                let sep = if i < node.nkeys() {
+                    Some(node.entry(i).key_bytes().to_vec())
+                } else {
+                    None
+                };
+                plan.push((node.child_block(i), sep));
+                i += 1;
             }
-            results.push((
-                entry.logical_key_bytes().to_vec(),
-                node.value_bytes_at(b, i).to_vec(),
-            ));
+            Node::Internal(plan)
         }
-    } else {
-        let mut i = match node.search(start) {
-            Ok(idx) => idx + 1,
-            Err(idx) => idx,
-        };
-        let nchildren = node.nkeys() + 1;
-        if i >= nchildren {
-            i = nchildren - 1;
-        }
-        while i < nchildren {
-            range_scan(store, node.child_block(i), start, end, results)?;
+    })?;
+    if let Node::Internal(plan) = plan {
+        for (child, sep) in plan {
+            range_scan(store, child, start, end, results)?;
             // Separator-in-right: once a separator >= end, all further
             // subtrees are out of range.
-            if i < node.nkeys() && node.entry(i).key_bytes() >= end {
+            if let Some(sep) = sep
+                && sep.as_slice() >= end
+            {
                 return Ok(());
             }
-            i += 1;
         }
     }
     Ok(())
@@ -1229,70 +1267,106 @@ fn range_scan_all(
     end: &[u8],
     results: &mut Vec<AllSnapRow>,
 ) -> Result<()> {
-    let node = store.read_node(block_nr)?;
-    if node.level() == 0 {
-        // Cross-bset merged iter, but unlike `range_scan` we keep tombstones.
-        // Lower-seq duplicates are dropped by the iterator's tie-break logic.
-        for (b, i) in MergedIter::new(node) {
-            let entry = node.entry_at(b, i);
-            let sk = entry.key_bytes();
-            if sk < start {
-                continue;
+    enum Node {
+        LeafRows,
+        Internal(Vec<(u64, Option<Vec<u8>>)>),
+    }
+    let plan = store.with_node(block_nr, |node| {
+        if node.level() == 0 {
+            // Cross-bset merged iter, but unlike `range_scan` we keep
+            // tombstones. Lower-seq duplicates are dropped by the iterator's
+            // tie-break logic.
+            for (b, i) in MergedIter::new(node) {
+                let entry = node.entry_at(b, i);
+                let sk = entry.key_bytes();
+                if sk < start {
+                    continue;
+                }
+                if sk >= end {
+                    break;
+                }
+                results.push((
+                    entry.logical_key_bytes().to_vec(),
+                    entry.snap_id(),
+                    entry.kind_enum(),
+                    node.value_bytes_at(b, i).to_vec(),
+                ));
             }
-            if sk >= end {
-                break;
+            Node::LeafRows
+        } else {
+            let mut i = match node.search(start) {
+                Ok(idx) => idx + 1,
+                Err(idx) => idx,
+            };
+            let nchildren = node.nkeys() + 1;
+            if i >= nchildren {
+                i = nchildren - 1;
             }
-            results.push((
-                entry.logical_key_bytes().to_vec(),
-                entry.snap_id(),
-                entry.kind_enum(),
-                node.value_bytes_at(b, i).to_vec(),
-            ));
+            let mut plan = Vec::new();
+            while i < nchildren {
+                let sep = if i < node.nkeys() {
+                    Some(node.entry(i).key_bytes().to_vec())
+                } else {
+                    None
+                };
+                plan.push((node.child_block(i), sep));
+                i += 1;
+            }
+            Node::Internal(plan)
         }
-    } else {
-        let mut i = match node.search(start) {
-            Ok(idx) => idx + 1,
-            Err(idx) => idx,
-        };
-        let nchildren = node.nkeys() + 1;
-        if i >= nchildren {
-            i = nchildren - 1;
-        }
-        while i < nchildren {
-            range_scan_all(store, node.child_block(i), start, end, results)?;
-            if i < node.nkeys() && node.entry(i).key_bytes() >= end {
+    })?;
+    if let Node::Internal(plan) = plan {
+        for (child, sep) in plan {
+            range_scan_all(store, child, start, end, results)?;
+            if let Some(sep) = sep
+                && sep.as_slice() >= end
+            {
                 return Ok(());
             }
-            i += 1;
         }
     }
     Ok(())
 }
 
 fn dump(store: &BlockStore, block_nr: u64, indent: usize) {
-    let node = store.read_node(block_nr).unwrap();
     let prefix = "  ".repeat(indent);
-    if node.level() == 0 {
-        print!(
-            "{prefix}[leaf blk={block_nr} bsets={} keys=",
-            node.bset_count()
-        );
-        // Walk merged-sorted view so debug output is in canonical order.
-        for (b, i) in MergedIter::new(node) {
-            print!(" {:02x?}", node.entry_at(b, i).key_bytes());
-        }
-        println!("]");
-    } else {
-        println!(
-            "{prefix}[internal blk={block_nr} level={} keys={}]",
-            node.level(),
-            node.nkeys()
-        );
-        for i in 0..=node.nkeys() {
-            dump(store, node.child_block(i), indent + 1);
-            if i < node.nkeys() {
-                println!("{prefix}  -- {:02x?} --", node.entry(i).key_bytes());
+    // Collect the child (block, separator) plan under the lock; recurse after.
+    let children: Vec<(u64, Option<Vec<u8>>)> = store
+        .with_node(block_nr, |node| {
+            if node.level() == 0 {
+                print!(
+                    "{prefix}[leaf blk={block_nr} bsets={} keys=",
+                    node.bset_count()
+                );
+                // Walk merged-sorted view so debug output is in canonical order.
+                for (b, i) in MergedIter::new(node) {
+                    print!(" {:02x?}", node.entry_at(b, i).key_bytes());
+                }
+                println!("]");
+                Vec::new()
+            } else {
+                println!(
+                    "{prefix}[internal blk={block_nr} level={} keys={}]",
+                    node.level(),
+                    node.nkeys()
+                );
+                (0..=node.nkeys())
+                    .map(|i| {
+                        let sep = if i < node.nkeys() {
+                            Some(node.entry(i).key_bytes().to_vec())
+                        } else {
+                            None
+                        };
+                        (node.child_block(i), sep)
+                    })
+                    .collect()
             }
+        })
+        .unwrap();
+    for (child, sep) in children {
+        dump(store, child, indent + 1);
+        if let Some(sep) = sep {
+            println!("{prefix}  -- {sep:02x?} --");
         }
     }
 }
@@ -1367,7 +1441,7 @@ mod tests {
         let old_root_block = tree.root_block;
         // Pre-split, the root is still a single leaf.
         assert_eq!(
-            tree.store.read_node(old_root_block).unwrap().level(),
+            tree.store.read_node_copy(old_root_block).unwrap().level(),
             0,
             "root should still be a leaf at MAX_ENTRIES = {n}"
         );
@@ -1378,7 +1452,7 @@ mod tests {
         tree.insert(&key(n), &val(n)).unwrap();
         assert_ne!(tree.root_block, old_root_block);
         assert!(
-            tree.store.read_node(tree.root_block).unwrap().level() >= 1,
+            tree.store.read_node_copy(tree.root_block).unwrap().level() >= 1,
             "new root should be internal after split"
         );
 
@@ -1604,7 +1678,7 @@ mod tests {
         }
 
         // Tree should have grown beyond level 1.
-        let root = tree.store.read_node(tree.root_block).unwrap();
+        let root = tree.store.read_node_copy(tree.root_block).unwrap();
         assert!(
             root.level() >= 2,
             "expected multi-level tree, got level {}",
@@ -1631,11 +1705,17 @@ mod tests {
             tree.insert(&key(i), &val(i)).unwrap();
         }
         // Root should still be a leaf.
-        assert_eq!(tree.store.read_node(tree.root_block).unwrap().level(), 0);
+        assert_eq!(
+            tree.store.read_node_copy(tree.root_block).unwrap().level(),
+            0
+        );
 
         // One more triggers a split.
         tree.insert(&key(max), &val(max)).unwrap();
-        assert_eq!(tree.store.read_node(tree.root_block).unwrap().level(), 1);
+        assert_eq!(
+            tree.store.read_node_copy(tree.root_block).unwrap().level(),
+            1
+        );
 
         for i in 0..=max {
             assert_eq!(
@@ -1781,9 +1861,9 @@ mod tests {
         // Root must be internal at this point.
         let snap = tree.root_block;
         assert!(
-            tree.store.read_node(snap).unwrap().level() >= 1,
+            tree.store.read_node_copy(snap).unwrap().level() >= 1,
             "expected internal root after {n} inserts, level={}",
-            tree.store.read_node(snap).unwrap().level()
+            tree.store.read_node_copy(snap).unwrap().level()
         );
 
         // Overwrite every key with a new value.
@@ -1867,7 +1947,7 @@ mod tests {
         assert_eq!(count_keys(&tree.store, tree.root_block), n as usize);
 
         // Root should be at least level 2 with this many keys.
-        let root = tree.store.read_node(tree.root_block).unwrap();
+        let root = tree.store.read_node_copy(tree.root_block).unwrap();
         assert!(root.level() >= 2);
 
         tree.verify();
@@ -2057,7 +2137,7 @@ mod tests {
     }
 
     fn check_leaf_fill(store: &BlockStore, block_nr: u64, min_keys: usize) {
-        let node = store.read_node(block_nr).unwrap();
+        let node = store.read_node_copy(block_nr).unwrap();
         if node.level() == 0 {
             assert!(
                 node.nkeys() >= min_keys,
@@ -2570,7 +2650,7 @@ mod tests {
     fn root_leaf_bset_count(tree: &Btree) -> usize {
         let mut blk = tree.root_block;
         loop {
-            let node = tree.store.read_node(blk).unwrap();
+            let node = tree.store.read_node_copy(blk).unwrap();
             if node.level() == 0 {
                 return node.bset_count();
             }
@@ -2674,7 +2754,7 @@ mod tests {
         let trigger = MAX_ENTRIES as u32;
         tree.insert(&key(trigger), &val(trigger)).unwrap();
         // Tree is now level >= 1; root is internal.
-        let root = tree.store.read_node(tree.root_block).unwrap();
+        let root = tree.store.read_node_copy(tree.root_block).unwrap();
         assert!(
             root.level() >= 1,
             "root should be internal after split, level={}",
@@ -2726,7 +2806,7 @@ mod tests {
         }
         let nkeys_before = {
             let blk = tree.root_block;
-            tree.store.read_node(blk).unwrap().nkeys()
+            tree.store.read_node_copy(blk).unwrap().nkeys()
         };
         let bcnt_before = root_leaf_bset_count(&tree);
         // key(0) lives in bset 0 (older); the in-place flip should target
@@ -2734,7 +2814,7 @@ mod tests {
         assert!(tree.delete(&key(0)).unwrap());
         let nkeys_after = {
             let blk = tree.root_block;
-            tree.store.read_node(blk).unwrap().nkeys()
+            tree.store.read_node_copy(blk).unwrap().nkeys()
         };
         let bcnt_after = root_leaf_bset_count(&tree);
         assert_eq!(

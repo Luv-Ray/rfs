@@ -2,24 +2,29 @@
 //! pure RAM or a single image file (pread/pwrite).
 //!
 //! Design notes:
-//! - Cache is **append-only** (`elsa::FrozenMap`): COW guarantees that a
-//!   given `block_nr` is written at most once after allocation, so the cache
-//!   never needs to mutate or evict an entry. This lets `read_*` keep its
-//!   `&self`-only signature even though it may need to fault a block in
-//!   from disk on a miss.
+//! - Cache is a **dirty-tracked mutable map** (`RwLock<HashMap<u64, Box<..>>>`).
+//!   The node cache is accessed only through the `with_node` closure (read)
+//!   entry point, never handed out as a long-lived borrow — so the lock is
+//!   released as soon as the closure returns and callers recurse without
+//!   holding it. See docs/node-cache-rewrite-plan.md.
+//!   Note: COW-once (a given `block_nr` is written at most once after
+//!   allocation) is still upheld today, but it is now a *convention* enforced
+//!   by funnelling all mutation through `write_node`, not a static guarantee
+//!   of the cache type.
 //! - Allocator is unified: btree nodes and file data blocks share one
 //!   monotonically-increasing `next_block_nr`. Block 0 is reserved for the
 //!   superblock; blocks 1..64 are the journal ring; node blocks have a
 //!   `MAGIC_NUMBER` + CRC at the head and data blocks are raw 4 KB payloads.
 //! - Journal: append-only ring buffer providing crash recovery — see journal.rs.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use elsa::sync::FrozenMap;
 use zerocopy::{FromBytes, IntoBytes, KnownLayout};
 
 use crate::block_btree::{BLOCK_SIZE, BtreeNodeRaw, MAGIC_NUMBER};
@@ -213,25 +218,39 @@ enum Backing {
     Image { file: File },
 }
 
-/// Append-only block cache + optional image-file backing.
+/// A cached btree node plus its dirty bit.
 ///
-/// All hot-path methods take `&self`. Mutation is funnelled through:
+/// `dirty` is set when the in-cache copy is newer than what is on disk. In
+/// the current write-through mode `write_node` clears it immediately (it
+/// pwrites before returning), but the field is in place for the upcoming
+/// write-back / incremental-flush step.
+struct CachedNode {
+    node: BtreeNodeRaw,
+    dirty: bool,
+}
+
+/// Block cache + optional image-file backing.
+///
+/// Mutation is funnelled through:
 /// - `AtomicU64` for the allocator counter
-/// - `FrozenMap` for the caches (append-only `&self`-insert)
+/// - `RwLock<HashMap>` for the caches
 /// - `File`'s own `&self` `read_at` / `write_at` (Unix `FileExt`)
 ///
-/// COW guarantees that any block_nr we hand out is written exactly once
-/// before being read, so the caches never need to overwrite an entry.
+/// The node cache is never handed out as a borrow: reads go through
+/// `with_node(nr, |node| ...)`, which takes the read lock, runs the closure,
+/// and drops the lock before returning — so recursive tree walks release the
+/// lock between levels (they extract the child block number inside the
+/// closure and recurse outside it).
 ///
 /// Two cache lanes are kept side by side because btree nodes need
 /// 4 KB alignment to be cast back to `&BtreeNodeRaw` (zerocopy), while
 /// raw data blocks are addressed as plain bytes. A given block_nr is
 /// always read/written through one lane consistently — caller picks via
-/// `read_node`/`write_node` vs `read_data`/`write_data`. They share
+/// `with_node`/`write_node` vs `read_data`/`write_data`. They share
 /// `next_block_nr`, so there is one global block-number space.
 pub struct BlockStore {
-    node_cache: FrozenMap<u64, Box<BtreeNodeRaw>>,
-    data_cache: FrozenMap<u64, Box<DataBlock>>,
+    node_cache: RwLock<HashMap<u64, Box<CachedNode>>>,
+    data_cache: RwLock<HashMap<u64, Box<DataBlock>>>,
     next_block_nr: AtomicU64,
     backing: Backing,
 }
@@ -241,8 +260,8 @@ impl BlockStore {
     /// `HashMap<u64, BtreeNodeRaw>` mode used by every in-process test.
     pub fn in_memory() -> Self {
         BlockStore {
-            node_cache: FrozenMap::new(),
-            data_cache: FrozenMap::new(),
+            node_cache: RwLock::new(HashMap::new()),
+            data_cache: RwLock::new(HashMap::new()),
             next_block_nr: AtomicU64::new(FIRST_DATA_BLOCK_NR),
             backing: Backing::Memory,
         }
@@ -257,8 +276,8 @@ impl BlockStore {
             .create_new(true)
             .open(path)?;
         Ok(BlockStore {
-            node_cache: FrozenMap::new(),
-            data_cache: FrozenMap::new(),
+            node_cache: RwLock::new(HashMap::new()),
+            data_cache: RwLock::new(HashMap::new()),
             next_block_nr: AtomicU64::new(FIRST_DATA_BLOCK_NR),
             backing: Backing::Image { file },
         })
@@ -269,8 +288,8 @@ impl BlockStore {
     pub fn open_image(path: &Path) -> Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         Ok(BlockStore {
-            node_cache: FrozenMap::new(),
-            data_cache: FrozenMap::new(),
+            node_cache: RwLock::new(HashMap::new()),
+            data_cache: RwLock::new(HashMap::new()),
             next_block_nr: AtomicU64::new(FIRST_DATA_BLOCK_NR),
             backing: Backing::Image { file },
         })
@@ -299,12 +318,24 @@ impl BlockStore {
 
     // ---------- Btree node IO ----------
 
-    /// Read a btree node, verifying magic and CRC on a fresh fault-in.
-    /// Returns a borrow into the node cache that lives as long as `&self`.
-    pub fn read_node(&self, nr: u64) -> Result<&BtreeNodeRaw> {
-        if let Some(n) = self.node_cache.get(&nr) {
-            return Ok(n);
+    /// Access a btree node under the cache read lock, running `f` against it
+    /// and returning the result. The lock is held only for the duration of
+    /// `f`, so callers must extract whatever they need (a child block number,
+    /// a copied-out value) inside the closure and recurse *outside* it — do
+    /// NOT call another `with_node` from within `f` (it would re-enter the
+    /// lock and can deadlock).
+    ///
+    /// On a cache miss with an image backing, the node is faulted in from
+    /// disk (magic + CRC verified) and published before `f` runs.
+    pub fn with_node<R>(&self, nr: u64, f: impl FnOnce(&BtreeNodeRaw) -> R) -> Result<R> {
+        // Fast path: already cached.
+        {
+            let cache = self.node_cache.read().unwrap();
+            if let Some(c) = cache.get(&nr) {
+                return Ok(f(&c.node));
+            }
         }
+        // Miss: fault in (image only), then publish and run under the lock.
         match &self.backing {
             Backing::Memory => Err(Error::BlockNotFound(nr)),
             Backing::Image { file } => {
@@ -312,19 +343,38 @@ impl BlockStore {
                 // verify magic + CRC, then publish to the cache.
                 let mut node = unsafe {
                     // SAFETY: BtreeNodeRaw is a POD `#[derive(FromBytes)]`
-                    // type and Box::new_zeroed_slice gives us properly
-                    // aligned, zero-initialized memory. We immediately
-                    // read_at into it, fully overwriting before any read.
+                    // type and Box::new_zeroed gives us properly aligned,
+                    // zero-initialized memory. We immediately read_at into
+                    // it, fully overwriting before any read.
                     Box::<BtreeNodeRaw>::new_zeroed().assume_init()
                 };
                 file.read_exact_at(node.as_mut_bytes(), nr * BLOCK_SIZE as u64)?;
                 verify_node_in_place(nr, &node)?;
-                Ok(self.node_cache.insert(nr, node))
+                let mut cache = self.node_cache.write().unwrap();
+                // Another thread may have raced us in; either copy is valid.
+                let entry = cache.entry(nr).or_insert_with(|| {
+                    Box::new(CachedNode {
+                        node: *node,
+                        dirty: false,
+                    })
+                });
+                Ok(f(&entry.node))
             }
         }
     }
 
+    /// Read a full owned copy of a btree node. Only for test assertions —
+    /// production read paths use `with_node` to avoid the 4 KB copy.
+    #[cfg(test)]
+    pub fn read_node_copy(&self, nr: u64) -> Result<Box<BtreeNodeRaw>> {
+        self.with_node(nr, |n| Box::new(n.clone()))
+    }
+
     /// Write a btree node, stamping CRC into its header before persisting.
+    ///
+    /// Write-through: the block is pwritten immediately (image backing) and
+    /// the cache entry is marked clean. The `dirty` bookkeeping is in place
+    /// for the future write-back step.
     pub fn write_node(&self, nr: u64, node: &BtreeNodeRaw) -> Result<()> {
         let mut copy = node.clone();
         copy.header.checksum = 0;
@@ -333,7 +383,51 @@ impl BlockStore {
         if let Backing::Image { file } = &self.backing {
             file.write_all_at(copy.as_bytes(), nr * BLOCK_SIZE as u64)?;
         }
-        let _ = self.node_cache.insert(nr, Box::new(copy));
+        self.node_cache.write().unwrap().insert(
+            nr,
+            Box::new(CachedNode {
+                node: copy,
+                dirty: false,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Flush a single dirty node to disk (CRC stamped, then pwrite). No-op if
+    /// the node is absent or already clean. Under write-through nodes are
+    /// never left dirty, so this is currently only exercised by the future
+    /// write-back path; kept here so `sync` can call it unconditionally.
+    pub fn flush_node(&self, nr: u64) -> Result<()> {
+        let mut cache = self.node_cache.write().unwrap();
+        let Some(c) = cache.get_mut(&nr) else {
+            return Ok(());
+        };
+        if !c.dirty {
+            return Ok(());
+        }
+        c.node.header.checksum = 0;
+        let crc = crc32fast::hash(c.node.as_bytes()) as u64;
+        c.node.header.checksum = crc;
+        if let Backing::Image { file } = &self.backing {
+            file.write_all_at(c.node.as_bytes(), nr * BLOCK_SIZE as u64)?;
+        }
+        c.dirty = false;
+        Ok(())
+    }
+
+    /// Flush every dirty node. No-op under write-through (nothing is dirty).
+    pub fn flush_all(&self) -> Result<()> {
+        let dirty: Vec<u64> = {
+            let cache = self.node_cache.read().unwrap();
+            cache
+                .iter()
+                .filter(|(_, c)| c.dirty)
+                .map(|(&nr, _)| nr)
+                .collect()
+        };
+        for nr in dirty {
+            self.flush_node(nr)?;
+        }
         Ok(())
     }
 
@@ -341,16 +435,25 @@ impl BlockStore {
 
     /// Read a 4 KB data block (file content). No magic / no CRC: data
     /// blocks are raw payload. Caller must have allocated the block first.
-    pub fn read_data(&self, nr: u64) -> Result<&[u8; BLOCK_SIZE]> {
-        if let Some(b) = self.data_cache.get(&nr) {
-            return Ok(&b.0);
+    ///
+    /// Returns an owned copy: data blocks are only ever read then immediately
+    /// copied by callers, and they are never mutated in place, so there's no
+    /// need for a closure/borrow API here.
+    pub fn read_data(&self, nr: u64) -> Result<[u8; BLOCK_SIZE]> {
+        {
+            let cache = self.data_cache.read().unwrap();
+            if let Some(b) = cache.get(&nr) {
+                return Ok(b.0);
+            }
         }
         match &self.backing {
             Backing::Memory => Err(Error::BlockNotFound(nr)),
             Backing::Image { file } => {
                 let mut block = Box::new(DataBlock::zeroed());
                 file.read_exact_at(&mut block.0, nr * BLOCK_SIZE as u64)?;
-                Ok(&self.data_cache.insert(nr, block).0)
+                let bytes = block.0;
+                self.data_cache.write().unwrap().insert(nr, block);
+                Ok(bytes)
             }
         }
     }
@@ -360,7 +463,10 @@ impl BlockStore {
         if let Backing::Image { file } = &self.backing {
             file.write_all_at(bytes, nr * BLOCK_SIZE as u64)?;
         }
-        let _ = self.data_cache.insert(nr, Box::new(DataBlock(*bytes)));
+        self.data_cache
+            .write()
+            .unwrap()
+            .insert(nr, Box::new(DataBlock(*bytes)));
         Ok(())
     }
 
