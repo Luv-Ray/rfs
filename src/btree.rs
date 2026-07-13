@@ -80,6 +80,17 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// COW B-tree: all mutations produce new nodes; old nodes remain reachable
 /// via their block numbers (key for crash recovery and snapshots).
+/// A resolved key/value write, captured for the write-ahead log. This is the
+/// *outcome* of a btree op (after Deleted-vs-Whiteout resolution), so replay
+/// is a single mode: re-insert `(sortable_key, kind, value)` — no snapshot
+/// chain, idempotent. `sortable_key` already includes the 4-byte snap suffix.
+#[derive(Clone, Debug)]
+pub struct LogRecord {
+    pub sortable_key: Vec<u8>,
+    pub kind: EntryKind,
+    pub value: Vec<u8>,
+}
+
 pub struct Btree {
     pub root_block: u64,
     /// Shared block storage. May be in-memory (cache only) or image-backed.
@@ -89,6 +100,13 @@ pub struct Btree {
     /// Used by the cross-bset merged iterator to break ties when the same
     /// sortable key appears in multiple bsets (latest write wins).
     next_bset_seq: u64,
+    /// Resolved writes since the last drain, for the WAL. Drained by
+    /// `Fs::journal_commit`. Recording is suppressed during replay via
+    /// `logging`.
+    log: Vec<LogRecord>,
+    /// Whether to record resolved writes into `log`. False during replay so
+    /// re-applied ops are not re-logged.
+    logging: bool,
 }
 
 impl Btree {
@@ -115,6 +133,8 @@ impl Btree {
             root_block,
             store,
             next_bset_seq,
+            log: Vec::new(),
+            logging: true,
         }
     }
 
@@ -136,7 +156,34 @@ impl Btree {
             // (from inserts that open a new bset, or from compaction) start
             // at 1.
             next_bset_seq: 1,
+            log: Vec::new(),
+            logging: true,
         }
+    }
+
+    /// Take the accumulated log records, clearing the buffer.
+    pub fn drain_log(&mut self) -> Vec<LogRecord> {
+        std::mem::take(&mut self.log)
+    }
+
+    /// Current number of buffered log records (for transaction rollback).
+    fn log_len(&self) -> usize {
+        self.log.len()
+    }
+
+    /// Truncate the log back to `len` (undo records from an aborted tx).
+    fn log_truncate(&mut self, len: usize) {
+        self.log.truncate(len);
+    }
+
+    /// Run `f` with logging suppressed (used during replay so re-applied ops
+    /// aren't re-recorded), restoring the prior setting afterward.
+    fn without_logging<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = self.logging;
+        self.logging = false;
+        let r = f(self);
+        self.logging = prev;
+        r
     }
 
     /// Read-only access to the next bset seq counter (for sync into
@@ -185,6 +232,13 @@ impl Btree {
             kind,
         )?;
         self.root_block = new_root;
+        if self.logging {
+            self.log.push(LogRecord {
+                sortable_key: buf[..len].to_vec(),
+                kind,
+                value: value.to_vec(),
+            });
+        }
         Ok(())
     }
 
@@ -217,9 +271,17 @@ impl Btree {
                 EntryKind::Deleted,
             )?;
             self.root_block = new_root;
+            if self.logging {
+                self.log.push(LogRecord {
+                    sortable_key: buf[..len].to_vec(),
+                    kind: EntryKind::Deleted,
+                    value: Vec::new(),
+                });
+            }
         } else {
             // Inherited from an ancestor. Must shadow the ancestor's
             // still-live entry with a Whiteout written at our snap.
+            // insert_with_kind records the log entry itself.
             self.insert_with_kind(key, snap, EntryKind::Whiteout, &[])?;
         }
         Ok(true)
@@ -425,6 +487,13 @@ impl<'a> Tx<'a> {
             kind,
         )?;
         self.pending_root = new_root;
+        if self.btree.logging {
+            self.btree.log.push(LogRecord {
+                sortable_key: buf[..len].to_vec(),
+                kind,
+                value: value.to_vec(),
+            });
+        }
         Ok(())
     }
 
@@ -443,6 +512,13 @@ impl<'a> Tx<'a> {
                 EntryKind::Deleted,
             )?;
             self.pending_root = new_root;
+            if self.btree.logging {
+                self.btree.log.push(LogRecord {
+                    sortable_key: buf[..len].to_vec(),
+                    kind: EntryKind::Deleted,
+                    value: Vec::new(),
+                });
+            }
         } else {
             self.insert_with_kind(key, snap, EntryKind::Whiteout, &[])?;
         }
@@ -475,6 +551,7 @@ impl Btree {
     where
         F: FnOnce(&mut Tx<'_>) -> Result<R>,
     {
+        let log_mark = self.log_len();
         let mut tx = Tx {
             pending_root: self.root_block,
             btree: self,
@@ -486,8 +563,29 @@ impl Btree {
                 tx.btree.root_block = new_root;
                 Ok(value)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // Abort: root untouched, and drop any log records the closure
+                // pushed before failing (those writes never became visible).
+                self.log_truncate(log_mark);
+                Err(e)
+            }
         }
+    }
+
+    /// Re-apply one logged record during recovery. Writes `(sortable_key,
+    /// kind, value)` directly with logging suppressed (so replay doesn't
+    /// re-log). `sortable_key` already carries the snap suffix, so this splits
+    /// it back into logical key + snap for the underlying insert.
+    pub fn replay_record(&mut self, rec: &LogRecord) -> Result<()> {
+        let n = rec.sortable_key.len();
+        debug_assert!(n >= SNAP_ID_BYTES, "sortable key too short");
+        let logical = &rec.sortable_key[..n - SNAP_ID_BYTES];
+        let snap = SnapId::from_be_bytes(
+            rec.sortable_key[n - SNAP_ID_BYTES..]
+                .try_into()
+                .expect("snap suffix is 4 bytes"),
+        );
+        self.without_logging(|bt| bt.insert_with_kind(logical, snap, rec.kind, &rec.value))
     }
 }
 

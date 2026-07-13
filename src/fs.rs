@@ -2,11 +2,42 @@ use std::sync::Arc;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::block_btree::{BLOCK_SIZE, MAX_LOGICAL_KEY_SIZE, MAX_VALUE_SIZE, ROOT_SNAP, SnapId};
-use crate::btree::{Btree, Result};
+use crate::block_btree::{
+    BLOCK_SIZE, EntryKind, MAX_LOGICAL_KEY_SIZE, MAX_VALUE_SIZE, ROOT_SNAP, SnapId,
+};
+use crate::btree::{Btree, LogRecord, Result};
 use crate::storage::BlockStore;
 
 pub const ROOT_INO: u64 = 1;
+
+/// Encode a resolved-write log record into a journal frame's op payload:
+/// `[key_len: u8][sortable_key][value]`. The record's `kind` travels in the
+/// frame's `op_kind` field, so it isn't repeated here. Fits in
+/// `JOURNAL_OP_CAPACITY` (key ≤ 32, value ≤ 96, + 1).
+fn encode_log_record(rec: &LogRecord) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + rec.sortable_key.len() + rec.value.len());
+    out.push(rec.sortable_key.len() as u8);
+    out.extend_from_slice(&rec.sortable_key);
+    out.extend_from_slice(&rec.value);
+    out
+}
+
+/// Inverse of [`encode_log_record`]. `op_kind` is the frame's op_kind byte.
+fn decode_log_record(op_kind: u8, payload: &[u8]) -> Result<LogRecord> {
+    let bad = || crate::btree::Error::Io(std::io::Error::other("malformed journal op record"));
+    let key_len = *payload.first().ok_or_else(bad)? as usize;
+    if payload.len() < 1 + key_len {
+        return Err(bad());
+    }
+    let sortable_key = payload[1..1 + key_len].to_vec();
+    let value = payload[1 + key_len..].to_vec();
+    let kind = EntryKind::from_u8(op_kind);
+    Ok(LogRecord {
+        sortable_key,
+        kind,
+        value,
+    })
+}
 
 pub const FILE_KIND_REGULAR: u8 = 1;
 pub const FILE_KIND_DIR: u8 = 2;
@@ -268,10 +299,6 @@ pub struct Fs {
     /// The journal_seq last written to the superblock (checkpoint). Used to
     /// detect ring-near-full and force a checkpoint before wraparound.
     last_checkpoint_seq: u64,
-    /// Logged operations buffered since the last `journal_commit`. Flushed as
-    /// one atomic commit group (ops + CommitEnd) on the next commit. Empty in
-    /// Step A (nothing records into it yet).
-    pending_ops: Vec<(u8, Vec<u8>)>,
 }
 
 impl Fs {
@@ -300,6 +327,11 @@ impl Fs {
         let mut fs = Self::seed(tree, store, ROOT_INO);
         fs.journal = Some(journal);
         fs.next_journal_seq = 1;
+        // Seeding inserted snapshot/subvol records into the btree log; discard
+        // them — the initial sync() below checkpoints the seeded tree straight
+        // into the superblock, so they must not leak into the first real commit
+        // group as replayable ops.
+        fs.tree.drain_log();
         // Write the initial superblock so Fs::open can find it.
         fs.sync()?;
         Ok(fs)
@@ -313,46 +345,53 @@ impl Fs {
         let sb = store.read_superblock()?;
 
         let journal = crate::journal::Journal::new(store.try_clone_file()?);
-        // Scan complete commit groups after the last checkpoint. Step A:
-        // recovery adopts the state recorded in the last group's CommitEnd
-        // frame (equivalent to the old "adopt last entry" behaviour); the
-        // logged ops in each group are not yet replayed.
+        // Scan complete commit groups after the last checkpoint, then replay
+        // each group's logged ops onto the checkpoint tree and adopt the last
+        // group's CommitEnd state scalars.
         let groups = journal.scan_groups(sb.journal_seq + 1)?;
         let next_journal_seq = journal.next_seq_after_scan(sb.journal_seq + 1)?;
 
-        let (
-            root_block,
-            next_block_nr,
-            next_bset_seq,
-            next_ino,
-            next_snap_id,
-            next_subvol_id,
-            current_subvol,
-        ) = if let Some(group) = groups.last() {
-            let e = &group.end;
-            (
-                e.root_block,
-                e.next_block_nr,
-                e.next_bset_seq,
-                e.next_ino,
-                e.next_snap_id,
-                e.next_subvol_id,
-                e.current_subvol,
-            )
-        } else {
-            (
-                sb.root_block,
-                sb.next_block_nr,
-                sb.next_bset_seq,
-                sb.next_ino,
-                sb.next_snap_id,
-                sb.next_subvol_id,
-                sb.current_subvol,
-            )
-        };
+        // Reopen the tree at the checkpoint (superblock) root, then replay.
+        // Set the allocator to the last group's next_block_nr up front so that
+        // node blocks allocated during replay never collide with data blocks
+        // already persisted (extent records reference fixed data_block ids).
+        let final_next_block_nr = groups
+            .last()
+            .map(|g| g.end.next_block_nr)
+            .unwrap_or(sb.next_block_nr);
+        store.set_next_block_nr(final_next_block_nr);
+        let mut tree = Btree::reopen(store.clone(), sb.root_block, sb.next_bset_seq);
+        for group in &groups {
+            for (op_kind, payload) in &group.ops {
+                let rec = decode_log_record(*op_kind, payload)?;
+                tree.replay_record(&rec)?;
+            }
+        }
 
-        store.set_next_block_nr(next_block_nr);
-        let tree = Btree::reopen(store.clone(), root_block, next_bset_seq);
+        // The tree's block-level state (root_block, next_block_nr,
+        // next_bset_seq) now comes from replay itself — replay re-does the COW
+        // writes and allocates its own node blocks, so those numbers legitimately
+        // differ from the original run's recorded values. Only the fs-level
+        // counters (next_ino / snap / subvol / current_subvol) are not derivable
+        // from replay, so those are adopted from the last CommitEnd.
+        let (next_ino, next_snap_id, next_subvol_id, current_subvol) =
+            if let Some(group) = groups.last() {
+                let e = &group.end;
+                (
+                    e.next_ino,
+                    e.next_snap_id,
+                    e.next_subvol_id,
+                    e.current_subvol,
+                )
+            } else {
+                (
+                    sb.next_ino,
+                    sb.next_snap_id,
+                    sb.next_subvol_id,
+                    sb.current_subvol,
+                )
+            };
+
         Ok(Fs {
             tree,
             store,
@@ -363,7 +402,6 @@ impl Fs {
             journal: Some(journal),
             next_journal_seq,
             last_checkpoint_seq: sb.journal_seq,
-            pending_ops: Vec::new(),
         })
     }
 
@@ -388,15 +426,17 @@ impl Fs {
             self.sync()?;
         }
 
+        // Drain the btree's resolved-write log into this commit group: one
+        // LoggedOp frame per record, then a CommitEnd carrying the resulting
+        // state. On replay the group's ops are re-applied from the checkpoint
+        // tree, then the CommitEnd's state scalars are adopted.
+        let records = self.tree.drain_log();
         let journal = self.journal.as_ref().unwrap();
-        // Emit one commit group: any buffered logged ops, then a CommitEnd
-        // frame recording the resulting state. (Step A: the op buffer is not
-        // yet populated, so this is just the CommitEnd — behaviourally the
-        // same fixed state checkpoint as before, in the new frame format.)
-        for (op_kind, data) in std::mem::take(&mut self.pending_ops) {
+        for rec in &records {
+            let data = encode_log_record(rec);
             let seq = self.next_journal_seq;
             self.next_journal_seq += 1;
-            let mut frame = crate::storage::JournalFrame::logged_op(seq, op_kind, &data);
+            let mut frame = crate::storage::JournalFrame::logged_op(seq, rec.kind as u8, &data);
             frame.checksum = frame.compute_checksum();
             journal.append(&frame)?;
         }
@@ -461,7 +501,6 @@ impl Fs {
             journal: None,
             next_journal_seq: 0,
             last_checkpoint_seq: 0,
-            pending_ops: Vec::new(),
         };
         // Seed the snapshot tree with the root snapshot. parent=NO_PARENT_SNAP
         // marks it as the top of its tree. Stored under snap=ROOT_SNAP itself
@@ -2052,38 +2091,139 @@ mod tests {
 
         {
             let mut fs = Fs::create(&img.0).unwrap();
-            // Write inode 2 and commit a valid journal entry at seq 1.
+            // Group 1 (fully committed): put_inode(2) -> op@seq1 + CommitEnd@seq2.
             fs.put_inode(2, &sample_inode(11)).unwrap();
             fs.journal_commit().unwrap();
 
-            // Write inode 3 (uncommitted — btree reflects it, but we will
-            // stomp the journal entry for seq 2 with a bad CRC).
+            // Group 2 (put_inode(3) -> op@seq3 + CommitEnd@seq4). We commit it
+            // to disk, then corrupt its CommitEnd frame so the group is torn.
             fs.put_inode(3, &sample_inode(22)).unwrap();
+            fs.journal_commit().unwrap();
 
-            // Build a corrupt journal frame at seq 2.
-            let mut bad = crate::storage::JournalFrame::commit_end(2, 999, 999, 999, 999, 0, 0, 0);
+            // Stomp group 2's CommitEnd (seq 4) with a bad CRC: the group now
+            // has ops (seq 3) but no valid closing CommitEnd, so replay must
+            // discard it entirely.
+            let mut bad = crate::storage::JournalFrame::commit_end(4, 999, 999, 999, 999, 0, 0, 0);
             bad.checksum = 0xDEAD_BEEF; // deliberately wrong CRC
             use std::os::unix::fs::FileExt;
             use zerocopy::IntoBytes;
             let file = fs.store.try_clone_file().unwrap();
-            let offset = crate::journal::Journal::frame_offset(2);
+            let offset = crate::journal::Journal::frame_offset(4);
             file.write_all_at(bad.as_bytes(), offset).unwrap();
-            // Drop without sync — superblock still reflects the initial sync
-            // from create(). The journal has seq 1 valid + seq 2 corrupt.
+            // Drop without sync — superblock still at the create() checkpoint
+            // (journal_seq = 0). Journal has group 1 complete, group 2 torn.
         }
 
-        // Recovery should stop at seq 1. The btree root from seq 1 only saw
-        // inode 2, so inode 3 must be unreachable.
+        // Recovery replays group 1 only; group 2's torn tail is discarded.
         {
             let fs = Fs::open(&img.0).unwrap();
             assert!(
                 fs.get_inode(2).unwrap().is_some(),
-                "inode 2 must be visible: was in valid journal entry at seq 1"
+                "inode 2 must be visible: group 1 committed fully"
             );
             assert!(
                 fs.get_inode(3).unwrap().is_none(),
-                "inode 3 must NOT be visible: journal entry at seq 2 was corrupt"
+                "inode 3 must NOT be visible: group 2's CommitEnd was corrupt"
             );
+        }
+    }
+
+    /// A multi-write op (like FUSE `create`: inode + dirent, then one commit)
+    /// must recover atomically — either both writes or neither. This models a
+    /// crash *after* the commit (both survive) vs a torn commit (neither).
+    #[test]
+    fn journal_multi_write_group_is_atomic() {
+        // Case 1: committed group — both the inode and its dirent survive.
+        let img = tmp_image_path("jnl-create-ok");
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            make_root(&mut fs);
+            fs.journal_commit().unwrap();
+            // "create": two writes, one commit (one atomic group).
+            fs.put_inode(2, &sample_inode(7)).unwrap();
+            fs.put_dirent(ROOT_INO, b"f", &DirentV1::new(2, FILE_KIND_REGULAR))
+                .unwrap();
+            fs.journal_commit().unwrap();
+        }
+        {
+            let fs = Fs::open(&img.0).unwrap();
+            assert!(fs.get_inode(2).unwrap().is_some(), "inode survives commit");
+            assert!(
+                fs.lookup_dirent(ROOT_INO, b"f").unwrap().is_some(),
+                "dirent survives commit"
+            );
+        }
+
+        // Case 2: torn group — corrupt the group's CommitEnd so neither the
+        // inode nor the dirent of that group is visible after recovery.
+        let img2 = tmp_image_path("jnl-create-torn");
+        {
+            let mut fs = Fs::create(&img2.0).unwrap();
+            make_root(&mut fs);
+            fs.journal_commit().unwrap(); // group 1: root dirent setup
+            let torn_start = fs.next_journal_seq; // first seq of the create group
+            fs.put_inode(2, &sample_inode(7)).unwrap();
+            fs.put_dirent(ROOT_INO, b"f", &DirentV1::new(2, FILE_KIND_REGULAR))
+                .unwrap();
+            fs.journal_commit().unwrap();
+            // The create group is [torn_start .. torn_start+2]: op, op, CommitEnd.
+            // Stomp its CommitEnd (torn_start + 2).
+            let end_seq = torn_start + 2;
+            let mut bad = crate::storage::JournalFrame::commit_end(end_seq, 9, 9, 9, 9, 0, 0, 0);
+            bad.checksum = 0xDEAD_BEEF;
+            use std::os::unix::fs::FileExt;
+            use zerocopy::IntoBytes;
+            let file = fs.store.try_clone_file().unwrap();
+            file.write_all_at(
+                bad.as_bytes(),
+                crate::journal::Journal::frame_offset(end_seq),
+            )
+            .unwrap();
+        }
+        {
+            let fs = Fs::open(&img2.0).unwrap();
+            assert!(
+                fs.get_inode(2).unwrap().is_none(),
+                "inode must NOT survive a torn create group"
+            );
+            assert!(
+                fs.lookup_dirent(ROOT_INO, b"f").unwrap().is_none(),
+                "dirent must NOT survive a torn create group"
+            );
+        }
+    }
+
+    /// A file with several extents, committed but not synced, must recover
+    /// with all its data. Exercises replay of many extent-key ops whose values
+    /// reference fixed data_block numbers written before the crash.
+    #[test]
+    fn journal_multi_extent_file_survives_recovery() {
+        let img = tmp_image_path("jnl-extents");
+        let n_blocks = 8u64;
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            make_root(&mut fs);
+            for i in 0..n_blocks {
+                let payload = vec![i as u8 + 1; BLOCK_SIZE];
+                fs.put_extent(2, i * BLOCK_SIZE as u64, &payload).unwrap();
+            }
+            fs.journal_commit().unwrap();
+            // Crash: no sync.
+        }
+        {
+            let fs = Fs::open(&img.0).unwrap();
+            let extents = fs.list_extents(2).unwrap();
+            assert_eq!(extents.len(), n_blocks as usize, "all extents recovered");
+            for i in 0..n_blocks {
+                let (off, ext) = &extents[i as usize];
+                assert_eq!(*off, i * BLOCK_SIZE as u64);
+                let block = fs.read_data_block(ext.data_block).unwrap();
+                assert_eq!(
+                    block[0],
+                    i as u8 + 1,
+                    "extent {i} data block content recovered"
+                );
+            }
         }
     }
 
