@@ -6,6 +6,15 @@ use crate::block_btree::BLOCK_SIZE;
 use crate::btree::{Error, Result};
 use crate::storage::*;
 
+/// One recovered commit group: the logged-op frames of the group followed by
+/// its closing `CommitEnd` frame (which carries the resulting fs state).
+pub struct CommitGroup {
+    /// `(op_kind, op_payload)` for each LoggedOp frame, in order.
+    pub ops: Vec<(u8, Vec<u8>)>,
+    /// The group's CommitEnd frame (state scalars live here).
+    pub end: JournalFrame,
+}
+
 pub struct Journal {
     file: std::fs::File,
 }
@@ -15,48 +24,91 @@ impl Journal {
         Journal { file }
     }
 
-    pub fn entry_offset(seq: u64) -> u64 {
+    /// Byte offset of the frame slot for a given seq (fixed-size ring).
+    pub fn frame_offset(seq: u64) -> u64 {
         let ring_pos = seq % JOURNAL_CAPACITY;
         let block_index = ring_pos / ENTRIES_PER_BLOCK as u64 + FIRST_JOURNAL_BLOCK;
         let slot_index = ring_pos % ENTRIES_PER_BLOCK as u64;
-        block_index * BLOCK_SIZE as u64 + slot_index * std::mem::size_of::<JournalEntry>() as u64
+        block_index * BLOCK_SIZE as u64 + slot_index * JOURNAL_FRAME_SIZE as u64
     }
 
-    pub fn append(&self, entry: &JournalEntry) -> Result<()> {
-        let offset = Self::entry_offset(entry.seq);
-        self.file.write_all_at(entry.as_bytes(), offset)?;
+    /// Append a single frame at its seq's ring slot. Caller fsyncs.
+    pub fn append(&self, frame: &JournalFrame) -> Result<()> {
+        let offset = Self::frame_offset(frame.seq);
+        self.file.write_all_at(frame.as_bytes(), offset)?;
         Ok(())
     }
 
-    pub fn read_entry(&self, seq: u64) -> Result<Option<JournalEntry>> {
-        let offset = Self::entry_offset(seq);
-        let mut buf = [0u8; std::mem::size_of::<JournalEntry>()];
+    /// Read the frame at `seq`, returning it only if it is valid for that seq.
+    pub fn read_frame(&self, seq: u64) -> Result<Option<JournalFrame>> {
+        let offset = Self::frame_offset(seq);
+        let mut buf = [0u8; JOURNAL_FRAME_SIZE];
         self.file.read_exact_at(&mut buf, offset)?;
-        let entry = JournalEntry::ref_from_bytes(&buf)
-            .map_err(|_| Error::Io(std::io::Error::other("journal entry size mismatch")))?;
-        if entry.is_valid(seq) {
-            Ok(Some(*entry))
+        let frame = JournalFrame::ref_from_bytes(&buf)
+            .map_err(|_| Error::Io(std::io::Error::other("journal frame size mismatch")))?;
+        if frame.is_valid(seq) {
+            Ok(Some(*frame))
         } else {
             Ok(None)
         }
     }
 
-    pub fn scan_from(&self, start_seq: u64) -> Result<Option<JournalEntry>> {
-        let mut last_valid: Option<JournalEntry> = None;
+    /// Scan forward from `start_seq`, returning every *complete* commit group
+    /// (ending in a `CommitEnd`) in order. A trailing run of `LoggedOp` frames
+    /// with no closing `CommitEnd` — a crash mid-commit — is discarded. Scan
+    /// stops at the first invalid/missing frame or after a full ring's worth
+    /// of frames (wraparound bound).
+    pub fn scan_groups(&self, start_seq: u64) -> Result<Vec<CommitGroup>> {
+        let mut groups = Vec::new();
+        let mut pending: Vec<(u8, Vec<u8>)> = Vec::new();
         let mut seq = start_seq;
         loop {
             if seq - start_seq >= JOURNAL_CAPACITY {
                 break;
             }
-            match self.read_entry(seq)? {
-                Some(e) => {
-                    last_valid = Some(e);
-                    seq += 1;
+            let Some(frame) = self.read_frame(seq)? else {
+                break;
+            };
+            match frame.kind() {
+                Some(FrameKind::LoggedOp) => {
+                    pending.push((frame.op_kind, frame.op_payload().to_vec()));
+                }
+                Some(FrameKind::CommitEnd) => {
+                    groups.push(CommitGroup {
+                        ops: std::mem::take(&mut pending),
+                        end: frame,
+                    });
                 }
                 None => break,
             }
+            seq += 1;
         }
-        Ok(last_valid)
+        // `pending` left non-empty = a torn commit at the tail; discard it.
+        Ok(groups)
+    }
+
+    /// The seq one past the last frame of the last complete commit group,
+    /// i.e. where the next append should go. Returns `start_seq` if no
+    /// complete group was found.
+    pub fn next_seq_after_scan(&self, start_seq: u64) -> Result<u64> {
+        let mut seq = start_seq;
+        let mut last_group_end = start_seq;
+        loop {
+            if seq - start_seq >= JOURNAL_CAPACITY {
+                break;
+            }
+            let Some(frame) = self.read_frame(seq)? else {
+                break;
+            };
+            if frame.kind().is_none() {
+                break;
+            }
+            seq += 1;
+            if frame.kind() == Some(FrameKind::CommitEnd) {
+                last_group_end = seq;
+            }
+        }
+        Ok(last_group_end)
     }
 }
 
@@ -65,81 +117,91 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    fn make_entry(seq: u64, root_block: u64) -> JournalEntry {
-        let mut e = JournalEntry {
-            magic: JOURNAL_MAGIC,
-            checksum: 0,
-            seq,
-            root_block,
-            next_block_nr: 100,
-            next_bset_seq: 1,
-            next_ino: 2,
-            next_snap_id: u32::MAX - 1,
-            next_subvol_id: 1,
-            current_subvol: 1,
-            _reserved: [0; 68],
-        };
-        e.checksum = e.compute_checksum();
-        e
+    fn make_journal() -> (NamedTempFile, Journal) {
+        let tmp = NamedTempFile::new().unwrap();
+        tmp.as_file()
+            .set_len((FIRST_JOURNAL_BLOCK + JOURNAL_BLOCKS) * BLOCK_SIZE as u64)
+            .unwrap();
+        let journal = Journal::new(tmp.as_file().try_clone().unwrap());
+        (tmp, journal)
+    }
+
+    fn end_frame(seq: u64, root_block: u64) -> JournalFrame {
+        let mut f = JournalFrame::commit_end(seq, root_block, 100, 1, 2, u32::MAX - 1, 1, 1);
+        f.checksum = f.compute_checksum();
+        f
+    }
+
+    fn op_frame(seq: u64, op_kind: u8, data: &[u8]) -> JournalFrame {
+        let mut f = JournalFrame::logged_op(seq, op_kind, data);
+        f.checksum = f.compute_checksum();
+        f
     }
 
     #[test]
     fn append_and_read_back() {
-        let tmp = NamedTempFile::new().unwrap();
-        // Extend file to cover journal region
-        tmp.as_file()
-            .set_len((FIRST_JOURNAL_BLOCK + JOURNAL_BLOCKS) * BLOCK_SIZE as u64)
-            .unwrap();
-        let journal = Journal::new(tmp.as_file().try_clone().unwrap());
-
-        let e1 = make_entry(1, 65);
-        journal.append(&e1).unwrap();
-
-        let read = journal.read_entry(1).unwrap();
-        assert_eq!(read.unwrap().root_block, 65);
+        let (_tmp, journal) = make_journal();
+        journal.append(&end_frame(1, 65)).unwrap();
+        let read = journal.read_frame(1).unwrap().unwrap();
+        assert_eq!(read.root_block, 65);
+        assert_eq!(read.kind(), Some(FrameKind::CommitEnd));
     }
 
     #[test]
-    fn scan_finds_last_valid() {
-        let tmp = NamedTempFile::new().unwrap();
-        tmp.as_file()
-            .set_len((FIRST_JOURNAL_BLOCK + JOURNAL_BLOCKS) * BLOCK_SIZE as u64)
-            .unwrap();
-        let journal = Journal::new(tmp.as_file().try_clone().unwrap());
+    fn scan_groups_collects_ops_then_end() {
+        let (_tmp, journal) = make_journal();
+        // Group 1: two ops + end.
+        journal.append(&op_frame(1, 3, b"op-a")).unwrap();
+        journal.append(&op_frame(2, 3, b"op-b")).unwrap();
+        journal.append(&end_frame(3, 65)).unwrap();
+        // Group 2: one op + end.
+        journal.append(&op_frame(4, 5, b"op-c")).unwrap();
+        journal.append(&end_frame(5, 70)).unwrap();
 
-        for seq in 1..=5 {
-            journal.append(&make_entry(seq, 60 + seq)).unwrap();
-        }
-        let last = journal.scan_from(1).unwrap().unwrap();
-        assert_eq!(last.seq, 5);
-        assert_eq!(last.root_block, 65);
+        let groups = journal.scan_groups(1).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].ops.len(), 2);
+        assert_eq!(groups[0].ops[0], (3u8, b"op-a".to_vec()));
+        assert_eq!(groups[0].end.root_block, 65);
+        assert_eq!(groups[1].ops.len(), 1);
+        assert_eq!(groups[1].end.root_block, 70);
+        assert_eq!(journal.next_seq_after_scan(1).unwrap(), 6);
     }
 
     #[test]
-    fn scan_returns_none_on_empty() {
-        let tmp = NamedTempFile::new().unwrap();
-        tmp.as_file()
-            .set_len((FIRST_JOURNAL_BLOCK + JOURNAL_BLOCKS) * BLOCK_SIZE as u64)
-            .unwrap();
-        let journal = Journal::new(tmp.as_file().try_clone().unwrap());
+    fn scan_groups_discards_torn_tail() {
+        let (_tmp, journal) = make_journal();
+        // One complete group, then a dangling op with no CommitEnd (crash).
+        journal.append(&op_frame(1, 3, b"op-a")).unwrap();
+        journal.append(&end_frame(2, 65)).unwrap();
+        journal.append(&op_frame(3, 3, b"orphan")).unwrap();
 
-        assert!(journal.scan_from(1).unwrap().is_none());
+        let groups = journal.scan_groups(1).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].end.root_block, 65);
+        // next append resumes after the last *complete* group.
+        assert_eq!(journal.next_seq_after_scan(1).unwrap(), 3);
+    }
+
+    #[test]
+    fn scan_returns_empty_on_empty() {
+        let (_tmp, journal) = make_journal();
+        assert!(journal.scan_groups(1).unwrap().is_empty());
+        assert_eq!(journal.next_seq_after_scan(1).unwrap(), 1);
     }
 
     #[test]
     fn ring_wrap() {
-        let tmp = NamedTempFile::new().unwrap();
-        tmp.as_file()
-            .set_len((FIRST_JOURNAL_BLOCK + JOURNAL_BLOCKS) * BLOCK_SIZE as u64)
-            .unwrap();
-        let journal = Journal::new(tmp.as_file().try_clone().unwrap());
-
-        // Write entries that wrap the ring
+        let (_tmp, journal) = make_journal();
+        // Groups that wrap the ring boundary.
         let start = JOURNAL_CAPACITY - 2;
-        for i in 0..5u64 {
-            journal.append(&make_entry(start + i, 100 + i)).unwrap();
-        }
-        let last = journal.scan_from(start).unwrap().unwrap();
-        assert_eq!(last.seq, start + 4);
+        journal.append(&op_frame(start, 3, b"x")).unwrap();
+        journal.append(&end_frame(start + 1, 101)).unwrap();
+        journal.append(&op_frame(start + 2, 3, b"y")).unwrap();
+        journal.append(&end_frame(start + 3, 102)).unwrap();
+
+        let groups = journal.scan_groups(start).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[1].end.root_block, 102);
     }
 }

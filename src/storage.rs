@@ -33,12 +33,15 @@ use crate::btree::{Error, Result};
 /// Block 0 is always the superblock.
 pub const SUPERBLOCK_BLOCK_NR: u64 = 0;
 
-/// Journal occupies blocks 1..64 (inclusive).
+/// Journal occupies blocks 1..64 (inclusive). Each 4 KB block holds
+/// `ENTRIES_PER_BLOCK` fixed-size 256-byte frames (16 × 256 = 4096, no
+/// padding). A frame is either a logged operation or a commit-end record;
+/// see [`JournalFrame`].
 pub const JOURNAL_MAGIC: u32 = 0x524A_4E4C; // "RJNL"
 pub const JOURNAL_BLOCKS: u64 = 64;
 pub const FIRST_JOURNAL_BLOCK: u64 = 1;
-pub const ENTRIES_PER_BLOCK: usize = 31;
-pub const JOURNAL_CAPACITY: u64 = JOURNAL_BLOCKS * ENTRIES_PER_BLOCK as u64; // 1984
+pub const ENTRIES_PER_BLOCK: usize = 16;
+pub const JOURNAL_CAPACITY: u64 = JOURNAL_BLOCKS * ENTRIES_PER_BLOCK as u64; // 1024
 
 /// First block number that may hold a node or data block. Block 0 is the
 /// superblock, blocks 1..64 are the journal ring buffer.
@@ -47,7 +50,9 @@ pub const FIRST_DATA_BLOCK_NR: u64 = FIRST_JOURNAL_BLOCK + JOURNAL_BLOCKS; // 65
 /// Magic number stamped at the head of the superblock.
 pub const SUPERBLOCK_MAGIC: u32 = 0x5246_5342; // "RFSB"
 /// On-disk format version; bumped on incompatible layout changes.
-pub const SUPERBLOCK_VERSION: u32 = 2;
+/// v3: journal switched from fixed 128-byte state entries to 256-byte
+/// framed records (logged ops + commit-end), see [`JournalFrame`].
+pub const SUPERBLOCK_VERSION: u32 = 3;
 
 /// Superblock — the single source of truth for "where the live tree is".
 ///
@@ -151,19 +156,60 @@ impl Superblock {
     }
 }
 
-/// A single journal entry, written to a journal block. Each block holds
-/// `ENTRIES_PER_BLOCK` (31) entries tightly packed; the block's remaining
-/// 128 bytes are unused padding.
+/// Size of one on-disk journal frame. 16 frames fill a 4 KB block exactly.
+pub const JOURNAL_FRAME_SIZE: usize = 256;
+
+/// Bytes of a frame available for a logged-operation payload, after the
+/// fixed 24-byte header + 48 bytes of commit-end state fields
+/// (24 + 48 + 184 = 256).
+pub const JOURNAL_OP_CAPACITY: usize = 184;
+
+/// What a [`JournalFrame`] carries.
 ///
-/// `magic` and `checksum` guard against torn/partial writes. `seq` is a
-/// monotonically-increasing counter; the replay scanner uses it to find the
-/// highest valid entry.
+/// The journal is a sequence of frames grouped into atomic *commit groups*.
+/// A group is zero or more `LoggedOp` frames followed by exactly one
+/// `CommitEnd` frame. Replay only applies a group once it has seen the
+/// group's `CommitEnd`; a trailing group with no `CommitEnd` (a crash mid
+/// commit) is discarded.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameKind {
+    /// One logged high-level operation; payload in `op_kind` + `op_data`.
+    LoggedOp = 1,
+    /// Closes a commit group and records the resulting fs state scalars.
+    CommitEnd = 2,
+}
+
+impl FrameKind {
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(FrameKind::LoggedOp),
+            2 => Some(FrameKind::CommitEnd),
+            _ => None,
+        }
+    }
+}
+
+/// A single fixed-size journal frame (256 bytes). `magic` + `checksum` guard
+/// against torn writes; `seq` is a monotonically-increasing per-frame counter
+/// the scanner uses to walk the ring and detect wraparound.
+///
+/// Layout: 32-byte header (magic, checksum, seq, frame_kind, op_kind, op_len)
+/// + 48 bytes of commit-end state scalars + `JOURNAL_OP_CAPACITY` op payload.
 #[repr(C)]
 #[derive(KnownLayout, zerocopy::Immutable, IntoBytes, FromBytes, Clone, Copy)]
-pub struct JournalEntry {
+pub struct JournalFrame {
     pub magic: u32,
     pub checksum: u32,
     pub seq: u64,
+    /// `FrameKind` discriminant.
+    pub frame_kind: u8,
+    /// For `LoggedOp`: the logged-operation opcode (see fs.rs). 0 otherwise.
+    pub op_kind: u8,
+    /// For `LoggedOp`: valid byte length of `op_data`. 0 otherwise.
+    pub op_len: u16,
+    _pad0: [u8; 4],
+    // ---- commit-end state (meaningful only when frame_kind == CommitEnd) ----
     pub root_block: u64,
     pub next_block_nr: u64,
     pub next_bset_seq: u64,
@@ -171,23 +217,96 @@ pub struct JournalEntry {
     pub next_snap_id: u32,
     pub next_subvol_id: u32,
     pub current_subvol: u32,
-    pub _reserved: [u8; 68],
+    _pad1: u32,
+    // ---- logged-op payload (meaningful only when frame_kind == LoggedOp) ----
+    pub op_data: [u8; JOURNAL_OP_CAPACITY],
 }
 
-const _: () = assert!(std::mem::size_of::<JournalEntry>() == 128);
+const _: () = assert!(std::mem::size_of::<JournalFrame>() == JOURNAL_FRAME_SIZE);
+const _: () = assert!(JOURNAL_FRAME_SIZE * ENTRIES_PER_BLOCK == BLOCK_SIZE);
 
-impl JournalEntry {
-    /// Compute a CRC32 over the entry with `checksum` treated as zero.
+impl JournalFrame {
+    /// A zeroed frame with magic set and the given seq + kind.
+    fn new(seq: u64, kind: FrameKind) -> Self {
+        JournalFrame {
+            magic: JOURNAL_MAGIC,
+            checksum: 0,
+            seq,
+            frame_kind: kind as u8,
+            op_kind: 0,
+            op_len: 0,
+            _pad0: [0; 4],
+            root_block: 0,
+            next_block_nr: 0,
+            next_bset_seq: 0,
+            next_ino: 0,
+            next_snap_id: 0,
+            next_subvol_id: 0,
+            current_subvol: 0,
+            _pad1: 0,
+            op_data: [0; JOURNAL_OP_CAPACITY],
+        }
+    }
+
+    /// Build a `LoggedOp` frame carrying `op_kind` + `data` (must fit in
+    /// `JOURNAL_OP_CAPACITY`).
+    pub fn logged_op(seq: u64, op_kind: u8, data: &[u8]) -> Self {
+        assert!(
+            data.len() <= JOURNAL_OP_CAPACITY,
+            "logged op payload {} > {JOURNAL_OP_CAPACITY}",
+            data.len()
+        );
+        let mut f = Self::new(seq, FrameKind::LoggedOp);
+        f.op_kind = op_kind;
+        f.op_len = data.len() as u16;
+        f.op_data[..data.len()].copy_from_slice(data);
+        f
+    }
+
+    /// Build a `CommitEnd` frame recording the fs state scalars.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_end(
+        seq: u64,
+        root_block: u64,
+        next_block_nr: u64,
+        next_bset_seq: u64,
+        next_ino: u64,
+        next_snap_id: u32,
+        next_subvol_id: u32,
+        current_subvol: u32,
+    ) -> Self {
+        let mut f = Self::new(seq, FrameKind::CommitEnd);
+        f.root_block = root_block;
+        f.next_block_nr = next_block_nr;
+        f.next_bset_seq = next_bset_seq;
+        f.next_ino = next_ino;
+        f.next_snap_id = next_snap_id;
+        f.next_subvol_id = next_subvol_id;
+        f.current_subvol = current_subvol;
+        f
+    }
+
+    pub fn kind(&self) -> Option<FrameKind> {
+        FrameKind::from_u8(self.frame_kind)
+    }
+
+    /// The logged-op payload slice (only meaningful for `LoggedOp` frames).
+    pub fn op_payload(&self) -> &[u8] {
+        &self.op_data[..self.op_len as usize]
+    }
+
+    /// Compute a CRC32 over the frame with `checksum` treated as zero.
     pub fn compute_checksum(&self) -> u32 {
         let mut copy = *self;
         copy.checksum = 0;
         crc32fast::hash(copy.as_bytes())
     }
 
-    /// Return `true` iff magic, seq, and checksum all pass.
+    /// Return `true` iff magic, seq, kind, and checksum all pass.
     pub fn is_valid(&self, expected_seq: u64) -> bool {
         self.magic == JOURNAL_MAGIC
             && self.seq == expected_seq
+            && self.kind().is_some()
             && self.checksum == self.compute_checksum()
     }
 }
@@ -538,42 +657,31 @@ mod journal_tests {
     use super::*;
 
     #[test]
-    fn journal_entry_crc_roundtrip() {
-        let mut entry = JournalEntry {
-            magic: JOURNAL_MAGIC,
-            checksum: 0,
-            seq: 42,
-            root_block: 100,
-            next_block_nr: 200,
-            next_bset_seq: 10,
-            next_ino: 50,
-            next_snap_id: u32::MAX - 5,
-            next_subvol_id: 3,
-            current_subvol: 1,
-            _reserved: [0; 68],
-        };
-        entry.checksum = entry.compute_checksum();
-        assert!(entry.is_valid(42));
-        assert!(!entry.is_valid(43)); // wrong seq
+    fn commit_end_frame_crc_roundtrip() {
+        let mut f = JournalFrame::commit_end(42, 100, 200, 10, 50, u32::MAX - 5, 3, 1);
+        f.checksum = f.compute_checksum();
+        assert!(f.is_valid(42));
+        assert!(!f.is_valid(43)); // wrong seq
+        assert_eq!(f.kind(), Some(FrameKind::CommitEnd));
+        assert_eq!(f.root_block, 100);
     }
 
     #[test]
-    fn journal_entry_detects_corruption() {
-        let mut entry = JournalEntry {
-            magic: JOURNAL_MAGIC,
-            checksum: 0,
-            seq: 1,
-            root_block: 65,
-            next_block_nr: 66,
-            next_bset_seq: 1,
-            next_ino: 2,
-            next_snap_id: u32::MAX - 1,
-            next_subvol_id: 1,
-            current_subvol: 1,
-            _reserved: [0; 68],
-        };
-        entry.checksum = entry.compute_checksum();
-        entry.root_block = 999; // corrupt
-        assert!(!entry.is_valid(1));
+    fn commit_end_frame_detects_corruption() {
+        let mut f = JournalFrame::commit_end(1, 65, 66, 1, 2, u32::MAX - 1, 1, 1);
+        f.checksum = f.compute_checksum();
+        f.root_block = 999; // corrupt
+        assert!(!f.is_valid(1));
+    }
+
+    #[test]
+    fn logged_op_frame_roundtrip() {
+        let payload = b"unlink:parent=5,name=foo";
+        let mut f = JournalFrame::logged_op(7, 3, payload);
+        f.checksum = f.compute_checksum();
+        assert!(f.is_valid(7));
+        assert_eq!(f.kind(), Some(FrameKind::LoggedOp));
+        assert_eq!(f.op_kind, 3);
+        assert_eq!(f.op_payload(), payload);
     }
 }

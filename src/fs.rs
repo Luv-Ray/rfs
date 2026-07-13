@@ -268,6 +268,10 @@ pub struct Fs {
     /// The journal_seq last written to the superblock (checkpoint). Used to
     /// detect ring-near-full and force a checkpoint before wraparound.
     last_checkpoint_seq: u64,
+    /// Logged operations buffered since the last `journal_commit`. Flushed as
+    /// one atomic commit group (ops + CommitEnd) on the next commit. Empty in
+    /// Step A (nothing records into it yet).
+    pending_ops: Vec<(u8, Vec<u8>)>,
 }
 
 impl Fs {
@@ -309,7 +313,12 @@ impl Fs {
         let sb = store.read_superblock()?;
 
         let journal = crate::journal::Journal::new(store.try_clone_file()?);
-        let recovered = journal.scan_from(sb.journal_seq + 1)?;
+        // Scan complete commit groups after the last checkpoint. Step A:
+        // recovery adopts the state recorded in the last group's CommitEnd
+        // frame (equivalent to the old "adopt last entry" behaviour); the
+        // logged ops in each group are not yet replayed.
+        let groups = journal.scan_groups(sb.journal_seq + 1)?;
+        let next_journal_seq = journal.next_seq_after_scan(sb.journal_seq + 1)?;
 
         let (
             root_block,
@@ -319,17 +328,16 @@ impl Fs {
             next_snap_id,
             next_subvol_id,
             current_subvol,
-            next_journal_seq,
-        ) = if let Some(ref entry) = recovered {
+        ) = if let Some(group) = groups.last() {
+            let e = &group.end;
             (
-                entry.root_block,
-                entry.next_block_nr,
-                entry.next_bset_seq,
-                entry.next_ino,
-                entry.next_snap_id,
-                entry.next_subvol_id,
-                entry.current_subvol,
-                entry.seq + 1,
+                e.root_block,
+                e.next_block_nr,
+                e.next_bset_seq,
+                e.next_ino,
+                e.next_snap_id,
+                e.next_subvol_id,
+                e.current_subvol,
             )
         } else {
             (
@@ -340,7 +348,6 @@ impl Fs {
                 sb.next_snap_id,
                 sb.next_subvol_id,
                 sb.current_subvol,
-                sb.journal_seq + 1,
             )
         };
 
@@ -356,6 +363,7 @@ impl Fs {
             journal: Some(journal),
             next_journal_seq,
             last_checkpoint_seq: sb.journal_seq,
+            pending_ops: Vec::new(),
         })
     }
 
@@ -380,23 +388,32 @@ impl Fs {
             self.sync()?;
         }
 
+        let journal = self.journal.as_ref().unwrap();
+        // Emit one commit group: any buffered logged ops, then a CommitEnd
+        // frame recording the resulting state. (Step A: the op buffer is not
+        // yet populated, so this is just the CommitEnd — behaviourally the
+        // same fixed state checkpoint as before, in the new frame format.)
+        for (op_kind, data) in std::mem::take(&mut self.pending_ops) {
+            let seq = self.next_journal_seq;
+            self.next_journal_seq += 1;
+            let mut frame = crate::storage::JournalFrame::logged_op(seq, op_kind, &data);
+            frame.checksum = frame.compute_checksum();
+            journal.append(&frame)?;
+        }
         let seq = self.next_journal_seq;
         self.next_journal_seq += 1;
-        let mut entry = crate::storage::JournalEntry {
-            magic: crate::storage::JOURNAL_MAGIC,
-            checksum: 0,
+        let mut end = crate::storage::JournalFrame::commit_end(
             seq,
-            root_block: self.tree.root_block,
-            next_block_nr: self.store.next_block_nr(),
-            next_bset_seq: self.tree.next_bset_seq(),
-            next_ino: self.next_ino,
-            next_snap_id: self.next_snap_id,
-            next_subvol_id: self.next_subvol_id,
-            current_subvol: self.current_subvol,
-            _reserved: [0; 68],
-        };
-        entry.checksum = entry.compute_checksum();
-        self.journal.as_ref().unwrap().append(&entry)?;
+            self.tree.root_block,
+            self.store.next_block_nr(),
+            self.tree.next_bset_seq(),
+            self.next_ino,
+            self.next_snap_id,
+            self.next_subvol_id,
+            self.current_subvol,
+        );
+        end.checksum = end.compute_checksum();
+        journal.append(&end)?;
         self.store.fsync()?;
         Ok(())
     }
@@ -444,6 +461,7 @@ impl Fs {
             journal: None,
             next_journal_seq: 0,
             last_checkpoint_seq: 0,
+            pending_ops: Vec::new(),
         };
         // Seed the snapshot tree with the root snapshot. parent=NO_PARENT_SNAP
         // marks it as the top of its tree. Stored under snap=ROOT_SNAP itself
@@ -2042,25 +2060,14 @@ mod tests {
             // stomp the journal entry for seq 2 with a bad CRC).
             fs.put_inode(3, &sample_inode(22)).unwrap();
 
-            // Build a corrupt journal entry at seq 2.
-            let bad_entry = crate::storage::JournalEntry {
-                magic: crate::storage::JOURNAL_MAGIC,
-                checksum: 0xDEAD_BEEF, // deliberately wrong CRC
-                seq: 2,
-                root_block: 999,
-                next_block_nr: 999,
-                next_bset_seq: 999,
-                next_ino: 999,
-                next_snap_id: 0,
-                next_subvol_id: 0,
-                current_subvol: 0,
-                _reserved: [0; 68],
-            };
+            // Build a corrupt journal frame at seq 2.
+            let mut bad = crate::storage::JournalFrame::commit_end(2, 999, 999, 999, 999, 0, 0, 0);
+            bad.checksum = 0xDEAD_BEEF; // deliberately wrong CRC
             use std::os::unix::fs::FileExt;
             use zerocopy::IntoBytes;
             let file = fs.store.try_clone_file().unwrap();
-            let offset = crate::journal::Journal::entry_offset(2);
-            file.write_all_at(bad_entry.as_bytes(), offset).unwrap();
+            let offset = crate::journal::Journal::frame_offset(2);
+            file.write_all_at(bad.as_bytes(), offset).unwrap();
             // Drop without sync — superblock still reflects the initial sync
             // from create(). The journal has seq 1 valid + seq 2 corrupt.
         }
@@ -2086,9 +2093,10 @@ mod tests {
 
         {
             let mut fs = Fs::create(&img.0).unwrap();
-            // Commit enough journal entries to trigger the ring-full guard.
-            // Threshold is JOURNAL_CAPACITY - 64 = 1920.
-            for _ in 0..1925 {
+            // Commit enough journal groups to trigger the ring-full guard.
+            // Threshold is JOURNAL_CAPACITY - 64 = 960 (each commit here is a
+            // single CommitEnd frame, so one group == one seq).
+            for _ in 0..965 {
                 fs.put_inode(2, &sample_inode(0)).unwrap();
                 fs.journal_commit().unwrap();
             }
