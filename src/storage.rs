@@ -372,6 +372,11 @@ pub struct BlockStore {
     data_cache: RwLock<HashMap<u64, Box<DataBlock>>>,
     next_block_nr: AtomicU64,
     backing: Backing,
+    /// Test-only counter of node persists (`write_node` calls). Used to assert
+    /// that in-place append collapses many hot-leaf writes into a handful of
+    /// node persists per checkpoint instead of one COW rewrite per op.
+    #[cfg(test)]
+    node_writes: AtomicU64,
 }
 
 impl BlockStore {
@@ -383,6 +388,8 @@ impl BlockStore {
             data_cache: RwLock::new(HashMap::new()),
             next_block_nr: AtomicU64::new(FIRST_DATA_BLOCK_NR),
             backing: Backing::Memory,
+            #[cfg(test)]
+            node_writes: AtomicU64::new(0),
         }
     }
 
@@ -399,6 +406,8 @@ impl BlockStore {
             data_cache: RwLock::new(HashMap::new()),
             next_block_nr: AtomicU64::new(FIRST_DATA_BLOCK_NR),
             backing: Backing::Image { file },
+            #[cfg(test)]
+            node_writes: AtomicU64::new(0),
         })
     }
 
@@ -411,6 +420,8 @@ impl BlockStore {
             data_cache: RwLock::new(HashMap::new()),
             next_block_nr: AtomicU64::new(FIRST_DATA_BLOCK_NR),
             backing: Backing::Image { file },
+            #[cfg(test)]
+            node_writes: AtomicU64::new(0),
         })
     }
 
@@ -489,12 +500,89 @@ impl BlockStore {
         self.with_node(nr, |n| Box::new(n.clone()))
     }
 
+    /// Mutate a cached btree node in place, marking it dirty. **Does not
+    /// pwrite** — the change lives only in the cache until the next
+    /// `checkpoint_flush` / `flush_all`. This is the write-back entry point
+    /// that backs bcachefs-style in-place bset append: between two
+    /// checkpoints, a hot leaf is appended to at a stable `block_nr` without
+    /// COWing the root→leaf path.
+    ///
+    /// Same locking discipline as `with_node`: the write lock is held only for
+    /// the duration of `f`. Do NOT call another `with_node*` from within `f`
+    /// (it would re-enter the lock and deadlock).
+    ///
+    /// On a cache miss with an image backing, the node is faulted in from disk
+    /// (magic + CRC verified) before `f` runs, so an in-place edit of a node
+    /// that was flushed in a prior checkpoint works transparently.
+    ///
+    /// Safety of "dirty but not persisted": between checkpoints the on-disk
+    /// bytes of a node are never read by recovery — `Fs::open` reopens at the
+    /// last checkpoint root and replays the WAL forward — so a node that is
+    /// dirty-in-cache-only is fully covered by its journal frames.
+    pub fn with_node_mut<R>(&self, nr: u64, f: impl FnOnce(&mut BtreeNodeRaw) -> R) -> Result<R> {
+        // Fast path: already cached — take the write lock and mutate.
+        {
+            let mut cache = self.node_cache.write().unwrap();
+            if let Some(c) = cache.get_mut(&nr) {
+                let r = f(&mut c.node);
+                c.dirty = true;
+                return Ok(r);
+            }
+        }
+        // Miss: fault in (image only), publish, then mutate under the lock.
+        match &self.backing {
+            Backing::Memory => Err(Error::BlockNotFound(nr)),
+            Backing::Image { file } => {
+                let mut node = unsafe {
+                    // SAFETY: see `with_node` — POD FromBytes type, zeroed +
+                    // aligned by new_zeroed, fully overwritten by read_exact_at.
+                    Box::<BtreeNodeRaw>::new_zeroed().assume_init()
+                };
+                file.read_exact_at(node.as_mut_bytes(), nr * BLOCK_SIZE as u64)?;
+                verify_node_in_place(nr, &node)?;
+                let mut cache = self.node_cache.write().unwrap();
+                let entry = cache.entry(nr).or_insert_with(|| {
+                    Box::new(CachedNode {
+                        node: *node,
+                        dirty: false,
+                    })
+                });
+                let r = f(&mut entry.node);
+                entry.dirty = true;
+                Ok(r)
+            }
+        }
+    }
+
+    /// Peek a node **only if it is already cached**, running `f(node, dirty)`.
+    /// Returns `None` without faulting anything in when the block is not
+    /// resident. `checkpoint_flush` uses this to walk exactly the subtree that
+    /// was touched this interval: a child absent from cache was never read or
+    /// written since the last checkpoint, so its on-disk subtree is clean and
+    /// can be kept as-is without reading it.
+    ///
+    /// Correctness relies on: (a) dirty nodes are never evicted, and (b) an
+    /// in-place edit leaves the whole root→leaf path resident (the descent
+    /// faulted every ancestor in). Both hold today (unbounded cache). A future
+    /// bounded/LRU cache must preserve them (flush-before-evict, and never
+    /// evict a node with a dirty descendant).
+    pub fn with_cached_node<R>(
+        &self,
+        nr: u64,
+        f: impl FnOnce(&BtreeNodeRaw, bool) -> R,
+    ) -> Option<R> {
+        let cache = self.node_cache.read().unwrap();
+        cache.get(&nr).map(|c| f(&c.node, c.dirty))
+    }
+
     /// Write a btree node, stamping CRC into its header before persisting.
     ///
     /// Write-through: the block is pwritten immediately (image backing) and
     /// the cache entry is marked clean. The `dirty` bookkeeping is in place
     /// for the future write-back step.
     pub fn write_node(&self, nr: u64, node: &BtreeNodeRaw) -> Result<()> {
+        #[cfg(test)]
+        self.node_writes.fetch_add(1, Ordering::Relaxed);
         let mut copy = node.clone();
         copy.header.checksum = 0;
         let crc = crc32fast::hash(copy.as_bytes()) as u64;
@@ -510,6 +598,12 @@ impl BlockStore {
             }),
         );
         Ok(())
+    }
+
+    /// Test-only: number of `write_node` persists so far.
+    #[cfg(test)]
+    pub fn node_writes(&self) -> u64 {
+        self.node_writes.load(Ordering::Relaxed)
     }
 
     /// Flush a single dirty node to disk (CRC stamped, then pwrite). No-op if

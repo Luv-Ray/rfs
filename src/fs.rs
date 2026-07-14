@@ -462,10 +462,15 @@ impl Fs {
     /// Records `journal_seq` so that on next open, replay starts after this
     /// checkpoint. Called on `close` and any explicit `Fs::sync` call.
     pub fn sync(&mut self) -> Result<()> {
-        // First flush data blocks + node blocks already written via
-        // BlockStore (their pwrite is done at write time, but we want the
-        // kernel to push them to the device before we publish the new
-        // superblock).
+        // Relocate every node mutated in place since the last checkpoint onto
+        // fresh blocks and adopt the new root. This is the point at which the
+        // interval's in-place bset appends become durable. It only ever writes
+        // freshly-allocated blocks, so the previous checkpoint stays intact
+        // until the superblock swap below.
+        self.tree.checkpoint()?;
+        // Flush data blocks + node blocks already written via BlockStore
+        // (their pwrite is done at write time, but we want the kernel to push
+        // them to the device before we publish the new superblock).
         self.store.fsync()?;
         let journal_seq = self.next_journal_seq.saturating_sub(1);
         let sb = crate::storage::Superblock {
@@ -2222,6 +2227,48 @@ mod tests {
                     block[0],
                     i as u8 + 1,
                     "extent {i} data block content recovered"
+                );
+            }
+        }
+    }
+
+    /// In-place append changes what hits disk between checkpoints (nothing:
+    /// hot nodes are dirty-in-cache only). This exercises the full interplay:
+    /// write + checkpoint (relocates dirty nodes to fresh blocks + superblock
+    /// swap), then MORE writes that are journaled but NOT checkpointed, then a
+    /// crash. Recovery must reopen at the checkpoint root and replay the second
+    /// batch — the values from both batches must be exactly right.
+    #[test]
+    fn journal_inplace_writes_across_checkpoint_recover() {
+        let img = tmp_image_path("jnl-inplace-ckpt");
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            make_root(&mut fs);
+            // Batch 1: create inodes 2..10 (size = ino), then sync (checkpoint:
+            // relocate dirty nodes + superblock swap makes this durable).
+            for ino in 2..10u64 {
+                fs.put_inode(ino, &sample_inode(ino)).unwrap();
+            }
+            fs.sync().unwrap();
+
+            // Batch 2: overwrite the SAME inodes in place (size = ino + 100),
+            // journal them, but do NOT sync. These live only in cache + journal.
+            for ino in 2..10u64 {
+                fs.put_inode(ino, &sample_inode(ino + 100)).unwrap();
+            }
+            fs.journal_commit().unwrap();
+            // Crash: no second sync.
+        }
+        {
+            let fs = Fs::open(&img.0).unwrap();
+            // Every inode must show the batch-2 (replayed) value, proving the
+            // checkpoint root + WAL replay compose correctly.
+            for ino in 2..10u64 {
+                let inode = fs.get_inode(ino).unwrap().expect("inode recovered");
+                assert_eq!(
+                    inode.size,
+                    ino + 100,
+                    "inode {ino} must show the journaled batch-2 value after replay"
                 );
             }
         }

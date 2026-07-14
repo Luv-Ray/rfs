@@ -166,6 +166,19 @@ impl Btree {
         std::mem::take(&mut self.log)
     }
 
+    /// Flush all in-place (dirty) edits made since the last checkpoint onto
+    /// fresh blocks and update `root_block` to the relocated root. Every write
+    /// targets a freshly-allocated block, so the previous on-disk checkpoint is
+    /// left intact until the caller publishes the new root (superblock swap).
+    ///
+    /// Called by `Fs::sync`. Idempotent when nothing is dirty: with no dirty
+    /// nodes the walk keeps every block_nr and `root_block` is unchanged.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        let new_root = checkpoint_flush(&self.store, self.root_block)?;
+        self.root_block = new_root;
+        Ok(())
+    }
+
     /// Current number of buffered log records (for transaction rollback).
     fn log_len(&self) -> usize {
         self.log.len()
@@ -230,6 +243,7 @@ impl Btree {
             &buf[..len],
             value,
             kind,
+            WriteMode::InPlace,
         )?;
         self.root_block = new_root;
         if self.logging {
@@ -269,6 +283,7 @@ impl Btree {
                 self.root_block,
                 &buf[..len],
                 EntryKind::Deleted,
+                WriteMode::InPlace,
             )?;
             self.root_block = new_root;
             if self.logging {
@@ -485,6 +500,7 @@ impl<'a> Tx<'a> {
             &buf[..len],
             value,
             kind,
+            WriteMode::Cow,
         )?;
         self.pending_root = new_root;
         if self.btree.logging {
@@ -510,6 +526,7 @@ impl<'a> Tx<'a> {
                 self.pending_root,
                 &buf[..len],
                 EntryKind::Deleted,
+                WriteMode::Cow,
             )?;
             self.pending_root = new_root;
             if self.btree.logging {
@@ -846,6 +863,22 @@ fn build_leaf_entry(sortable_key: &[u8], kind: EntryKind, value: &[u8]) -> DiskE
 
 // ---------- Recursive operations ----------
 
+/// How a leaf write lands on its target node.
+///
+/// - `InPlace`: mutate the cached leaf at a stable `block_nr` (the hot,
+///   non-transactional path). Ancestors keep their child pointers, the root
+///   is unchanged, and the dirty node is relocated later by `checkpoint_flush`.
+/// - `Cow`: clone the leaf onto a fresh block (classic copy-on-write). Used
+///   inside transactions so an aborted transaction leaves the original tree
+///   untouched, and in-transaction reads at `pending_root` see prior writes.
+///
+/// A split always allocates fresh blocks regardless of mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    InPlace,
+    Cow,
+}
+
 fn find(store: &BlockStore, block_nr: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
     Ok(
         find_raw(store, block_nr, key)?.and_then(|(value, kind)| match kind {
@@ -942,38 +975,83 @@ fn flip_kind_in_place(
     block_nr: u64,
     sortable_key: &[u8],
     new_kind: EntryKind,
+    mode: WriteMode,
 ) -> Result<u64> {
-    let old_node = store.with_node(block_nr, clone_to_heap)?;
-    let new_block = store.alloc();
-    let mut new_node = old_node;
-    if new_node.level() == 0 {
-        // Find the entry with the highest seq among bsets that contain
-        // sortable_key; that's the one merged_find would surface.
+    // Locate the highest-seq copy of the key in a leaf (that's the one
+    // merged_find surfaces) and set its kind. Shared by both modes.
+    let flip = |leaf: &mut BtreeNodeRaw| {
         let mut best: Option<(usize, usize, u64)> = None;
-        for b in 0..new_node.bset_count() {
-            if let Ok(idx) = new_node.bset_search(b, sortable_key) {
-                let seq = new_node.bset_header(b).seq;
+        for b in 0..leaf.bset_count() {
+            if let Ok(idx) = leaf.bset_search(b, sortable_key) {
+                let seq = leaf.bset_header(b).seq;
                 if best.is_none_or(|(_, _, s)| seq > s) {
                     best = Some((b, idx, seq));
                 }
             }
         }
         let (b, i, _) = best.expect("flip_kind_in_place: key not found in leaf");
-        new_node.entry_at_mut(b, i).set_kind(new_kind);
-    } else {
-        let child_idx = match new_node.search(sortable_key) {
+        leaf.entry_at_mut(b, i).set_kind(new_kind);
+    };
+
+    let level = store.with_node(block_nr, |n| n.level())?;
+    if level == 0 {
+        return match mode {
+            // nkeys and block_nr unchanged, so no ancestor pointer changes.
+            WriteMode::InPlace => {
+                store.with_node_mut(block_nr, flip)?;
+                Ok(block_nr)
+            }
+            // Clone onto a fresh block; caller COWs the path upward.
+            WriteMode::Cow => {
+                let new_block = store.alloc();
+                let mut new_node = store.with_node(block_nr, clone_to_heap)?;
+                flip(&mut new_node);
+                store.write_node(new_block, &new_node)?;
+                Ok(new_block)
+            }
+        };
+    }
+    // Internal: descend to the child that holds the key.
+    let (child_idx, child_nr) = store.with_node(block_nr, |node| {
+        let idx = match node.search(sortable_key) {
             Ok(i) => i + 1,
             Err(i) => i,
         };
-        let child_nr = new_node.child_block(child_idx);
-        let new_child = flip_kind_in_place(store, child_nr, sortable_key, new_kind)?;
-        new_node.set_child_block(child_idx, new_child);
+        (idx, node.child_block(idx))
+    })?;
+    let new_child = flip_kind_in_place(store, child_nr, sortable_key, new_kind, mode)?;
+    match mode {
+        WriteMode::InPlace => {
+            debug_assert_eq!(
+                new_child, child_nr,
+                "InPlace flip must not move the child block"
+            );
+            Ok(block_nr)
+        }
+        WriteMode::Cow => {
+            // Child was COWed to a fresh block; patch our pointer onto a fresh
+            // block too, propagating the copy up to the root.
+            let new_block = store.alloc();
+            let mut new_node = store.with_node(block_nr, clone_to_heap)?;
+            new_node.set_child_block(child_idx, new_child);
+            store.write_node(new_block, &new_node)?;
+            Ok(new_block)
+        }
     }
-    store.write_node(new_block, &new_node)?;
-    Ok(new_block)
 }
 
-/// COW insert — returns the block number of the (possibly new) root.
+/// Insert an entry, returning the block number of the (possibly new) root of
+/// the subtree.
+///
+/// Between checkpoints this is **not** COW for the common case: a write that
+/// the target leaf can absorb (overwrite, append into a bset, open a new bset,
+/// or compact-when-full) is applied **in place** via `with_node_mut`, leaving
+/// the leaf's `block_nr` — and therefore every ancestor's child pointer, and
+/// the root — unchanged. Only a **split** (leaf/internal at capacity) still
+/// allocates fresh blocks and COWs the path from the split point up to the
+/// root. The still-dirty in-place nodes are relocated to fresh blocks later,
+/// in one batch, by [`checkpoint_flush`]. See docs/in-place-append-plan.md.
+///
 /// `kind` is the entry kind (Live for normal inserts, Deleted/Whiteout for
 /// tombstones). On a found-key path the existing entry's kind is replaced.
 fn insert(
@@ -983,122 +1061,150 @@ fn insert(
     key: &[u8],
     value: &[u8],
     kind: EntryKind,
+    mode: WriteMode,
 ) -> Result<u64> {
-    // COW: clone before mutating so the original block stays intact.
-    let old_node = store.with_node(block_nr, clone_to_heap)?;
-    if old_node.level() == 0 {
-        insert_leaf(store, next_bset_seq, &old_node, key, value, kind)
+    let level = store.with_node(block_nr, |n| n.level())?;
+    if level == 0 {
+        insert_leaf(store, next_bset_seq, block_nr, key, value, kind, mode)
     } else {
-        insert_internal(store, next_bset_seq, &old_node, key, value, kind)
+        insert_internal(store, next_bset_seq, block_nr, key, value, kind, mode)
     }
 }
 
 fn insert_leaf(
     store: &BlockStore,
     next_bset_seq: &mut u64,
-    old_node: &BtreeNodeRaw,
+    block_nr: u64,
     key: &[u8],
     value: &[u8],
     kind: EntryKind,
+    mode: WriteMode,
 ) -> Result<u64> {
-    // Determine whether the write absorbs in place (overwrite of a key
-    // already living in the latest bset → sort_insert returns Ok, no
-    // growth) or grows the node by one entry (Err path of sort_insert).
-    let absorbs_in_place = if old_node.bset_count() == 0 {
-        false
-    } else {
-        let last = old_node.bset_count() - 1;
-        old_node.bset_search(last, key).is_ok()
+    // Peek (read-lock only) to decide the shape of the write:
+    // - `absorbs_in_place`: the key already lives in the latest bset, so the
+    //   write is a pure overwrite (no growth, no new bset).
+    // - otherwise, if the leaf is already at capacity, we must split.
+    // Splitting needs the whole node cloned out; the in-place cases don't.
+    enum Plan {
+        InPlace { absorbs: bool },
+        Split(Box<BtreeNodeRaw>),
+    }
+    let plan = store.with_node(block_nr, |node| {
+        let absorbs = if node.bset_count() == 0 {
+            false
+        } else {
+            let last = node.bset_count() - 1;
+            node.bset_search(last, key).is_ok()
+        };
+        if !absorbs && node.nkeys() >= MAX_ENTRIES {
+            Plan::Split(clone_to_heap(node))
+        } else {
+            Plan::InPlace { absorbs }
+        }
+    })?;
+
+    // A closure that applies the write (overwrite-in-latest-bset, or
+    // ensure-writable + sort-insert) to a leaf node in memory. Shared by both
+    // the in-place and COW application paths.
+    let apply = |leaf: &mut BtreeNodeRaw, absorbs: bool, next_bset_seq: &mut u64| {
+        if absorbs {
+            let last_idx = leaf.bset_count() - 1;
+            let entry_idx = leaf
+                .bset_search(last_idx, key)
+                .expect("absorbs implies present in last bset");
+            *leaf.entry_at_mut(last_idx, entry_idx) = build_leaf_entry(key, kind, value);
+        } else {
+            ensure_writable_last_bset(leaf, next_bset_seq);
+            let entry = build_leaf_entry(key, kind, value);
+            // Return value (overwrite vs new slot) is irrelevant: the entry is
+            // written either way.
+            let _ = leaf.sort_insert_into_last_bset(&entry);
+        }
     };
 
-    // Leaf at capacity AND the write would grow it — split first, then
-    // recurse to insert into the correct half. The split internally
-    // compacts a multi-bset source so the resulting halves are clean
-    // single-bset nodes (which the merged read-path also handles trivially).
-    if !absorbs_in_place && old_node.nkeys() >= MAX_ENTRIES {
-        let (mut root_box, root_nr, left_block, right_block) =
-            split_leaf_node(store, next_bset_seq, old_node)?;
-        root_box.set_child_block(0, left_block);
-        root_box.set_child_block(1, right_block);
+    let old_node = match plan {
+        Plan::InPlace { absorbs } => match mode {
+            // Hot path: mutate the cached leaf and keep its block_nr. The node
+            // is dirty; checkpoint_flush relocates it to a fresh block later.
+            WriteMode::InPlace => {
+                store.with_node_mut(block_nr, |leaf| apply(leaf, absorbs, next_bset_seq))?;
+                return Ok(block_nr);
+            }
+            // Transaction path: clone onto a fresh block so the original stays
+            // intact for abort / in-transaction reads at the old root.
+            WriteMode::Cow => {
+                let new_block = store.alloc();
+                let mut new_node = store.with_node(block_nr, clone_to_heap)?;
+                apply(&mut new_node, absorbs, next_bset_seq);
+                store.write_node(new_block, &new_node)?;
+                return Ok(new_block);
+            }
+        },
+        Plan::Split(node) => node,
+    };
 
-        // Decide which half the key should be inserted into based on the
-        // separator (which root_box already knows about).
-        let child_idx = match root_box.search(key) {
-            Ok(i) => i + 1,
-            Err(i) => i,
-        };
-        let child_nr = root_box.child_block(child_idx);
-        let child_level = store.with_node(child_nr, |n| n.level())?;
-        let new_child_nr = insert(store, next_bset_seq, child_nr, key, value, kind)?;
+    // Split path (rare): allocate fresh blocks and COW upward. The split
+    // internally compacts a multi-bset source so the resulting halves are
+    // clean single-bset nodes. New blocks always have block_nr above every
+    // block referenced by the last on-disk checkpoint, so writing them
+    // through never overwrites committed state.
+    let (mut root_box, root_nr, left_block, right_block) =
+        split_leaf_node(store, next_bset_seq, &old_node)?;
+    root_box.set_child_block(0, left_block);
+    root_box.set_child_block(1, right_block);
 
-        let new_child_level = store.with_node(new_child_nr, |n| n.level())?;
-        if new_child_level > child_level {
-            // Child itself split — promote its median to the (still
-            // unwritten) parent. promote_to_parent will write a fresh
-            // parent (possibly cascade-splitting it) and return its nr.
-            let (median_key, left, right) = store.with_node(new_child_nr, |new_child| {
-                (
-                    new_child.entry(0).key_bytes().to_vec(),
-                    new_child.child_block(0),
-                    new_child.child_block(1),
-                )
-            })?;
-            // root_box at this point still has the original child[child_idx]
-            // pointer (left/right_block from the leaf split); promote builds
-            // a brand-new parent node, so we can drop root_nr — it was
-            // allocated speculatively but never written.
-            let _ = root_nr; // intentionally leaked: orphaned alloc, no GC v1
-            return promote_to_parent(store, &root_box, child_idx, &median_key, left, right);
-        }
+    // Decide which half the key should be inserted into based on the
+    // separator (which root_box already knows about).
+    let child_idx = match root_box.search(key) {
+        Ok(i) => i + 1,
+        Err(i) => i,
+    };
+    let child_nr = root_box.child_block(child_idx);
+    let child_level = store.with_node(child_nr, |n| n.level())?;
+    let new_child_nr = insert(store, next_bset_seq, child_nr, key, value, kind, mode)?;
 
-        // No cascade split: finalize root_box by pointing the child slot
-        // at the (possibly COW-replaced) child and commit to store.
-        root_box.set_child_block(child_idx, new_child_nr);
-        store.write_node(root_nr, &root_box)?;
-        return Ok(root_nr);
+    let new_child_level = store.with_node(new_child_nr, |n| n.level())?;
+    if new_child_level > child_level {
+        // Child itself split — promote its median to the (still unwritten)
+        // parent. promote_to_parent will write a fresh parent (possibly
+        // cascade-splitting it) and return its nr.
+        let (median_key, left, right) = store.with_node(new_child_nr, |new_child| {
+            (
+                new_child.entry(0).key_bytes().to_vec(),
+                new_child.child_block(0),
+                new_child.child_block(1),
+            )
+        })?;
+        let _ = root_nr; // intentionally leaked: orphaned alloc, no GC v1
+        return promote_to_parent(store, &root_box, child_idx, &median_key, left, right);
     }
 
-    // Normal path: COW the node. If the key already lives in the latest
-    // bset (`absorbs_in_place`), patch that entry directly so we don't
-    // grow the node (and don't disturb that "latest bset" invariant by
-    // opening a new bset). Otherwise ensure the latest bset is writable
-    // (open new bset or compact as needed) and sort-insert.
-    let new_block = store.alloc();
-    let mut new_node = clone_to_heap(old_node);
-    if absorbs_in_place {
-        let last_idx = new_node.bset_count() - 1;
-        let entry_idx = new_node
-            .bset_search(last_idx, key)
-            .expect("absorbs_in_place implies present in last bset");
-        let entry = build_leaf_entry(key, kind, value);
-        *new_node.entry_at_mut(last_idx, entry_idx) = entry;
-    } else {
-        ensure_writable_last_bset(&mut new_node, next_bset_seq);
-        let entry = build_leaf_entry(key, kind, value);
-        // The result distinguishes overwrite-in-place vs new-entry but
-        // we don't need it: the entry has been written either way.
-        let _ = new_node.sort_insert_into_last_bset(&entry);
-    }
-    store.write_node(new_block, &new_node)?;
-    Ok(new_block)
+    // No cascade split: finalize root_box by pointing the child slot at the
+    // (possibly COW-replaced) child and commit to store.
+    root_box.set_child_block(child_idx, new_child_nr);
+    store.write_node(root_nr, &root_box)?;
+    Ok(root_nr)
 }
 
 fn insert_internal(
     store: &BlockStore,
     next_bset_seq: &mut u64,
-    old_node: &BtreeNodeRaw,
+    block_nr: u64,
     key: &[u8],
     value: &[u8],
     kind: EntryKind,
+    mode: WriteMode,
 ) -> Result<u64> {
-    let child_idx = match old_node.search(key) {
-        Ok(i) => i + 1,
-        Err(i) => i,
-    };
-    let child_nr = old_node.child_block(child_idx);
+    let (child_idx, child_nr) = store.with_node(block_nr, |node| {
+        let idx = match node.search(key) {
+            Ok(i) => i + 1,
+            Err(i) => i,
+        };
+        (idx, node.child_block(idx))
+    })?;
     let child_level = store.with_node(child_nr, |n| n.level())?;
 
-    let new_child_nr = insert(store, next_bset_seq, child_nr, key, value, kind)?;
+    let new_child_nr = insert(store, next_bset_seq, child_nr, key, value, kind, mode)?;
 
     // Child split and grew a level — promote its median key to this level.
     let new_child_level = store.with_node(new_child_nr, |n| n.level())?;
@@ -1110,14 +1216,26 @@ fn insert_internal(
                 new_child.child_block(1),
             )
         })?;
-        // promote_to_parent sets all child pointers internally; we must NOT
-        // touch the returned block afterward — child_idx is only valid against
-        // the old parent, not a potential new root from a cascading split.
-        return promote_to_parent(store, old_node, child_idx, &median_key, left, right);
+        // promote_to_parent builds a fresh parent; child_idx is only valid
+        // against the old parent, so we must not touch the result afterward.
+        // Clone the node out from under the lock first — promote_to_parent
+        // re-enters the store (alloc / write_node), which would deadlock if
+        // called inside a with_node closure.
+        let old_node = store.with_node(block_nr, clone_to_heap)?;
+        return promote_to_parent(store, &old_node, child_idx, &median_key, left, right);
     }
 
+    // Common case: the child was mutated in place, so its block_nr did not
+    // change — the parent's pointer is still correct and the parent needs no
+    // rewrite. Return our own block_nr unchanged (no COW, no alloc).
+    if new_child_nr == child_nr {
+        return Ok(block_nr);
+    }
+
+    // The child moved (it was COWed — e.g. a grandchild split forced it to a
+    // fresh block). Patch our pointer, COWing this node onto a fresh block.
     let new_block = store.alloc();
-    let mut new_node = clone_to_heap(old_node);
+    let mut new_node = store.with_node(block_nr, clone_to_heap)?;
     new_node.set_child_block(child_idx, new_child_nr);
     store.write_node(new_block, &new_node)?;
     Ok(new_block)
@@ -1276,6 +1394,72 @@ fn promote_to_parent(
         store.write_node(root_nr, &root_box)?;
         Ok(root_nr)
     }
+}
+
+// ---------- Checkpoint flush ----------
+
+/// Post-order COW-relocate of every dirty node reachable from `block_nr` onto
+/// fresh blocks, persisting them via write-through. Returns the (possibly new)
+/// block number of this subtree's root.
+///
+/// This is how in-place edits made between checkpoints become durable. During
+/// the interval, hot leaves are mutated in place at a stable block_nr and left
+/// dirty-in-cache-only; at checkpoint we walk the touched subtree and rewrite
+/// each dirty node to a **fresh** block (never overwriting a block referenced
+/// by the last on-disk checkpoint), fixing up parent pointers as children
+/// move. A clean node — or a node not resident in cache at all (never touched
+/// this interval) — is kept at its current block_nr and not rewritten.
+///
+/// Safety: because every write targets a freshly-allocated block, a crash
+/// anywhere during the flush leaves the previous checkpoint's on-disk tree
+/// byte-for-byte intact; the superblock still points at the old root until the
+/// caller swaps it (double-fsync in `Fs::sync`). The newly written blocks
+/// become unreferenced orphans until a future GC.
+fn checkpoint_flush(store: &BlockStore, block_nr: u64) -> Result<u64> {
+    // A node absent from the cache was neither read nor written since the last
+    // checkpoint, so its whole on-disk subtree is already clean — keep it.
+    let Some((level, dirty)) = store.with_cached_node(block_nr, |n, dirty| (n.level(), dirty))
+    else {
+        return Ok(block_nr);
+    };
+
+    if level == 0 {
+        if !dirty {
+            return Ok(block_nr);
+        }
+        // Relocate this leaf to a fresh block.
+        let node = store.with_node(block_nr, clone_to_heap)?;
+        let new_block = store.alloc();
+        store.write_node(new_block, &node)?;
+        return Ok(new_block);
+    }
+
+    // Internal node: flush every child first, collecting any that moved.
+    let child_blocks: Vec<u64> = store
+        .with_cached_node(block_nr, |node, _| {
+            (0..=node.nkeys()).map(|i| node.child_block(i)).collect()
+        })
+        .expect("node was resident at level read above");
+
+    let mut new_children = Vec::with_capacity(child_blocks.len());
+    let mut any_moved = false;
+    for &child in &child_blocks {
+        let new_child = checkpoint_flush(store, child)?;
+        any_moved |= new_child != child;
+        new_children.push(new_child);
+    }
+
+    // Rewrite this node iff it is itself dirty or a child moved.
+    if !dirty && !any_moved {
+        return Ok(block_nr);
+    }
+    let mut node = store.with_node(block_nr, clone_to_heap)?;
+    for (i, &new_child) in new_children.iter().enumerate() {
+        node.set_child_block(i, new_child);
+    }
+    let new_block = store.alloc();
+    store.write_node(new_block, &node)?;
+    Ok(new_block)
 }
 
 // ---------- Scan & debug ----------
@@ -1906,85 +2090,134 @@ mod tests {
     // ---------- COW deeper verification ----------
 
     #[test]
-    fn test_cow_multiple_snapshots() {
+    fn test_checkpoint_preserves_content() {
+        // In-place append dropped the old "a saved root_block is a frozen
+        // snapshot" property at the btree level (see
+        // docs/in-place-append-plan.md §1.1). What replaces it is the
+        // checkpoint: `checkpoint()` relocates every dirty node onto a fresh
+        // block and returns a new root, without losing or corrupting content.
+        // This test drives inserts across splits, checkpoints, then more
+        // in-place edits, and verifies the content survives every checkpoint.
         let mut tree = Btree::new();
-        let mut snapshots = Vec::new();
-
-        // Take a snapshot (save root_block) after every 100 inserts.
         for i in 0u32..500 {
             tree.insert(&key(i), &val(i)).unwrap();
-            if i % 100 == 99 {
-                snapshots.push((i, tree.root_block));
-            }
         }
 
-        // Each snapshot should reflect exactly the keys inserted up to that point.
-        for &(last_key, snap_root) in &snapshots {
-            for i in 0..=last_key {
-                assert_eq!(
-                    find_at_root(&tree.store, snap_root, &key(i))
-                        .unwrap()
-                        .as_deref(),
-                    Some(val(i).as_slice()),
-                    "snapshot after key {last_key}: key {i} missing"
-                );
-            }
-            // Key just beyond the snapshot should not exist.
+        // Checkpoint: dirty nodes relocate, root changes (something was dirty).
+        let pre = tree.root_block;
+        tree.checkpoint().unwrap();
+        assert_ne!(
+            tree.root_block, pre,
+            "checkpoint should relocate dirty root"
+        );
+        for i in 0..500 {
             assert_eq!(
-                find_at_root(&tree.store, snap_root, &key(last_key + 1))
-                    .unwrap()
-                    .as_deref(),
-                None,
-                "snapshot after key {last_key}: key {} unexpectedly present",
-                last_key + 1
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i).as_slice()),
+                "key {i} lost across checkpoint"
             );
         }
+        assert_eq!(count_keys(&tree.store, tree.root_block), 500);
 
+        // A second checkpoint with nothing dirty is a no-op on the root.
+        let clean = tree.root_block;
+        tree.checkpoint().unwrap();
+        assert_eq!(
+            tree.root_block, clean,
+            "clean checkpoint must not move root"
+        );
+
+        // More in-place overwrites, then checkpoint again — content follows.
+        for i in 0..250u32 {
+            tree.insert(&key(i), &val(i + 1_000_000)).unwrap();
+        }
+        tree.checkpoint().unwrap();
+        for i in 0..250 {
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i + 1_000_000).as_slice())
+            );
+        }
+        for i in 250..500 {
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(val(i).as_slice())
+            );
+        }
+        assert_eq!(count_keys(&tree.store, tree.root_block), 500);
         tree.verify();
     }
 
     #[test]
-    fn test_cow_after_overwrite() {
-        // Build a btree large enough that the root is internal (forced
-        // by inserting MAX_ENTRIES + a few more), snapshot the root_block,
-        // then overwrite every old key with a new value. The frozen
-        // snapshot must still see the original values; the modern tree
-        // must see the overwritten values. This exercises COW correctness
-        // across multiple leaves under one internal node.
+    fn test_inplace_append_kills_write_amplification() {
+        // The headline win: a run of writes the target leaf can absorb should
+        // persist ZERO nodes during the run (they mutate the cached leaf in
+        // place), and only a small bounded number at checkpoint. Under the old
+        // COW-per-op scheme each of the N writes rewrote the whole root→leaf
+        // path, so this counter would have been ≥ N.
         let mut tree = Btree::new();
-        let n = MAX_ENTRIES as u32 + 10; // ≥ 39, forces ≥1 split
+        // Seed a single key so the tree exists; then take the baseline.
+        tree.insert(&key(0), &val(0)).unwrap();
+        tree.checkpoint().unwrap();
+        let base = tree.store.node_writes();
+
+        // Overwrite the same key many times — pure in-place, single leaf.
+        const N: u32 = 200;
+        for i in 0..N {
+            tree.insert(&key(0), &val(i)).unwrap();
+        }
+        assert_eq!(
+            tree.store.node_writes(),
+            base,
+            "in-place overwrites must not persist any node before checkpoint"
+        );
+
+        // One checkpoint persists just the touched path (a single leaf here).
+        tree.checkpoint().unwrap();
+        let after = tree.store.node_writes();
+        assert!(
+            after - base <= 2,
+            "checkpoint of one hot leaf should persist ≤2 nodes, got {}",
+            after - base
+        );
+        assert_eq!(
+            tree.find(&key(0)).unwrap().as_deref(),
+            Some(val(N - 1).as_slice())
+        );
+        tree.verify();
+    }
+
+    #[test]
+    fn test_inplace_overwrite_keeps_root_stable() {
+        // A pure overwrite of a key already in the latest bset is absorbed in
+        // place: the leaf's block_nr is unchanged, so no ancestor pointer
+        // changes and root_block stays put — the whole point of in-place
+        // append (kill per-op COW write amplification). Contrast with a split,
+        // which still allocates fresh blocks (covered by
+        // test_cow_preserves_old_root).
+        let mut tree = Btree::new();
+        let n = MAX_ENTRIES as u32 + 10; // ≥ 39, forces an internal root
         for i in 0..n {
             tree.insert(&key(i), &val(i)).unwrap();
         }
-        // Root must be internal at this point.
-        let snap = tree.root_block;
         assert!(
-            tree.store.read_node_copy(snap).unwrap().level() >= 1,
-            "expected internal root after {n} inserts, level={}",
-            tree.store.read_node_copy(snap).unwrap().level()
+            tree.store.read_node_copy(tree.root_block).unwrap().level() >= 1,
+            "expected internal root after {n} inserts"
         );
 
-        // Overwrite every key with a new value.
-        for i in 0..n {
-            tree.insert(&key(i), &val(i + 1_000_000)).unwrap();
-        }
-
-        // Modern view: everyone sees the new value.
-        for i in 0..n {
-            assert_eq!(
-                tree.find(&key(i)).unwrap().as_deref(),
-                Some(val(i + 1_000_000).as_slice()),
-                "modern key {i} should see new value"
-            );
-        }
-        // Frozen snapshot: every key still has its original value.
-        for i in 0..n {
-            assert_eq!(
-                find_at_root(&tree.store, snap, &key(i)).unwrap().as_deref(),
-                Some(val(i).as_slice()),
-                "snap key {i} regressed: COW leaked through"
-            );
-        }
+        // Overwrite the most-recently-inserted key (guaranteed to sit in its
+        // leaf's latest bset → true in-place overwrite, no growth, no split).
+        let root_before = tree.root_block;
+        tree.insert(&key(n - 1), &val(n - 1 + 1_000_000)).unwrap();
+        assert_eq!(
+            tree.root_block, root_before,
+            "in-place overwrite must not change root_block (no COW)"
+        );
+        assert_eq!(
+            tree.find(&key(n - 1)).unwrap().as_deref(),
+            Some(val(n - 1 + 1_000_000).as_slice()),
+            "overwrite must be visible in the modern tree"
+        );
         tree.verify();
     }
 

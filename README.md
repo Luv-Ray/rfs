@@ -24,10 +24,14 @@ FUSE (`fuser` 0.17, pure Rust):
 
 Persistence:
 - Single backing image file with superblock, CRC32 per node block
-- `BlockStore` with append-only `FrozenMap` cache (borrow-stable across faults)
+- `BlockStore` with a dirty-tracked mutable node/data cache
+- In-place bset append: between checkpoints, writes a hot leaf can absorb
+  mutate the cached node at a stable block number (no per-op root→leaf COW);
+  a checkpoint relocates the dirty nodes onto fresh blocks and swaps the root
 - `Fs::create` / `Fs::open` / `Fs::sync`; FUSE auto-syncs on destroy
-- Write-ahead journal (ring buffer, seq + CRC per entry) with commit after every
-  write op and replay-on-open crash recovery; superblock checkpoint on sync
+- Write-ahead journal (ring buffer, seq + CRC per frame) recording key-level
+  logged ops in atomic commit groups; replay-on-open recovery from the last
+  superblock checkpoint; superblock checkpoint on sync
 
 ## TODO
 
@@ -41,16 +45,22 @@ Snapshot lifecycle (one connected piece):
 - [ ] `needs_whiteout` bit + whiteout-only compaction (let compaction safely
       drop whiteouts, not just `Deleted`)
 - [ ] Snapshot deletion (walk btrees, drop gone snap_id keys, clean whiteouts)
+- [ ] `deleted_inodes` btree + background reclaim (bcachefs style): make unlink
+      bounded by recording the orphan inode and reclaiming its extents lazily,
+      instead of deleting every extent in one transaction. Removes the current
+      limit that unlinking a large file (> ~3.6 MB) can overflow the journal
+      ring in a single commit group.
 
-Write-amplification path (prerequisite chain for larger nodes, in order):
-- [ ] Node cache rewrite: `FrozenMap` → dirty-tracked mutable cache. Current
-      COW-once + borrow-stable cache forbids in-place node mutation; bcachefs-style
-      in-place bset append needs this. Subsumes bounded cache + LRU eviction.
-- [ ] Journal: fixed-size checkpoint → variable-length logical WAL (record
-      key-level ops, not just a `root_block` snapshot)
-- [ ] Recovery: adopt-root → replay logged ops from last checkpoint
-- [ ] Incremental flush: write appended bsets alone; amortize full-node rewrite
-      into compaction / split
+Write-amplification path (prerequisite chain for larger nodes):
+- [x] Node cache rewrite: `FrozenMap` → dirty-tracked mutable cache
+- [x] Journal: fixed-size checkpoint → variable-length logical WAL (key-level
+      ops in commit groups) + replay-from-checkpoint recovery
+- [x] In-place bset append: hot writes mutate the cached node at a stable block
+      number; checkpoint relocates dirty nodes and swaps the root
+- [ ] On-disk incremental flush: persist appended bsets alone (per-bset checksum
+      + `journal_seq`, bsets found by scan not authoritative `bset_count`);
+      recovery drops a torn tail bset. Currently a checkpoint still rewrites each
+      dirty node whole — this amortizes that for large nodes.
 - [ ] Raise node size to 64–256 KB (needs COW write-amp benchmarks)
 
 Optimizations / deferrable (don't block anything):
