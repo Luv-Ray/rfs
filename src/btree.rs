@@ -2097,6 +2097,10 @@ mod tests {
     // ---------- COW deeper verification ----------
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "hundreds of inserts + checkpoints; slow under Miri, no new unsafe path"
+    )]
     fn test_checkpoint_preserves_content() {
         // In-place append dropped the old "a saved root_block is a frozen
         // snapshot" property at the btree level (see
@@ -2826,6 +2830,10 @@ mod tests {
     // ---------- Phase 6: Btree::transaction ----------
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "200+ inserts across splits in one tx; slow under Miri, no new unsafe path"
+    )]
     fn transaction_commits_multiple_ops_atomically() {
         // Drive a single transaction with enough inserts to force splits
         // inside the tx. The tx must commit atomically — readers outside
@@ -3253,6 +3261,10 @@ mod tests {
     /// the path silently becomes unreachable (split fires first) — this
     /// test catches that regression.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "drives repeated compaction over many inserts; slow under Miri, no new unsafe path"
+    )]
     fn compaction_path_is_reachable() {
         use std::sync::atomic::Ordering;
 

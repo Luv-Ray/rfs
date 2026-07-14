@@ -1632,6 +1632,10 @@ mod tests {
     /// `root_block`. The basic round-trip test only ever touches a
     /// single-leaf tree.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "5000-file image test; slow under Miri, no new unsafe path"
+    )]
     fn image_persist_through_btree_split() {
         let img = tmp_image_path("split");
         // 5_000 inodes ≫ MAX_ENTRIES (29) — at MAX_INTERNAL_KEYS = 27 fanout
@@ -1675,6 +1679,10 @@ mod tests {
     /// Delete (in-place tombstone + cross-snap whiteout) survives sync.
     /// Reopen and check the deleted name really stays gone.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "2000-file create+delete image test; slow under Miri, no new unsafe path"
+    )]
     fn image_persist_after_delete() {
         let img = tmp_image_path("delete");
         // 2_000 entries forces the dirent btree well beyond a single
@@ -1841,6 +1849,10 @@ mod tests {
     /// `image_persist_through_btree_split`, which only stresses inode
     /// keys.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "1000-dirent image test; slow under Miri, no new unsafe path"
+    )]
     fn image_persist_dense_dirents() {
         let img = tmp_image_path("dense-dir");
         const N: u32 = 1_000;
@@ -1886,6 +1898,10 @@ mod tests {
     /// reopen mis-restores the counter and we start handing out already-
     /// occupied block numbers.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "1000 files across 4 sync rounds; ~5 min under Miri, no new unsafe path"
+    )]
     fn image_size_grows_monotonically_across_syncs() {
         let img = tmp_image_path("grow");
         let mut sizes = Vec::new();
