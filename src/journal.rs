@@ -44,10 +44,14 @@ impl Journal {
         let offset = Self::frame_offset(seq);
         let mut buf = [0u8; JOURNAL_FRAME_SIZE];
         self.file.read_exact_at(&mut buf, offset)?;
-        let frame = JournalFrame::ref_from_bytes(&buf)
+        // Copy out with `read_from_bytes` — a `[u8; N]` stack buffer is only
+        // 1-byte aligned, but JournalFrame has u64 fields needing 8-byte
+        // alignment, so a borrowing `ref_from_bytes` would be UB on misaligned
+        // reads (Miri flags it). The owned copy sidesteps the requirement.
+        let frame = JournalFrame::read_from_bytes(&buf)
             .map_err(|_| Error::Io(std::io::Error::other("journal frame size mismatch")))?;
         if frame.is_valid(seq) {
-            Ok(Some(*frame))
+            Ok(Some(frame))
         } else {
             Ok(None)
         }

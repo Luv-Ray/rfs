@@ -122,7 +122,12 @@ impl Superblock {
     /// Verify magic, version, and CRC. Returns the parsed superblock on
     /// success, or a structured error pointing at block 0.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let sb = Superblock::ref_from_bytes(bytes)
+        // `read_from_bytes` copies into an owned value, so it has no alignment
+        // requirement on `bytes`. `ref_from_bytes` would return a reference
+        // *into* the buffer and thus require 8-byte alignment (Superblock has
+        // u64 fields); callers hand us a `Vec<u8>` / `&[u8]` with no alignment
+        // guarantee, so we must copy. (Miri flags the ref_from_bytes form.)
+        let sb = Superblock::read_from_bytes(bytes)
             .map_err(|_| Error::Io(io::Error::other("superblock size mismatch")))?;
         if sb.magic != SUPERBLOCK_MAGIC {
             return Err(Error::BadMagic {
@@ -143,7 +148,7 @@ impl Superblock {
                 block: SUPERBLOCK_BLOCK_NR,
             });
         }
-        Ok(*sb)
+        Ok(sb)
     }
 
     /// Render the superblock to its 4 KB on-disk form, stamping the CRC.
