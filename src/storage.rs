@@ -577,9 +577,12 @@ impl BlockStore {
 
     /// Write a btree node, stamping CRC into its header before persisting.
     ///
-    /// Write-through: the block is pwritten immediately (image backing) and
-    /// the cache entry is marked clean. The `dirty` bookkeeping is in place
-    /// for the future write-back step.
+    /// Write-through: the block is pwritten immediately (image backing) and the
+    /// cache entry is marked clean. Used by the paths that produce a node at a
+    /// *fresh* block — split / promote, and `checkpoint_flush`'s COW-relocate —
+    /// where an immediate persist to a never-before-written block is always
+    /// safe. Hot in-place edits go through `with_node_mut` instead (dirty, not
+    /// pwritten until the next checkpoint).
     pub fn write_node(&self, nr: u64, node: &BtreeNodeRaw) -> Result<()> {
         #[cfg(test)]
         self.node_writes.fetch_add(1, Ordering::Relaxed);
@@ -606,10 +609,19 @@ impl BlockStore {
         self.node_writes.load(Ordering::Relaxed)
     }
 
-    /// Flush a single dirty node to disk (CRC stamped, then pwrite). No-op if
-    /// the node is absent or already clean. Under write-through nodes are
-    /// never left dirty, so this is currently only exercised by the future
-    /// write-back path; kept here so `sync` can call it unconditionally.
+    /// Flush a single dirty node to disk **in place** (CRC stamped, then pwrite
+    /// to the node's own block). No-op if the node is absent or already clean.
+    ///
+    /// Not used on the checkpoint path: `checkpoint_flush` relocates dirty
+    /// nodes onto *fresh* blocks so a crash can't corrupt the still-live
+    /// previous checkpoint. Writing a dirty node back to its own block_nr would
+    /// overwrite committed state, so this must NOT be called for checkpointing.
+    ///
+    /// Kept as the entry point for a future bounded cache with LRU eviction:
+    /// evicting a dirty node requires flushing it first (flush-before-evict).
+    /// A block written between checkpoints is re-derivable from the WAL, so an
+    /// in-place flush of it is safe there — it is only unsafe as a substitute
+    /// for the checkpoint's COW-relocate. Currently unused (unbounded cache).
     pub fn flush_node(&self, nr: u64) -> Result<()> {
         let mut cache = self.node_cache.write().unwrap();
         let Some(c) = cache.get_mut(&nr) else {
@@ -628,7 +640,9 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Flush every dirty node. No-op under write-through (nothing is dirty).
+    /// Flush every dirty node in place. Same caveat as [`Self::flush_node`]:
+    /// this is the future LRU-eviction primitive, not the checkpoint path
+    /// (which uses `checkpoint_flush`'s COW-relocate). Currently unused.
     pub fn flush_all(&self) -> Result<()> {
         let dirty: Vec<u64> = {
             let cache = self.node_cache.read().unwrap();
