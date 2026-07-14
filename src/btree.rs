@@ -1689,6 +1689,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_multiple_inserts() {
         let mut tree = Btree::new();
         let n = 1000u32;
@@ -1767,6 +1768,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_split_many_keys() {
         let mut tree = Btree::new();
         let n = 2000u32;
@@ -1784,6 +1786,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_range_scan() {
         let mut tree = Btree::new();
         for i in 0u32..5000 {
@@ -1827,6 +1830,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_reverse_insert() {
         let mut tree = Btree::new();
         let n = 2000u32;
@@ -1885,6 +1889,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_random_keys() {
         let mut rng = Rng(0xDEAD_BEEF_CAFE);
         let mut tree = Btree::new();
@@ -1920,6 +1925,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_random_overwrite_consistency() {
         let mut rng = Rng(0x1234_5678);
         let mut tree = Btree::new();
@@ -1950,6 +1956,7 @@ mod tests {
     // ---------- Split propagation ----------
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_split_propagation_forced_root_split() {
         // Insert keys in ascending order until the root splits multiple times.
         // With MAX_ENTRIES=29, filling 29 leaves forces a 3-level tree.
@@ -2246,6 +2253,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_range_scan_entire_tree() {
         let mut tree = Btree::new();
         let n = 500u32;
@@ -2263,6 +2271,7 @@ mod tests {
     // ---------- Large-scale stress ----------
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_large_scale_10k() {
         let mut tree = Btree::new();
         let n = 10_000u32;
@@ -2285,6 +2294,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_large_scale_random_20k() {
         let mut rng = Rng(0xCAFE_BABE);
         let mut tree = Btree::new();
@@ -2310,6 +2320,7 @@ mod tests {
     // ---------- Invariant: total key count ----------
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_key_count_after_mixed_operations() {
         let mut tree = Btree::new();
         let mut reference = HashMap::new();
@@ -2360,6 +2371,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_balance_sequential_inserts() {
         let mut tree = Btree::new();
         // Insert enough keys to create multiple levels.
@@ -2372,6 +2384,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_balance_reverse_inserts() {
         let mut tree = Btree::new();
         for i in (0..5000u32).rev() {
@@ -2382,6 +2395,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_balance_random_inserts() {
         let mut rng = Rng(0xBEEF_FACE);
         let mut tree = Btree::new();
@@ -2394,6 +2408,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_balance_after_overwrites() {
         let mut tree = Btree::new();
         for i in 0..2000u32 {
@@ -2408,6 +2423,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_balance_at_each_split_level() {
         // Insert one key at a time and verify balance after every insert.
         let mut tree = Btree::new();
@@ -2419,6 +2435,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_balance_height_grows_logarithmically() {
         // With MAX_ENTRIES=29, a B-tree of height h can hold at least
         // 29^h keys (each leaf full). So height should be O(log_29(n)).
@@ -2454,6 +2471,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_balance_leaf_fill_ratio() {
         // Every leaf (except possibly the last split remainder) should have
         // at least MAX_ENTRIES/2 keys. This is the standard B-tree invariant.
@@ -2483,6 +2501,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn test_balance_cow_snapshots_all_balanced() {
         let mut tree = Btree::new();
         let mut snapshots = Vec::new();
@@ -2912,6 +2931,7 @@ mod tests {
     // ---------- Phase 9: randomized insert/delete vs BTreeMap ----------
 
     #[test]
+    #[cfg_attr(miri, ignore = "throughput stress test; no new unsafe path")]
     fn random_insert_delete_matches_btreemap() {
         // Drive a long random sequence of inserts and deletes into both the
         // Btree and a std BTreeMap, then check that visibility matches at

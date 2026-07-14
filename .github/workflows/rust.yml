@@ -22,3 +22,32 @@ jobs:
       run: cargo test --verbose
     - name: Run clippy
       run: cargo clippy --verbose
+
+  miri:
+    # Runs the test suite under Miri to catch UB in the `unsafe` blocks
+    # (Box::new_zeroed node allocation, zerocopy casts). Miri is slow, so it
+    # is a separate job that runs in parallel with `build` rather than
+    # blocking the fast build/clippy feedback.
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install nightly + Miri
+      run: |
+        rustup toolchain install nightly --component miri
+        rustup override set nightly
+        cargo miri setup
+    - name: Run tests under Miri
+      # -Zmiri-disable-isolation: the image-backed tests do real file I/O
+      # (open / pread / pwrite) and read the wall clock for temp paths, which
+      # Miri blocks under its default isolation. Disabling isolation lets Miri
+      # forward those to the host while still checking memory semantics.
+      # --lib: every test is an inline #[cfg(test)] module in the library
+      # crate; this skips the fuser-linked binary target.
+      # Heavy throughput/stress tests (thousands of inserts) are marked
+      # #[cfg_attr(miri, ignore)] so they are skipped here — they exercise no
+      # unsafe path the smaller tests don't, and would take ~30 min under Miri
+      # vs ~2 min for the rest. Plain `cargo test` still runs them.
+      env:
+        MIRIFLAGS: -Zmiri-disable-isolation
+      run: cargo miri test --lib --verbose

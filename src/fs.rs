@@ -2275,6 +2275,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "965 commit+fsync iterations; slow under Miri, no new unsafe path"
+    )]
     fn journal_ring_full_forces_checkpoint() {
         let img = tmp_image_path("jnl-ringfull");
 
