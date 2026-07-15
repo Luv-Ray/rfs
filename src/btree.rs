@@ -940,19 +940,86 @@ fn find_visible(
     Ok(find_visible_with_snap(store, block_nr, logical, chain)?.map(|(v, _)| v))
 }
 
+/// Resolve the entry visible at the chain's head for a single logical key.
+///
+/// Returns `Some((value, snap))` for the closest ancestor holding a `Live`
+/// entry, or `None` if the closest ancestor with any entry is a tombstone
+/// (Deleted/Whiteout) or if no ancestor has an entry at all.
+///
+/// # How this works (and why it's not `D` descents)
+///
+/// The naive version did one exact `find_raw` per ancestor:
+/// `O(D · log N)` — the `log N` tree descent multiplied by the chain depth.
+/// Instead we do a **single** range positioning over every snapshot version
+/// of `logical`, then filter linearly: `O(log N + K + D)`, where `K` is the
+/// number of stored versions of this key and `D` the chain length (to build
+/// `chain_set`). The `log N` no longer multiplies `D`. This is the point-lookup
+/// analogue of [`Btree::range_scan_visible`], scoped to one key — it reuses the
+/// same `range_scan_all` walker and chain-membership filter.
+///
+/// # The range must cover *all* snap versions
+///
+/// A point key is stored as `logical ++ snap_be` (4-byte big-endian suffix).
+/// To capture every version we scan `[logical ++ [0x00;4], logical ++
+/// [0xFF;4] ++ [0x00])`:
+/// - the start pins the smallest possible suffix;
+/// - the end sits **just past** `snap = u32::MAX` (`ROOT_SNAP`, whose suffix is
+///   `[0xFF;4]`). The trailing `0x00` byte makes `end` strictly greater than
+///   `logical ++ [0xFF;4]` (a proper prefix sorts first) without reaching any
+///   lexicographically-greater sibling key.
+///
+/// Because keys are variable-length, a longer key that has `logical` as a byte
+/// prefix (e.g. dirent `"abc"` vs `"ab"`) interleaves *within* this byte range,
+/// so we additionally filter `row_logical == logical` to drop those interlopers.
+///
+/// # Why chain order == snap-ascending order
+///
+/// `ancestor_chain` yields `[target, parent, …, root]`, and snap ids are
+/// allocated downward (parent_id > child_id), so that list is strictly
+/// ascending in snap_id. `range_scan_all` yields rows in (logical ASC, snap
+/// ASC) order, so the first row whose snap is on the chain is exactly the
+/// closest ancestor with an entry — the same one the per-ancestor walk found.
 fn find_visible_with_snap(
     store: &BlockStore,
     block_nr: u64,
     logical: &[u8],
     chain: &[SnapId],
 ) -> Result<Option<(Vec<u8>, SnapId)>> {
-    for &snap in chain {
-        let (buf, len) = sortable_key(logical, snap);
-        match find_raw(store, block_nr, &buf[..len])? {
-            Some((value, EntryKind::Live)) => return Ok(Some((value, snap))),
-            Some((_, EntryKind::Deleted | EntryKind::Whiteout)) => return Ok(None),
-            None => continue,
+    let n = logical.len();
+    assert!(n <= MAX_LOGICAL_KEY_SIZE);
+
+    // start = logical ++ [0x00; 4]
+    let mut start = [0u8; MAX_KEY_SIZE];
+    start[..n].copy_from_slice(logical);
+    // start[n..n + SNAP_ID_BYTES] is already zero.
+
+    // end = logical ++ [0xFF; 4] ++ [0x00] — strictly past snap = u32::MAX.
+    let mut end = Vec::with_capacity(n + SNAP_ID_BYTES + 1);
+    end.extend_from_slice(logical);
+    end.extend_from_slice(&[0xFF; SNAP_ID_BYTES]);
+    end.push(0x00);
+
+    let mut rows: Vec<AllSnapRow> = Vec::new();
+    range_scan_all(
+        store,
+        block_nr,
+        &start[..n + SNAP_ID_BYTES],
+        &end,
+        &mut rows,
+    )?;
+
+    // Rows are in (logical ASC, snap ASC) order. Restrict to exactly `logical`
+    // (drop prefix-extension interlopers), then take the first row whose snap
+    // is on the ancestor chain — Live emits, tombstone shadows.
+    let chain_set: std::collections::HashSet<SnapId> = chain.iter().copied().collect();
+    for (row_logical, snap, kind, value) in rows {
+        if row_logical.as_slice() != logical || !chain_set.contains(&snap) {
+            continue;
         }
+        return Ok(match kind {
+            EntryKind::Live => Some((value, snap)),
+            EntryKind::Deleted | EntryKind::Whiteout => None,
+        });
     }
     Ok(None)
 }
@@ -2627,6 +2694,34 @@ mod tests {
             Some(b"v_root".as_slice()),
             "parent must NOT see child's override"
         );
+    }
+
+    #[test]
+    fn find_visible_prefix_key_does_not_leak() {
+        // Regression for the range-based find_visible: a longer key that has
+        // the lookup key as a byte prefix ("ab" vs "abc") interleaves *within*
+        // the [logical ++ 0x00*4, logical ++ 0xFF*4 ++ 0x00) scan range, so the
+        // exact-match filter must reject it. Also pins the ROOT_SNAP (0xFF
+        // suffix) upper boundary: the entry for "ab" itself lives at that suffix
+        // and must still be captured.
+        let mut tree = Btree::new();
+        tree.insert_at(b"ab", ROOT_SNAP, b"short").unwrap();
+        tree.insert_at(b"abc", ROOT_SNAP, b"longer").unwrap();
+
+        let chain = vec![ROOT_SNAP];
+        // "ab" must resolve to its own value, never the prefix-extension "abc".
+        assert_eq!(
+            tree.find_visible(b"ab", &chain).unwrap().as_deref(),
+            Some(b"short".as_slice()),
+            "lookup of prefix key must not pick up the longer sibling"
+        );
+        assert_eq!(
+            tree.find_visible(b"abc", &chain).unwrap().as_deref(),
+            Some(b"longer".as_slice())
+        );
+        // A key that only exists as a prefix of a stored key resolves to None,
+        // not to the longer key's value.
+        assert_eq!(tree.find_visible(b"a", &chain).unwrap(), None);
     }
 
     #[test]
