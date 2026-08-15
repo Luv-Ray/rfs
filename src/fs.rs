@@ -141,6 +141,32 @@ fn subvol_key(subvol: SubvolId) -> [u8; SUBVOL_KEY_LEN] {
     k
 }
 
+/// Logical-key range covering every snapshot metadata entry:
+/// `[KIND_SNAPSHOT, 0, 0, 0, 0] .. [KIND_SNAPSHOT + 1]`. The one-byte end
+/// sorts before the first subvolume key (`KIND_SUBVOL = KIND_SNAPSHOT + 1`,
+/// followed by a 4-byte id), so only snapshot entries are included.
+fn snapshot_range() -> ([u8; SNAPSHOT_KEY_LEN], [u8; 1]) {
+    (snapshot_key(0), [KIND_SNAPSHOT + 1])
+}
+
+fn snapshot_id_from_key(key: &[u8]) -> SnapId {
+    assert_eq!(key.len(), SNAPSHOT_KEY_LEN);
+    assert_eq!(key[0], KIND_SNAPSHOT);
+    SnapId::from_be_bytes(key[1..].try_into().unwrap())
+}
+
+fn subvol_range() -> ([u8; SUBVOL_KEY_LEN], [u8; 1]) {
+    let mut start = [0u8; SUBVOL_KEY_LEN];
+    start[0] = KIND_SUBVOL;
+    (start, [KIND_SUBVOL + 1])
+}
+
+fn subvol_id_from_key(key: &[u8]) -> SubvolId {
+    assert_eq!(key.len(), SUBVOL_KEY_LEN);
+    assert_eq!(key[0], KIND_SUBVOL);
+    SubvolId::from_be_bytes(key[1..].try_into().unwrap())
+}
+
 // ---------- Value structs ----------
 
 #[repr(C)]
@@ -247,6 +273,13 @@ pub enum FsError {
     /// An id space (snap_id / subvol_id) is exhausted (ENOSPC). Without a
     /// GC to recycle freed ids there is no way to satisfy the request.
     Exhausted,
+    /// Operation target is not the kind of subvolume it applies to (e.g.
+    /// deleting the default subvolume, or deleting a writable subvolume in
+    /// v1 where only readonly snapshots are deletable) (EINVAL).
+    Invalid,
+    /// The snapshot is still in use: it is the active subvolume, or it has
+    /// descendant snapshots/subvolumes whose chains depend on it (EBUSY).
+    Busy,
 }
 
 impl std::fmt::Display for FsError {
@@ -258,6 +291,8 @@ impl std::fmt::Display for FsError {
             FsError::NotEmpty => f.write_str("directory not empty"),
             FsError::AlreadyExists => f.write_str("already exists"),
             FsError::Exhausted => f.write_str("id space exhausted"),
+            FsError::Invalid => f.write_str("invalid operation"),
+            FsError::Busy => f.write_str("resource busy"),
         }
     }
 }
@@ -578,6 +613,23 @@ impl Fs {
         Ok(bytes.map(|b| SnapshotV1::read_from_bytes(&b).expect("snapshot value size mismatch")))
     }
 
+    /// Every live snapshot metadata entry, in logical-key (snap_id) order.
+    /// Uses a visible scan at ROOT_SNAP so tombstoned snapshot records are
+    /// excluded; snapshot metadata is always written at ROOT_SNAP itself.
+    pub fn list_snapshots(&self) -> Result<Vec<(SnapId, SnapshotV1)>> {
+        let (start, end) = snapshot_range();
+        self.tree
+            .range_scan_visible(&start, &end, &[ROOT_SNAP])?
+            .into_iter()
+            .map(|(key, value)| {
+                let snap = snapshot_id_from_key(&key);
+                let meta =
+                    SnapshotV1::read_from_bytes(&value).expect("snapshot value size mismatch");
+                Ok((snap, meta))
+            })
+            .collect()
+    }
+
     /// Walk the snapshot ancestor chain starting at `snap`. Yields
     /// `[snap, parent(snap), grandparent(snap), ...]`, stopping at the first
     /// snapshot whose `parent_id == NO_PARENT_SNAP` (a tree root) or whose
@@ -632,6 +684,20 @@ impl Fs {
     pub fn get_subvol(&self, id: SubvolId) -> Result<Option<SubvolV1>> {
         let bytes = self.tree.find_at(&subvol_key(id), ROOT_SNAP)?;
         Ok(bytes.map(|b| SubvolV1::read_from_bytes(&b).expect("subvol value size mismatch")))
+    }
+
+    /// Every live subvolume entry, in logical-key (subvol_id) order.
+    pub fn list_subvols(&self) -> Result<Vec<(SubvolId, SubvolV1)>> {
+        let (start, end) = subvol_range();
+        self.tree
+            .range_scan_visible(&start, &end, &[ROOT_SNAP])?
+            .into_iter()
+            .map(|(key, value)| {
+                let id = subvol_id_from_key(&key);
+                let meta = SubvolV1::read_from_bytes(&value).expect("subvol value size mismatch");
+                Ok((id, meta))
+            })
+            .collect()
     }
 
     // -- Inode --
@@ -940,6 +1006,127 @@ impl Fs {
         }
         self.current_subvol = id;
         Ok(())
+    }
+
+    /// Delete a readonly snapshot subvolume and physically drop the key
+    /// versions stored at its snap_id.
+    ///
+    /// v1 restrictions keep the snapshot tree well-formed without a full
+    /// subvolume-deletion protocol:
+    /// - the default subvolume cannot be deleted;
+    /// - only readonly snapshot subvolumes are deletable;
+    /// - the target must not be the active subvolume;
+    /// - the target snap_id must have no child snapshots, and no other
+    ///   subvolume may have an ancestor chain containing it.
+    ///
+    /// The metadata removal is one atomic transaction (and therefore lands
+    /// in the btree WAL log for the next `journal_commit`). The subsequent
+    /// `drop_snapshot_keys` compaction is unlogged, GC-style cleanup: if it
+    /// is lost in a crash, recovery still sees the snapshot metadata as
+    /// deleted and the leftover dead-snap keys are simply invisible garbage.
+    pub fn delete_snapshot(&mut self, subvol: SubvolId) -> FsResult<()> {
+        if subvol == ROOT_SUBVOL {
+            return Err(FsError::Invalid);
+        }
+        let target = self.get_subvol(subvol)?.ok_or(FsError::NotFound)?;
+        if target.flags & SUBVOL_FLAG_READONLY == 0 {
+            return Err(FsError::Invalid);
+        }
+        if self.current_subvol == subvol {
+            return Err(FsError::Busy);
+        }
+        let dead_snap = target.snap_id;
+        if dead_snap == ROOT_SNAP {
+            return Err(FsError::Invalid);
+        }
+
+        // Reject deletion while any direct child snapshot exists.
+        for (_, meta) in self.list_snapshots()? {
+            if meta.parent_id == dead_snap {
+                return Err(FsError::Busy);
+            }
+        }
+
+        // Reject deletion while any other subvolume depends on the dead snap
+        // or on one of its descendants. `is_ancestor` is inclusive, so a
+        // subvolume pointing directly at `dead_snap` (other than the target,
+        // which is skipped) is caught here too. The parent_subvol check is
+        // redundant with a well-formed tree but keeps the guard local even if
+        // snapshot metadata were already missing.
+        for (id, meta) in self.list_subvols()? {
+            if id == subvol {
+                continue;
+            }
+            if meta.parent_subvol == subvol || self.is_ancestor(dead_snap, meta.snap_id)? {
+                return Err(FsError::Busy);
+            }
+        }
+
+        // Step 1: atomically tombstone the snapshot-tree and subvolume-tree
+        // metadata. Both records live at ROOT_SNAP; the Deleted tombstones
+        // make future get_* / list_* calls miss them.
+        let snap_k = snapshot_key(dead_snap);
+        let subvol_k = subvol_key(subvol);
+        self.tree.transaction(|tx| {
+            tx.delete_at(&snap_k, ROOT_SNAP, &[ROOT_SNAP])?;
+            tx.delete_at(&subvol_k, ROOT_SNAP, &[ROOT_SNAP])?;
+            Ok(())
+        })?;
+
+        // Step 2: physical cleanup of every key version at the now-unreachable
+        // snap_id. In-place compaction; root_block is unchanged, dirty leaves
+        // are persisted by the next checkpoint.
+        self.tree.drop_snapshot_keys(dead_snap)?;
+
+        // Step 3: deleting this subvolume may have left ancestor snapshot
+        // nodes with no subvolume and no child snapshot. Remove them
+        // bottom-up (e.g. the original s_ro node left behind when a readonly
+        // snapshot subvolume was itself snapshotted and then the child
+        // snapshot deleted).
+        self.sweep_unreferenced_snapshots()?;
+        Ok(())
+    }
+
+    /// Repeatedly delete snapshot metadata whose snap_id is not referenced by
+    /// any subvolume and has no live child snapshots. Such nodes are
+    /// unreachable from every possible ancestor chain, so their key versions
+    /// can be dropped by the same snapshot-deletion compaction.
+    fn sweep_unreferenced_snapshots(&mut self) -> FsResult<()> {
+        loop {
+            let subvol_snaps: std::collections::HashSet<SnapId> = self
+                .list_subvols()?
+                .into_iter()
+                .map(|(_, meta)| meta.snap_id)
+                .collect();
+            let snapshots = self.list_snapshots()?;
+
+            let parent_ids: std::collections::HashSet<SnapId> = snapshots
+                .iter()
+                .map(|(_, meta)| meta.parent_id)
+                .filter(|&parent| parent != NO_PARENT_SNAP)
+                .collect();
+
+            let candidates: Vec<SnapId> = snapshots
+                .iter()
+                .filter(|(snap, _)| {
+                    *snap != ROOT_SNAP && !subvol_snaps.contains(snap) && !parent_ids.contains(snap)
+                })
+                .map(|(snap, _)| *snap)
+                .collect();
+            if candidates.is_empty() {
+                return Ok(());
+            }
+
+            self.tree.transaction(|tx| {
+                for snap in &candidates {
+                    tx.delete_at(&snapshot_key(*snap), ROOT_SNAP, &[ROOT_SNAP])?;
+                }
+                Ok(())
+            })?;
+            for snap in candidates {
+                self.tree.drop_snapshot_keys(snap)?;
+            }
+        }
     }
 }
 
@@ -1468,6 +1655,136 @@ mod tests {
         }
     }
 
+    // ---------- Snapshot deletion ----------
+
+    #[test]
+    fn delete_snapshot_removes_metadata_and_dead_snap_keys() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let inherited = make_file(&mut fs, ROOT_INO, b"inherited");
+
+        let snap_subvol = fs.snapshot_subvol(ROOT_SUBVOL).unwrap();
+        let dead_snap = fs.get_subvol(snap_subvol).unwrap().unwrap().snap_id;
+
+        // Write inside the readonly snapshot (readonly is not enforced yet),
+        // covering all three entry kinds at dead_snap:
+        // - `inside` stays Live;
+        // - `doomed` becomes Deleted;
+        // - `inherited` (created at ROOT_SNAP) becomes a Whiteout in the
+        //   snapshot view.
+        fs.switch_subvol(snap_subvol).unwrap();
+        let inside = make_file(&mut fs, ROOT_INO, b"inside");
+        let _doomed = make_file(&mut fs, ROOT_INO, b"doomed");
+        fs.unlink(ROOT_INO, b"doomed").unwrap();
+        fs.unlink(ROOT_INO, b"inherited").unwrap();
+        assert!(fs.get_inode(inside).unwrap().is_some());
+        assert!(fs.lookup_dirent(ROOT_INO, b"inherited").unwrap().is_none());
+        fs.switch_subvol(ROOT_SUBVOL).unwrap();
+
+        // The writable side still sees the pre-snapshot file.
+        let d = fs.lookup_dirent(ROOT_INO, b"inherited").unwrap().unwrap();
+        assert_eq!(d.target_ino, inherited);
+
+        fs.delete_snapshot(snap_subvol).unwrap();
+
+        // Metadata is gone from both trees.
+        assert_eq!(fs.get_subvol(snap_subvol).unwrap(), None);
+        assert_eq!(fs.get_snapshot(dead_snap).unwrap(), None);
+        assert!(
+            !fs.list_subvols()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| *id == snap_subvol)
+        );
+        assert!(
+            !fs.list_snapshots()
+                .unwrap()
+                .iter()
+                .any(|(snap, _)| *snap == dead_snap)
+        );
+
+        // Every raw key version stored at the dead snap_id has been
+        // physically dropped from the btree.
+        let raw = fs.tree.range_scan_all(&[0], &[0xFF]).unwrap();
+        assert!(
+            raw.iter().all(|(_, snap, _, _)| *snap != dead_snap),
+            "dead-snap entries survived snapshot deletion"
+        );
+
+        // The writable side's own visibility is unchanged: it still has the
+        // inherited file, and never saw the snapshot-only entries.
+        assert_eq!(
+            fs.lookup_dirent(ROOT_INO, b"inherited")
+                .unwrap()
+                .unwrap()
+                .target_ino,
+            inherited
+        );
+        assert_eq!(fs.lookup_dirent(ROOT_INO, b"inside").unwrap(), None);
+        assert_eq!(fs.lookup_dirent(ROOT_INO, b"doomed").unwrap(), None);
+    }
+
+    #[test]
+    fn delete_snapshot_rejects_root_and_missing_subvols() {
+        let mut fs = Fs::new();
+        assert!(matches!(
+            fs.delete_snapshot(ROOT_SUBVOL),
+            Err(FsError::Invalid)
+        ));
+        assert!(matches!(fs.delete_snapshot(9999), Err(FsError::NotFound)));
+    }
+
+    #[test]
+    fn delete_snapshot_rejects_active_subvol() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let snap_subvol = fs.snapshot_subvol(ROOT_SUBVOL).unwrap();
+
+        fs.switch_subvol(snap_subvol).unwrap();
+        assert!(matches!(
+            fs.delete_snapshot(snap_subvol),
+            Err(FsError::Busy)
+        ));
+
+        // Switching away makes it deletable.
+        fs.switch_subvol(ROOT_SUBVOL).unwrap();
+        fs.delete_snapshot(snap_subvol).unwrap();
+        assert_eq!(fs.get_subvol(snap_subvol).unwrap(), None);
+    }
+
+    #[test]
+    fn delete_snapshot_requires_leaf_snapshot_and_sweeps_orphans() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+
+        let snap1 = fs.snapshot_subvol(ROOT_SUBVOL).unwrap();
+        let snap1_original = fs.get_subvol(snap1).unwrap().unwrap().snap_id;
+
+        // Snapshot the readonly snapshot: snap1 becomes an internal snapshot
+        // node, with its own writable id and a new readonly child snapshot.
+        let snap2 = fs.snapshot_subvol(snap1).unwrap();
+        let snap1_active = fs.get_subvol(snap1).unwrap().unwrap().snap_id;
+        assert_ne!(snap1_original, snap1_active);
+
+        // snap1 now has a live descendant, so it is busy.
+        assert!(matches!(fs.delete_snapshot(snap1), Err(FsError::Busy)));
+        // The original snap1 node is still an ancestor of the live child.
+        assert!(fs.get_snapshot(snap1_original).unwrap().is_some());
+
+        // Delete bottom-up: leaf first...
+        fs.delete_snapshot(snap2).unwrap();
+        assert_eq!(fs.get_subvol(snap2).unwrap(), None);
+        // ...which makes the original internal node unreferenced after snap1
+        // itself is deleted.
+        fs.delete_snapshot(snap1).unwrap();
+        assert_eq!(fs.get_snapshot(snap1_active).unwrap(), None);
+        assert_eq!(
+            fs.get_snapshot(snap1_original).unwrap(),
+            None,
+            "unreferenced internal snapshot node should have been swept"
+        );
+    }
+
     // ---------- Image-backed persistence ----------
 
     /// Helper: build a unique image path under the test tmpdir. Cleaned up
@@ -1787,6 +2104,53 @@ mod tests {
             b"alpha-pre-snap",
             "readonly snapshot subvol should see pre-snap write"
         );
+    }
+
+    /// Snapshot deletion's metadata transaction must survive a crash through
+    /// the journal even when the physical dead-snap cleanup has not been
+    /// checkpointed. The key-drop compaction is GC-style cleanup; losing it
+    /// in a crash is fine, but losing the subvolume/snapshot metadata
+    /// deletion is not.
+    #[test]
+    fn image_delete_snapshot_metadata_recovers_from_journal() {
+        let img = tmp_image_path("del-snap-jnl");
+        let snap_subvol;
+        let dead_snap;
+        let pre_ino;
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            make_root(&mut fs);
+            pre_ino = make_file(&mut fs, ROOT_INO, b"pre");
+            fs.journal_commit().unwrap();
+
+            snap_subvol = fs.snapshot_subvol(ROOT_SUBVOL).unwrap();
+            dead_snap = fs.get_subvol(snap_subvol).unwrap().unwrap().snap_id;
+            // Put some live keys at the snapshot's own snap_id so the
+            // recovery path has dead-snap garbage to (correctly) ignore.
+            fs.switch_subvol(snap_subvol).unwrap();
+            let _ = make_file(&mut fs, ROOT_INO, b"inside");
+            fs.switch_subvol(ROOT_SUBVOL).unwrap();
+            fs.journal_commit().unwrap();
+
+            fs.delete_snapshot(snap_subvol).unwrap();
+            fs.journal_commit().unwrap();
+            // Crash: no sync, so the key-drop compaction is lost.
+        }
+
+        let mut fs = Fs::open(&img.0).unwrap();
+        // The metadata deletion was journaled and is replayed.
+        assert_eq!(fs.get_subvol(snap_subvol).unwrap(), None);
+        assert_eq!(fs.get_snapshot(dead_snap).unwrap(), None);
+        assert!(matches!(
+            fs.switch_subvol(snap_subvol),
+            Err(FsError::NotFound)
+        ));
+
+        // The active root subvolume still works and still sees pre-snapshot
+        // data; keys written only inside the deleted snapshot are invisible.
+        let d = fs.lookup_dirent(ROOT_INO, b"pre").unwrap().unwrap();
+        assert_eq!(d.target_ino, pre_ino);
+        assert_eq!(fs.lookup_dirent(ROOT_INO, b"inside").unwrap(), None);
     }
 
     /// Overwrite the same extent slot many times across multiple sync

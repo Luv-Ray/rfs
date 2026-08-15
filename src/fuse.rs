@@ -200,6 +200,8 @@ fn errno_for_fs_error(e: FsError) -> Errno {
         FsError::NotEmpty => Errno::ENOTEMPTY,
         FsError::AlreadyExists => Errno::EEXIST,
         FsError::Exhausted => Errno::ENOSPC,
+        FsError::Invalid => Errno::EINVAL,
+        FsError::Busy => Errno::EBUSY,
         FsError::Btree(_) => Errno::EIO,
     }
 }

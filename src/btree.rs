@@ -440,6 +440,32 @@ impl Btree {
         Ok(out)
     }
 
+    /// Drop every entry stored at `dead_snap` from the whole reachable tree.
+    ///
+    /// Snapshot deletion calls this after removing the snapshot-tree
+    /// metadata: once no live subvolume's ancestor chain contains
+    /// `dead_snap`, every key version at that snap_id (Live, Deleted, or
+    /// Whiteout) is unreachable and can be physically removed. Like
+    /// [`Self::compact_whiteouts`], this is a compaction pass — each touched
+    /// leaf is rebuilt from its merged view, so dropping a winning entry at
+    /// `dead_snap` drops all physical copies of that sortable key.
+    ///
+    /// Edits are applied in place (dirty cache until the next checkpoint), no
+    /// split is possible, and `root_block` stays put. Internal-node separator
+    /// keys are left in place; a separator may outlive the leaf entry it was
+    /// promoted from, which is fine because separators are only routing
+    /// bounds, not data.
+    ///
+    /// Returns the number of winning entries dropped.
+    pub fn drop_snapshot_keys(&mut self, dead_snap: SnapId) -> Result<usize> {
+        drop_snapshot_keys_rec(
+            &self.store,
+            self.root_block,
+            dead_snap,
+            &mut self.next_bset_seq,
+        )
+    }
+
     /// Whiteout-only compaction over the whole reachable tree.
     ///
     /// Walks every leaf and, where the `BSET_FLAG_NEEDS_WHITEOUT` marker
@@ -920,6 +946,44 @@ fn leaf_has_droppable_whiteout(
         }
     }
     false
+}
+
+/// Does this leaf contain any raw entry at `dead_snap`? Used to decide whether
+/// a snapshot-deletion compaction would change the leaf. Scanning raw bsets
+/// (rather than the merged view) is deliberate: even an old dead-snap copy
+/// shadowed by a newer duplicate is enough reason to rebuild, because the
+/// rebuild will collapse all duplicates and physically discard the dead copy.
+fn leaf_has_snap_entries(node: &BtreeNodeRaw, dead_snap: SnapId) -> bool {
+    for b in 0..node.bset_count() {
+        for entry in node.bset_entries(b) {
+            if entry.snap_id() == dead_snap {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Snapshot-deletion compaction: rebuild `node` from its merged view, dropping
+/// every winning entry whose snap_id is `dead_snap` (any kind). Returns the
+/// number of winning entries dropped.
+fn compact_leaf_dropping_snap(node: &mut BtreeNodeRaw, new_seq: u64, dead_snap: SnapId) -> usize {
+    debug_assert_eq!(node.level(), 0);
+    let entries = collect_leaf_entries_sorted(node);
+    let mut dropped = 0;
+    let kept: Vec<DiskEntry> = entries
+        .into_iter()
+        .filter(|e| {
+            if e.snap_id() == dead_snap {
+                dropped += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    rebuild_leaf_from_entries(node, new_seq, &kept);
+    dropped
 }
 
 /// Make the latest bset of `leaf` ready to receive a new sort-insert.
@@ -1684,6 +1748,37 @@ fn compact_whiteouts_rec(
     let mut dropped = 0;
     for child in children {
         dropped += compact_whiteouts_rec(store, child, dead_snaps, next_bset_seq)?;
+    }
+    Ok(dropped)
+}
+
+/// Recursive half of [`Btree::drop_snapshot_keys`]. Same traversal shape as
+/// [`compact_whiteouts_rec`], but the leaf predicate is "contains any entry
+/// at `dead_snap`" instead of the whiteout marker.
+fn drop_snapshot_keys_rec(
+    store: &BlockStore,
+    block_nr: u64,
+    dead_snap: SnapId,
+    next_bset_seq: &mut u64,
+) -> Result<usize> {
+    let level = store.with_node(block_nr, |n| n.level())?;
+    if level == 0 {
+        let should_compact =
+            store.with_node(block_nr, |leaf| leaf_has_snap_entries(leaf, dead_snap))?;
+        if !should_compact {
+            return Ok(0);
+        }
+        return store.with_node_mut(block_nr, |leaf| {
+            compact_leaf_dropping_snap(leaf, alloc_seq(next_bset_seq), dead_snap)
+        });
+    }
+
+    let children: Vec<u64> = store.with_node(block_nr, |node| {
+        (0..=node.nkeys()).map(|i| node.child_block(i)).collect()
+    })?;
+    let mut dropped = 0;
+    for child in children {
+        dropped += drop_snapshot_keys_rec(store, child, dead_snap, next_bset_seq)?;
     }
     Ok(dropped)
 }
@@ -3253,6 +3348,89 @@ mod tests {
         assert!(!node.bset_needs_whiteout(0));
         assert_eq!(node.bset_entries(0).len(), 1);
         assert_eq!(node.bset_entries(0)[0].kind_enum(), EntryKind::Live);
+    }
+
+    #[test]
+    fn drop_snapshot_keys_removes_all_kinds_at_dead_snap() {
+        // Snapshot deletion must physically remove Live, Deleted, and
+        // Whiteout entries stored at the dead snap_id, while leaving every
+        // other snap_id untouched.
+        let mut tree = Btree::new();
+        tree.insert_at(b"root", ROOT_SNAP, b"v_root").unwrap();
+        tree.insert_at(b"live", 100, b"v_live").unwrap();
+        tree.insert_with_kind(b"deleted", 100, EntryKind::Deleted, &[])
+            .unwrap();
+        tree.insert_with_kind(b"white", 100, EntryKind::Whiteout, &[])
+            .unwrap();
+        tree.insert_at(b"other", 80, b"v_other").unwrap();
+
+        let dropped = tree.drop_snapshot_keys(100).unwrap();
+        assert_eq!(dropped, 3);
+
+        let raw = tree.range_scan_all(b"a", b"z").unwrap();
+        let dead: Vec<&SnapId> = raw
+            .iter()
+            .filter(|(_, snap, _, _)| *snap == 100)
+            .map(|(_, snap, _, _)| snap)
+            .collect();
+        assert!(
+            dead.is_empty(),
+            "entries at the dead snap survived: {dead:?}"
+        );
+        assert_eq!(
+            tree.find_at(b"root", ROOT_SNAP).unwrap().as_deref(),
+            Some(b"v_root".as_slice())
+        );
+        assert_eq!(
+            tree.find_at(b"other", 80).unwrap().as_deref(),
+            Some(b"v_other".as_slice())
+        );
+        tree.verify();
+    }
+
+    #[test]
+    fn drop_snapshot_keys_does_not_resurrect_shadowed_copy() {
+        // A dead-snap key may have duplicate physical copies across bsets.
+        // Rebuilding the leaf from the merged view drops the winning copy
+        // AND every shadowed duplicate, so none of them can resurface.
+        let mut tree = Btree::new();
+        tree.insert_at(b"K", 100, b"old").unwrap();
+        for i in 0..(BSET_SOFT_LIMIT as u32 + 2) {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
+        assert!(root_leaf_bset_count(&tree) >= 2);
+        tree.insert_at(b"K", 100, b"new").unwrap();
+
+        let dropped = tree.drop_snapshot_keys(100).unwrap();
+        assert_eq!(dropped, 1, "merged view contains exactly one winning K@100");
+
+        let raw = tree.range_scan_all(b"J", b"L").unwrap();
+        assert!(
+            raw.iter()
+                .all(|(logical, snap, _, _)| !(logical.as_slice() == b"K" && *snap == 100)),
+            "both physical K@100 copies must be gone"
+        );
+        tree.verify();
+    }
+
+    #[test]
+    fn drop_snapshot_keys_reaches_leaves_below_internal_nodes() {
+        let mut tree = Btree::new();
+        for i in 0..=(MAX_ENTRIES as u32) {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
+        assert!(tree.store.read_node_copy(tree.root_block).unwrap().level() > 0);
+        tree.insert_at(b"zz", 100, b"dead").unwrap();
+        tree.insert_at(b"yy", ROOT_SNAP, b"live").unwrap();
+
+        let dropped = tree.drop_snapshot_keys(100).unwrap();
+        assert_eq!(dropped, 1);
+        assert_eq!(tree.find_at(b"zz", 100).unwrap(), None);
+        assert_eq!(
+            tree.find_at(b"yy", ROOT_SNAP).unwrap().as_deref(),
+            Some(b"live".as_slice())
+        );
+        tree.verify();
     }
 
     #[test]

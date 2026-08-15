@@ -46,7 +46,10 @@ Snapshot lifecycle (one connected piece):
       `Btree::compact_whiteouts` drops only whiteouts at dead snap_ids; a
       winning whiteout drop also drops shadowed duplicate copies via merged
       compaction, so lower-seq versions cannot resurface)
-- [ ] Snapshot deletion (walk btrees, drop gone snap_id keys, clean whiteouts)
+- [x] Snapshot deletion (`Fs::delete_snapshot`: validates leaf snapshot /
+      non-active subvol, atomically tombstones snapshot+subvol metadata,
+      `Btree::drop_snapshot_keys` compacts away every key version at the
+      dead snap_id, then sweeps unreferenced internal snapshot nodes)
 - [ ] `deleted_inodes` btree + background reclaim (bcachefs style): make unlink
       bounded by recording the orphan inode and reclaiming its extents lazily,
       instead of deleting every extent in one transaction. Removes the current
