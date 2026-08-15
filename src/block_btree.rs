@@ -33,12 +33,22 @@ pub const BSET_TREE_NR_MAX: usize = 4;
 /// value (4 × 7 = 28 ≤ 28).
 pub const BSET_SOFT_LIMIT: usize = 7;
 
+/// `BsetHeader::flags` bit: this bset contains (or contained at some point)
+/// at least one `Whiteout` entry. Kept as a "may contain whiteout" flag so a
+/// snapshot-deletion pass can find whiteouts without scanning every entry of
+/// every leaf; compaction recomputes it exactly from the surviving entries.
+/// The flag may remain set after a whiteout is overwritten (over-approximation
+/// is safe — it only causes an unnecessary whiteout-compaction pass).
+pub const BSET_FLAG_NEEDS_WHITEOUT: u16 = 1 << 0;
+
 /// Per-entry type tag. Stored in `DiskEntry::kind`.
 ///
 /// - `Live`: normal key/value.
 /// - `Deleted`: trivial tombstone (KEY_TYPE_deleted in bcachefs). Produced
-///   when X deletes a key it itself wrote at snap_id == X. Compaction may
-///   drop these unconditionally.
+///   when X deletes a key it itself wrote at snap_id == X. Like a whiteout it
+///   must shadow ancestor versions until snap X is gone, so ordinary
+///   compaction keeps it; snapshot deletion may drop it together with the
+///   other keys at the dead snap_id.
 /// - `Whiteout`: snapshot tombstone (KEY_TYPE_whiteout in bcachefs). Produced
 ///   when X deletes a key inherited from an ancestor snapshot. Must shadow
 ///   the ancestor's still-live key, so compaction keeps it until the relevant
@@ -100,7 +110,7 @@ const _: () = assert!(std::mem::size_of::<NodeHeader>() == 64);
 /// bcachefs's `struct bset` carries seq + flags + version + size; this is
 /// the minimal subset we need: a monotonic seq (so the merged iterator can
 /// resolve ties between bsets storing the same key), the per-bset entry
-/// count, and a flags field for future bits like `needs_whiteout`.
+/// count, and a flags field. Bit 0 is [`BSET_FLAG_NEEDS_WHITEOUT`].
 #[repr(C)]
 #[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Copy)]
 pub struct BsetHeader {
@@ -385,6 +395,28 @@ impl BtreeNodeRaw {
     pub fn bset_header(&self, i: usize) -> BsetHeader {
         let off = bset_offset(self, i);
         read_bset_header(self, off)
+    }
+
+    /// Whether bset `i` has the "needs whiteout processing" flag set.
+    pub fn bset_needs_whiteout(&self, i: usize) -> bool {
+        self.bset_header(i).flags & BSET_FLAG_NEEDS_WHITEOUT != 0
+    }
+
+    /// Set or clear the "needs whiteout processing" flag on bset `i`.
+    pub fn set_bset_needs_whiteout(&mut self, i: usize, needs: bool) {
+        let off = bset_offset(self, i);
+        let mut h = read_bset_header(self, off);
+        if needs {
+            h.flags |= BSET_FLAG_NEEDS_WHITEOUT;
+        } else {
+            h.flags &= !BSET_FLAG_NEEDS_WHITEOUT;
+        }
+        write_bset_header(self, off, &h);
+    }
+
+    /// Whether any bset in this node has the "needs whiteout processing" flag.
+    pub fn any_bset_needs_whiteout(&self) -> bool {
+        (0..self.bset_count()).any(|i| self.bset_needs_whiteout(i))
     }
 
     /// Sorted entries belonging to bset `i`.

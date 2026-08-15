@@ -42,8 +42,10 @@ Functionality gaps (user-visible):
       `switch_subvol` exist but have no mount-side entry point)
 
 Snapshot lifecycle (one connected piece):
-- [ ] `needs_whiteout` bit + whiteout-only compaction (let compaction safely
-      drop whiteouts, not just `Deleted`)
+- [x] `needs_whiteout` bit + whiteout-only compaction (per-bset flag,
+      `Btree::compact_whiteouts` drops only whiteouts at dead snap_ids; a
+      winning whiteout drop also drops shadowed duplicate copies via merged
+      compaction, so lower-seq versions cannot resurface)
 - [ ] Snapshot deletion (walk btrees, drop gone snap_id keys, clean whiteouts)
 - [ ] `deleted_inodes` btree + background reclaim (bcachefs style): make unlink
       bounded by recording the orphan inode and reclaiming its extents lazily,

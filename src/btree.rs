@@ -440,6 +440,38 @@ impl Btree {
         Ok(out)
     }
 
+    /// Whiteout-only compaction over the whole reachable tree.
+    ///
+    /// Walks every leaf and, where the `BSET_FLAG_NEEDS_WHITEOUT` marker
+    /// says a bset may contain whiteouts, compacts the leaf while dropping
+    /// each winning `Whiteout` whose `snap_id` is in `dead_snaps`. Compaction
+    /// (not point deletion) is what makes the drop safe: the merged view
+    /// collapses duplicate `(logical, snap)` versions to the highest-seq
+    /// winner, so removing a winning whiteout removes all physical copies of
+    /// that version instead of resurrecting a lower-seq one.
+    ///
+    /// `dead_snaps` is the caller's snapshot-tree decision: it must contain
+    /// snap ids that no longer appear on any live ancestor chain. The btree
+    /// layer cannot verify that, so it blindly trusts the set. Edits are
+    /// applied in place (dirty cache until the next checkpoint), no split is
+    /// possible (compaction only shrinks leaves), and `root_block` stays put.
+    ///
+    /// Returns the number of whiteout entries dropped.
+    pub fn compact_whiteouts(
+        &mut self,
+        dead_snaps: &std::collections::HashSet<SnapId>,
+    ) -> Result<usize> {
+        if dead_snaps.is_empty() {
+            return Ok(0);
+        }
+        compact_whiteouts_rec(
+            &self.store,
+            self.root_block,
+            dead_snaps,
+            &mut self.next_bset_seq,
+        )
+    }
+
     pub fn dump(&self) {
         println!(
             "=== B-tree (next_block_nr={}) ===",
@@ -682,6 +714,21 @@ fn verify_node(store: &BlockStore, block_nr: u64, lo: Option<&[u8]>, hi: Option<
             }
             prev = Some(k);
         }
+        // The needs-whiteout flag is an over-approximation in the set
+        // direction, but it must never be false for a bset that actually
+        // contains a whiteout — whiteout compaction relies on that.
+        for b in 0..node.bset_count() {
+            if node.bset_needs_whiteout(b) {
+                continue;
+            }
+            for entry in node.bset_entries(b) {
+                debug_assert!(
+                    entry.kind_enum() != EntryKind::Whiteout,
+                    "blk={block_nr} bset {b} contains a whiteout but the \
+                     needs-whiteout flag is clear"
+                );
+            }
+        }
         return;
     }
 
@@ -801,16 +848,78 @@ fn collect_leaf_entries_sorted(node: &BtreeNodeRaw) -> Vec<DiskEntry> {
 /// Always operates on leaves — internals stay single-bset by construction
 /// and never need compaction.
 fn compact_leaf_in_place(node: &mut BtreeNodeRaw, new_seq: u64) {
-    debug_assert_eq!(node.level(), 0);
     let entries = collect_leaf_entries_sorted(node);
+    rebuild_leaf_from_entries(node, new_seq, &entries);
+}
+
+/// Rebuild `node` as a single fresh bset containing exactly `entries` (which
+/// must already be sorted and deduplicated). Recomputes the
+/// `BSET_FLAG_NEEDS_WHITEOUT` flag from the surviving entries so a
+/// compaction that removes the last whiteout clears the flag.
+fn rebuild_leaf_from_entries(node: &mut BtreeNodeRaw, new_seq: u64, entries: &[DiskEntry]) {
+    debug_assert_eq!(node.level(), 0);
     let gen_no = node.generation();
+    let needs_whiteout = entries.iter().any(|e| e.kind_enum() == EntryKind::Whiteout);
     // Reset the body to a single empty bset; replay entries in sorted order.
     *node = BtreeNodeRaw::new(0);
     node.set_generation(gen_no);
     node.start_new_bset(new_seq);
-    for entry in &entries {
+    for entry in entries {
         node.append_to_last_bset(entry);
     }
+    node.set_bset_needs_whiteout(0, needs_whiteout);
+}
+
+/// Whiteout-only compaction: rebuild a leaf from its merged view, dropping
+/// every winning `Whiteout` entry whose snap_id is in `dead_snaps`. Because
+/// the merged view already collapsed duplicate `(logical, snap)` versions to
+/// the highest-seq winner, dropping that winner drops *all* physical copies
+/// of the key — a lower-seq copy can never resurface. `Deleted` and live
+/// entries are always kept; a full snapshot-deletion pass removes them
+/// separately.
+///
+/// Returns the number of whiteout entries dropped.
+fn compact_leaf_dropping_whiteouts(
+    node: &mut BtreeNodeRaw,
+    new_seq: u64,
+    dead_snaps: &std::collections::HashSet<SnapId>,
+) -> usize {
+    debug_assert_eq!(node.level(), 0);
+    let entries = collect_leaf_entries_sorted(node);
+    let mut dropped = 0;
+    let kept: Vec<DiskEntry> = entries
+        .into_iter()
+        .filter(|e| {
+            let drop = e.kind_enum() == EntryKind::Whiteout && dead_snaps.contains(&e.snap_id());
+            if drop {
+                dropped += 1;
+            }
+            !drop
+        })
+        .collect();
+    rebuild_leaf_from_entries(node, new_seq, &kept);
+    dropped
+}
+
+/// Does any bset flagged `needs_whiteout` in this leaf contain a whiteout for
+/// a dead snapshot? The flag is an over-approximation (it stays set when a
+/// whiteout is overwritten), so the caller verifies the candidate before
+/// spending a compaction on it.
+fn leaf_has_droppable_whiteout(
+    node: &BtreeNodeRaw,
+    dead_snaps: &std::collections::HashSet<SnapId>,
+) -> bool {
+    for b in 0..node.bset_count() {
+        if !node.bset_needs_whiteout(b) {
+            continue;
+        }
+        for entry in node.bset_entries(b) {
+            if entry.kind_enum() == EntryKind::Whiteout && dead_snaps.contains(&entry.snap_id()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Make the latest bset of `leaf` ready to receive a new sort-insert.
@@ -1058,6 +1167,12 @@ fn flip_kind_in_place(
         }
         let (b, i, _) = best.expect("flip_kind_in_place: key not found in leaf");
         leaf.entry_at_mut(b, i).set_kind(new_kind);
+        // Future-proofing: this function currently only ever flips Live→
+        // Deleted, but if it is reused to flip a key to Whiteout the
+        // needs-whiteout marker must be set on the containing bset.
+        if new_kind == EntryKind::Whiteout {
+            leaf.set_bset_needs_whiteout(b, true);
+        }
     };
 
     let level = store.with_node(block_nr, |n| n.level())?;
@@ -1186,6 +1301,14 @@ fn insert_leaf(
             // Return value (overwrite vs new slot) is irrelevant: the entry is
             // written either way.
             let _ = leaf.sort_insert_into_last_bset(&entry);
+        }
+        // A whiteout write marks the bset it landed in so a future snapshot
+        // deletion can find it without scanning every entry of every leaf.
+        // Overwriting a whiteout with a non-whiteout leaves the flag set —
+        // that over-approximation is safe and is recomputed on compaction.
+        if kind == EntryKind::Whiteout {
+            let last_idx = leaf.bset_count() - 1;
+            leaf.set_bset_needs_whiteout(last_idx, true);
         }
     };
 
@@ -1527,6 +1650,42 @@ fn checkpoint_flush(store: &BlockStore, block_nr: u64) -> Result<u64> {
     let new_block = store.alloc();
     store.write_node(new_block, &node)?;
     Ok(new_block)
+}
+
+/// Recursive half of [`Btree::compact_whiteouts`]. Applies leaf compactions
+/// in place and accumulates the number of dropped whiteouts. Leaf edits never
+/// change a block number, so internal nodes (and therefore `root_block`) are
+/// untouched; only the target leaves are marked dirty.
+fn compact_whiteouts_rec(
+    store: &BlockStore,
+    block_nr: u64,
+    dead_snaps: &std::collections::HashSet<SnapId>,
+    next_bset_seq: &mut u64,
+) -> Result<usize> {
+    let level = store.with_node(block_nr, |n| n.level())?;
+    if level == 0 {
+        let should_compact = store.with_node(block_nr, |leaf| {
+            leaf_has_droppable_whiteout(leaf, dead_snaps)
+        })?;
+        if !should_compact {
+            return Ok(0);
+        }
+        return store.with_node_mut(block_nr, |leaf| {
+            compact_leaf_dropping_whiteouts(leaf, alloc_seq(next_bset_seq), dead_snaps)
+        });
+    }
+
+    // Internal node: collect the child plan under the read lock, then recurse
+    // after the lock is released (with_node* closures must not re-enter the
+    // store).
+    let children: Vec<u64> = store.with_node(block_nr, |node| {
+        (0..=node.nkeys()).map(|i| node.child_block(i)).collect()
+    })?;
+    let mut dropped = 0;
+    for child in children {
+        dropped += compact_whiteouts_rec(store, child, dead_snaps, next_bset_seq)?;
+    }
+    Ok(dropped)
 }
 
 // ---------- Scan & debug ----------
@@ -2922,6 +3081,212 @@ mod tests {
         );
     }
 
+    // ---------- Whiteout flag + whiteout-only compaction ----------
+
+    fn dead_snaps(snaps: impl IntoIterator<Item = SnapId>) -> std::collections::HashSet<SnapId> {
+        snaps.into_iter().collect()
+    }
+
+    #[test]
+    fn whiteout_write_sets_needs_whiteout_flag() {
+        let mut tree = Btree::new();
+        tree.insert_at(b"K", ROOT_SNAP, b"v_root").unwrap();
+        tree.delete_at(b"K", 100, &[100, ROOT_SNAP]).unwrap();
+
+        let root = tree.store.read_node_copy(tree.root_block).unwrap();
+        assert!(
+            root.bset_needs_whiteout(0),
+            "bset containing a cross-snap whiteout must be flagged"
+        );
+        tree.verify();
+    }
+
+    #[test]
+    fn compact_whiteouts_drops_only_dead_whiteouts_keeps_deleted() {
+        // Parent has K. Child 100 overwrites K then deletes it, producing a
+        // Deleted tombstone at 100; child 80 deletes the inherited parent
+        // key, producing a Whiteout at 80. Whiteout compaction for dead
+        // snaps {80, 100} must remove only the whiteout — Deleted entries
+        // are kept for the full snapshot-deletion pass.
+        let mut tree = Btree::new();
+        tree.insert_at(b"K", ROOT_SNAP, b"v_root").unwrap();
+        tree.insert_at(b"K", 100, b"v_100").unwrap();
+        tree.delete_at(b"K", 100, &[100, ROOT_SNAP]).unwrap();
+        tree.delete_at(b"K", 80, &[80, ROOT_SNAP]).unwrap();
+
+        let dropped = tree.compact_whiteouts(&dead_snaps([80, 100])).unwrap();
+        assert_eq!(dropped, 1, "only the Whiteout@80 may be dropped");
+
+        let raw = tree.range_scan_all(b"J", b"L").unwrap();
+        let rows: Vec<(SnapId, EntryKind)> = raw
+            .iter()
+            .map(|(_, snap, kind, _)| (*snap, *kind))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(100, EntryKind::Deleted), (ROOT_SNAP, EntryKind::Live)]
+        );
+
+        // Deleted@100 still shadows the parent key for chain [100, root];
+        // chain [80, root] now sees the parent key again.
+        assert_eq!(tree.find_visible(b"K", &[100, ROOT_SNAP]).unwrap(), None);
+        assert_eq!(
+            tree.find_visible(b"K", &[80, ROOT_SNAP])
+                .unwrap()
+                .as_deref(),
+            Some(b"v_root".as_slice())
+        );
+        tree.verify();
+    }
+
+    #[test]
+    fn compact_whiteouts_does_not_resurrect_shadowed_copy() {
+        // The same (logical, snap) version can exist in multiple bsets, with
+        // the highest-seq copy winning. If that winner is a dropped whiteout,
+        // compaction must drop every physical copy of the version — otherwise
+        // an older Live copy would resurface. This is why whiteout removal is
+        // a compaction, not a point delete.
+        let mut tree = Btree::new();
+        tree.insert_at(b"K", ROOT_SNAP, b"v_root").unwrap();
+        tree.insert_at(b"K", 100, b"v_100").unwrap();
+        // Roll the bset so a later write of K@100 lands in a newer bset as a
+        // duplicate rather than overwriting the copy in bset 0.
+        for i in 0..(BSET_SOFT_LIMIT as u32 + 2) {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
+        assert!(root_leaf_bset_count(&tree) >= 2);
+        tree.insert_with_kind(b"K", 100, EntryKind::Whiteout, &[])
+            .unwrap();
+        assert_eq!(tree.find_visible(b"K", &[100, ROOT_SNAP]).unwrap(), None);
+
+        let dropped = tree.compact_whiteouts(&dead_snaps([100])).unwrap();
+        assert_eq!(dropped, 1);
+
+        let raw = tree.range_scan_all(b"J", b"L").unwrap();
+        let k100_rows = raw
+            .iter()
+            .filter(|(logical, snap, _, _)| logical.as_slice() == b"K" && *snap == 100)
+            .count();
+        assert_eq!(
+            k100_rows, 0,
+            "dropping the winning whiteout must also drop the older shadowed K@100 copy"
+        );
+        assert_eq!(
+            tree.find_visible(b"K", &[100, ROOT_SNAP])
+                .unwrap()
+                .as_deref(),
+            Some(b"v_root".as_slice()),
+            "after the whiteout is gone, chain [100, root] sees the parent version"
+        );
+        tree.verify();
+    }
+
+    #[test]
+    fn whiteout_flag_survives_checkpoint() {
+        // checkpoint_flush COW-relocates dirty leaves; the copied node must
+        // carry the per-bset flag (and the whiteout) onto the fresh block.
+        let mut tree = Btree::new();
+        tree.insert_at(b"K", ROOT_SNAP, b"v_root").unwrap();
+        tree.delete_at(b"K", 100, &[100, ROOT_SNAP]).unwrap();
+
+        tree.checkpoint().unwrap();
+
+        let root = tree.store.read_node_copy(tree.root_block).unwrap();
+        assert!(root.bset_needs_whiteout(0));
+        assert_eq!(tree.find_visible(b"K", &[100, ROOT_SNAP]).unwrap(), None);
+        assert_eq!(
+            tree.find_visible(b"K", &[ROOT_SNAP]).unwrap().as_deref(),
+            Some(b"v_root".as_slice())
+        );
+        tree.verify();
+    }
+
+    #[test]
+    fn full_compaction_preserves_whiteout_and_flag() {
+        let mut tree = Btree::new();
+        tree.insert_at(b"W", ROOT_SNAP, b"v_root").unwrap();
+        tree.insert_with_kind(b"W", 100, EntryKind::Whiteout, &[])
+            .unwrap();
+        force_full_compaction(&mut tree, 2);
+
+        let root = tree.store.read_node_copy(tree.root_block).unwrap();
+        assert_eq!(
+            root.bset_count(),
+            1,
+            "force_full_compaction should have compacted the leaf back to one bset"
+        );
+        assert_eq!(root.nkeys(), MAX_ENTRIES);
+        assert!(
+            root.bset_needs_whiteout(0),
+            "ordinary compaction must keep the flag when a whiteout survives"
+        );
+        let raw = tree.range_scan_all(b"V", b"X").unwrap();
+        let kinds: Vec<(SnapId, EntryKind)> = raw
+            .iter()
+            .map(|(_, snap, kind, _)| (*snap, *kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![(100, EntryKind::Whiteout), (ROOT_SNAP, EntryKind::Live)]
+        );
+        assert_eq!(tree.find_visible(b"W", &[100, ROOT_SNAP]).unwrap(), None);
+        assert_eq!(
+            tree.find_visible(b"W", &[ROOT_SNAP]).unwrap().as_deref(),
+            Some(b"v_root".as_slice())
+        );
+        tree.verify();
+    }
+
+    #[test]
+    fn compaction_clears_stale_whiteout_flag() {
+        // Overwriting a whiteout with a Live entry leaves the flag set
+        // (cheap over-approximation). The next full compaction rebuilds the
+        // bset from the merged view and must clear the stale bit.
+        let mut tree = Btree::new();
+        tree.insert_with_kind(b"K", 100, EntryKind::Whiteout, &[])
+            .unwrap();
+        tree.insert_at(b"K", 100, b"v").unwrap();
+        let mut node = tree.store.read_node_copy(tree.root_block).unwrap();
+        assert!(node.bset_needs_whiteout(0));
+
+        compact_leaf_in_place(&mut node, 99);
+        assert!(!node.bset_needs_whiteout(0));
+        assert_eq!(node.bset_entries(0).len(), 1);
+        assert_eq!(node.bset_entries(0)[0].kind_enum(), EntryKind::Live);
+    }
+
+    #[test]
+    fn compact_whiteouts_reaches_leaves_below_internal_nodes() {
+        // The tree walk must descend through internal nodes; whiteout
+        // compaction is not just a root-leaf shortcut.
+        let mut tree = Btree::new();
+        for i in 0..=(MAX_ENTRIES as u32) {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
+        assert!(tree.store.read_node_copy(tree.root_block).unwrap().level() > 0);
+
+        tree.insert_at(b"zz", ROOT_SNAP, b"v_root").unwrap();
+        tree.delete_at(b"zz", 100, &[100, ROOT_SNAP]).unwrap();
+
+        let dropped = tree.compact_whiteouts(&dead_snaps([100])).unwrap();
+        assert_eq!(dropped, 1);
+
+        let raw = tree.range_scan_all(b"zy", b"z{").unwrap();
+        let rows: Vec<(SnapId, EntryKind)> = raw
+            .iter()
+            .filter(|(logical, _, _, _)| logical.as_slice() == b"zz")
+            .map(|(_, snap, kind, _)| (*snap, *kind))
+            .collect();
+        assert_eq!(rows, vec![(ROOT_SNAP, EntryKind::Live)]);
+        assert_eq!(
+            tree.find_visible(b"zz", &[100, ROOT_SNAP])
+                .unwrap()
+                .as_deref(),
+            Some(b"v_root".as_slice())
+        );
+        tree.verify();
+    }
+
     // ---------- Phase 6: Btree::transaction ----------
 
     #[test]
@@ -3109,6 +3474,17 @@ mod tests {
                 return node.bset_count();
             }
             blk = node.child_block(0);
+        }
+    }
+
+    /// Fill a single-leaf tree with enough distinct numeric keys to drive the
+    /// four-bsets-full compaction path. `existing_entries` is the number of
+    /// distinct sortable keys already in the leaf; the helper leaves the leaf
+    /// at exactly MAX_ENTRIES entries with one freshly compacted bset.
+    fn force_full_compaction(tree: &mut Btree, existing_entries: usize) {
+        let fill = BSET_SOFT_LIMIT * BSET_TREE_NR_MAX - existing_entries;
+        for i in 0..=(fill as u32) {
+            tree.insert(&key(i), &val(i)).unwrap();
         }
     }
 
