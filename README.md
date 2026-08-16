@@ -50,11 +50,12 @@ Snapshot lifecycle (one connected piece):
       non-active subvol, atomically tombstones snapshot+subvol metadata,
       `Btree::drop_snapshot_keys` compacts away every key version at the
       dead snap_id, then sweeps unreferenced internal snapshot nodes)
-- [ ] `deleted_inodes` btree + background reclaim (bcachefs style): make unlink
-      bounded by recording the orphan inode and reclaiming its extents lazily,
-      instead of deleting every extent in one transaction. Removes the current
-      limit that unlinking a large file (> ~3.6 MB) can overflow the journal
-      ring in a single commit group.
+- [x] `deleted_inodes` btree + lazy reclaim (bcachefs style): unlink now
+      records a `(inode, snap_id, next_offset)` work item and tombstones only
+      dirent+inode in the transaction; `Fs::journal_commit` reclaims a slice
+      of extents with a budget derived from the journal ring's remaining soft
+      capacity, so unlinking a large file can no longer overflow one commit
+      group.
 
 Write-amplification path (prerequisite chain for larger nodes):
 - [x] Node cache rewrite: `FrozenMap` → dirty-tracked mutable cache

@@ -60,12 +60,17 @@ const KIND_SNAPSHOT: u8 = 0xF0;
 /// Subvolume tree: maps a subvol_id to its current snap_id and root inode.
 /// Stored at logical key `[KIND_SUBVOL, subvol_id_be]` with snap=ROOT_SNAP.
 const KIND_SUBVOL: u8 = 0xF1;
+/// Orphaned-inode worklist. `unlink` records one entry per (inode, snap)
+/// whose last link disappeared; a later bounded reclaim pass deletes the
+/// inode's extents and then removes the work item.
+const KIND_DELETED_INODES: u8 = 0xF2;
 
 const INODE_KEY_LEN: usize = 1 + 8;
 const DIRENT_PREFIX_LEN: usize = 1 + 8;
 const EXTENT_KEY_LEN: usize = 1 + 8 + 8;
 const SNAPSHOT_KEY_LEN: usize = 1 + 4;
 const SUBVOL_KEY_LEN: usize = 1 + 4;
+const DELETED_INODE_KEY_LEN: usize = 1 + 8 + 4;
 
 /// Sentinel meaning "no parent" in the snapshot tree. Real snap_ids are
 /// allocated downward from `ROOT_SNAP = u32::MAX`, so 0 will never collide.
@@ -167,6 +172,28 @@ fn subvol_id_from_key(key: &[u8]) -> SubvolId {
     SubvolId::from_be_bytes(key[1..].try_into().unwrap())
 }
 
+fn deleted_inode_key(ino: u64, snap: SnapId) -> [u8; DELETED_INODE_KEY_LEN] {
+    let mut k = [0u8; DELETED_INODE_KEY_LEN];
+    k[0] = KIND_DELETED_INODES;
+    k[1..9].copy_from_slice(&ino.to_be_bytes());
+    k[9..].copy_from_slice(&snap.to_be_bytes());
+    k
+}
+
+/// Logical-key range covering every deleted-inode work item:
+/// `[KIND_DELETED_INODES, 0…] .. [KIND_DELETED_INODES + 1]`.
+fn deleted_inode_range() -> ([u8; DELETED_INODE_KEY_LEN], [u8; 1]) {
+    (deleted_inode_key(0, 0), [KIND_DELETED_INODES + 1])
+}
+
+fn deleted_inode_from_key(key: &[u8]) -> (u64, SnapId) {
+    assert_eq!(key.len(), DELETED_INODE_KEY_LEN);
+    assert_eq!(key[0], KIND_DELETED_INODES);
+    let ino = u64::from_be_bytes(key[1..9].try_into().unwrap());
+    let snap = SnapId::from_be_bytes(key[9..].try_into().unwrap());
+    (ino, snap)
+}
+
 // ---------- Value structs ----------
 
 #[repr(C)]
@@ -252,6 +279,34 @@ const _: () = assert!(std::mem::size_of::<SubvolV1>() == 32);
 
 pub const SUBVOL_FLAG_READONLY: u32 = 1 << 0;
 
+/// One deleted-inode work item's value. The identity (inode + snap_id) lives
+/// in the logical key; the value carries only reclaim progress.
+/// `next_offset` is the first extent offset that has not yet been tombstoned
+/// by the reclaim pass.
+#[repr(C)]
+#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeletedInodeV1 {
+    pub next_offset: u64,
+    _pad: [u8; 8],
+}
+
+const _: () = assert!(std::mem::size_of::<DeletedInodeV1>() == 16);
+
+impl DeletedInodeV1 {
+    pub fn new() -> Self {
+        DeletedInodeV1 {
+            next_offset: 0,
+            _pad: [0; 8],
+        }
+    }
+}
+
+impl Default for DeletedInodeV1 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------- Fs error type ----------
 
 /// High-level filesystem errors. The lower-level Btree calls return
@@ -306,6 +361,20 @@ impl From<crate::btree::Error> for FsError {
 }
 
 pub type FsResult<T> = std::result::Result<T, FsError>;
+
+/// Journal frames below this watermark are the soft capacity: a commit group
+/// is never allowed to push `next_journal_seq - last_checkpoint_seq` past it.
+/// The `-64` mirrors the pre-existing ring-near-full guard.
+const JOURNAL_RECLAIM_SOFT_LIMIT: u64 = crate::storage::JOURNAL_CAPACITY - 64;
+
+/// Fixed reclaim budget used when there is no journal ring to measure
+/// (pure in-memory filesystem).
+const RECLAIM_IN_MEMORY_BUDGET: usize = 128;
+
+/// Frames reserved on top of already-pending log records when computing how
+/// much reclaim may join a commit group: one CommitEnd, one orphan progress
+/// update (at most one per reclaim call), and one safety margin.
+const RECLAIM_COMMIT_RESERVED_FRAMES: u64 = 3;
 
 // ---------- Fs ----------
 
@@ -441,24 +510,39 @@ impl Fs {
     }
 
     /// Write a journal entry capturing the current fs state, then fsync data.
-    /// No-op for in-memory (RAM-only) filesystems. Called by the FUSE layer
-    /// after any write operation to provide crash recovery without a full sync.
+    /// Called by the FUSE layer after any write operation to provide crash
+    /// recovery without a full sync. Also runs one bounded slice of
+    /// deleted-inode reclaim, so orphan extent deletion is amortized over
+    /// ordinary commits.
     ///
-    /// Forces a checkpoint when the ring is near capacity to prevent wraparound
-    /// from overwriting un-checkpointed entries.
+    /// The reclaim budget is derived from the journal ring's remaining soft
+    /// capacity (the same `JOURNAL_CAPACITY - 64` watermark used by the
+    /// near-full checkpoint guard), minus the LoggedOp frames already pending
+    /// for the caller's operation and a small reserve for CommitEnd plus the
+    /// reclaim progress update. A fuller ring therefore reclaims less; an
+    /// empty one (right after a checkpoint) may reclaim more.
     pub fn journal_commit(&mut self) -> Result<()> {
         if self.journal.is_none() {
+            // Pure-RAM filesystem has no ring to measure, but still amortizes
+            // orphan cleanup over write commits.
+            self.reclaim_deleted_inodes(RECLAIM_IN_MEMORY_BUDGET)?;
             return Ok(());
         }
 
         // If the ring is near capacity, force a checkpoint first so that
         // recovery's scan start (sb.journal_seq + 1) stays within the ring.
+        // This also resets the soft-capacity headroom used below.
         if self
             .next_journal_seq
             .saturating_sub(self.last_checkpoint_seq)
-            >= crate::storage::JOURNAL_CAPACITY - 64
+            >= JOURNAL_RECLAIM_SOFT_LIMIT
         {
             self.sync()?;
+        }
+
+        let reclaim_budget = self.reclaim_budget_for_commit();
+        if reclaim_budget > 0 {
+            self.reclaim_deleted_inodes(reclaim_budget)?;
         }
 
         // Drain the btree's resolved-write log into this commit group: one
@@ -491,6 +575,24 @@ impl Fs {
         journal.append(&end)?;
         self.store.fsync()?;
         Ok(())
+    }
+
+    /// How many reclaim delete ops may join this commit without pushing the
+    /// journal ring past its soft watermark.
+    ///
+    /// Frames already spoken for: `pending_log_len()` LoggedOp records from
+    /// the caller's operation, one CommitEnd, one possible orphan-progress
+    /// update, and one safety margin. The result is converted to `usize`;
+    /// on 32-bit targets a huge headroom saturates.
+    fn reclaim_budget_for_commit(&self) -> usize {
+        let outstanding = self
+            .next_journal_seq
+            .saturating_sub(self.last_checkpoint_seq);
+        let headroom = JOURNAL_RECLAIM_SOFT_LIMIT.saturating_sub(outstanding);
+        let already_spoken_for =
+            self.tree.pending_log_len() as u64 + RECLAIM_COMMIT_RESERVED_FRAMES;
+        let budget = headroom.saturating_sub(already_spoken_for);
+        usize::try_from(budget).unwrap_or(usize::MAX)
     }
 
     /// Persist all live state (`fsync` data + write a fresh superblock).
@@ -700,6 +802,22 @@ impl Fs {
             .collect()
     }
 
+    /// Every pending deleted-inode work item, in logical-key (ino, snap)
+    /// order: `(ino, snap_id, next_offset)`.
+    pub fn list_deleted_inodes(&self) -> Result<Vec<(u64, SnapId, u64)>> {
+        let (start, end) = deleted_inode_range();
+        self.tree
+            .range_scan_visible(&start, &end, &[ROOT_SNAP])?
+            .into_iter()
+            .map(|(key, value)| {
+                let (ino, snap) = deleted_inode_from_key(&key);
+                let progress = DeletedInodeV1::read_from_bytes(&value)
+                    .expect("deleted-inode value size mismatch");
+                Ok((ino, snap, progress.next_offset))
+            })
+            .collect()
+    }
+
     // -- Inode --
 
     pub fn put_inode(&mut self, ino: u64, inode: &InodeV1) -> Result<()> {
@@ -805,6 +923,100 @@ impl Fs {
             .collect())
     }
 
+    /// Record one pending deleted-inode work item at `snap` (the snap_id at
+    /// which the file was unlinked). Work items are stored at ROOT_SNAP so
+    /// they are visible from every subvolume, exactly like snapshot/subvol
+    /// metadata.
+    fn put_deleted_inode(&mut self, ino: u64, snap: SnapId, next_offset: u64) -> Result<()> {
+        let progress = DeletedInodeV1 {
+            next_offset,
+            _pad: [0; 8],
+        };
+        self.tree.insert_at(
+            &deleted_inode_key(ino, snap),
+            ROOT_SNAP,
+            progress.as_bytes(),
+        )
+    }
+
+    fn delete_deleted_inode(&mut self, ino: u64, snap: SnapId) -> Result<bool> {
+        self.tree
+            .delete_at(&deleted_inode_key(ino, snap), ROOT_SNAP, &[ROOT_SNAP])
+    }
+
+    /// Lazily reclaim deleted inodes, deleting at most `op_budget` extent/
+    /// orphan btree records. Returns the number of delete operations issued.
+    ///
+    /// `op_budget` is measured in operations that each produce at most one
+    /// WAL LoggedOp frame. At most one extra orphan-progress update is written
+    /// per call (the caller reserves a frame for it when computing the
+    /// journal budget).
+    pub fn reclaim_deleted_inodes(&mut self, op_budget: usize) -> Result<usize> {
+        let mut budget = op_budget;
+        let mut issued = 0usize;
+
+        // Snapshot a fresh worklist. Reclaim is single-writer; this also
+        // means work items created later in this same call are picked up on
+        // the next commit.
+        let orphans = self.list_deleted_inodes()?;
+        for (ino, snap, next_offset) in orphans {
+            if budget == 0 {
+                break;
+            }
+
+            // If the snapshot is already gone, its keys were dropped by
+            // `Btree::drop_snapshot_keys`; the work item itself is obsolete.
+            if self.get_snapshot(snap)?.is_none() {
+                self.delete_deleted_inode(ino, snap)?;
+                budget -= 1;
+                issued += 1;
+                continue;
+            }
+
+            // Reclaim against this orphan's own snapshot chain, never the
+            // currently active subvolume's chain.
+            let chain = self.ancestor_chain(snap)?;
+            let (_, end) = extent_range(ino);
+            let start = extent_key(ino, next_offset);
+            let extents = self.tree.range_scan_visible(&start, &end, &chain)?;
+
+            let mut finished = true;
+            let mut last_offset = next_offset;
+            for (key, _extent) in extents {
+                if budget == 0 {
+                    finished = false;
+                    break;
+                }
+                let offset = extent_offset_from_key(&key);
+                self.tree
+                    .delete_at(&extent_key(ino, offset), snap, &chain)?;
+                last_offset = offset;
+                budget -= 1;
+                issued += 1;
+            }
+
+            if finished {
+                // No visible extents remain. Delete the work item if there
+                // is budget for it; otherwise leave it — the next pass will
+                // find an empty extent scan and only pay the orphan delete.
+                if budget == 0 {
+                    continue;
+                }
+                self.delete_deleted_inode(ino, snap)?;
+                budget -= 1;
+                issued += 1;
+            } else {
+                // Persist progress. At most one such update happens per call
+                // because the loop stops as soon as the budget is exhausted.
+                let next = last_offset.saturating_add(1);
+                if next != next_offset {
+                    self.put_deleted_inode(ino, snap, next)?;
+                }
+            }
+        }
+        Ok(issued)
+    }
+
     /// The ancestor chain of the currently active subvolume's snap_id.
     /// Used by every read path to resolve visibility.
     fn current_chain(&self) -> Result<Vec<SnapId>> {
@@ -816,10 +1028,14 @@ impl Fs {
     // These wrap multi-key changes in a single Btree::transaction so the
     // outside view sees a single root swap (atomic).
 
-    /// Remove a regular file. Decrements nlink; on the last link, removes
-    /// the inode and all of its extents (data blocks remain in `data_blocks`
-    /// for now — block reclamation is a TODO since snapshots can still hold
-    /// references to them via inherited extent entries).
+    /// Remove a regular file. Decrements nlink; on the last link, tombstones
+    /// the dirent and inode in one small transaction and records a
+    /// deleted-inode work item for the inode's extents. Extent reclamation
+    /// happens later, bounded by the journal's available frames, in
+    /// [`Fs::reclaim_deleted_inodes`] (called from `journal_commit`).
+    ///
+    /// Data blocks remain allocated (block reclamation is a separate TODO;
+    /// snapshots can still reference inherited extent entries).
     pub fn unlink(&mut self, parent: u64, name: &[u8]) -> FsResult<()> {
         let snap = self.current_snap();
         let chain = self.current_chain()?;
@@ -828,28 +1044,17 @@ impl Fs {
         let target_ino = dirent.target_ino;
         let inode = self.get_inode(target_ino)?.ok_or(FsError::NotFound)?;
 
-        // Last-link case: pre-collect extent offsets to delete in tx. Done
-        // here (not inside the closure) because we only have &mut Tx in the
-        // closure, not access to Fs::list_extents.
-        let extents: Vec<u64> = if inode.nlink <= 1 {
-            self.list_extents(target_ino)?
-                .into_iter()
-                .map(|(off, _)| off)
-                .collect()
-        } else {
-            Vec::new()
-        };
-
         let dirent_k = dirent_key(parent, name);
         let inode_k = inode_key(target_ino);
+        let orphan_k = deleted_inode_key(target_ino, snap);
 
         self.tree.transaction(|tx| {
             tx.delete_at(&dirent_k, snap, &chain)?;
             if inode.nlink <= 1 {
-                for offset in &extents {
-                    tx.delete_at(&extent_key(target_ino, *offset), snap, &chain)?;
-                }
                 tx.delete_at(&inode_k, snap, &chain)?;
+                // Record the orphan AFTER the dirent/inode tombstones, so a
+                // torn commit replays all three or none of them.
+                tx.insert(&orphan_k, ROOT_SNAP, DeletedInodeV1::new().as_bytes())?;
             } else {
                 let mut updated = inode;
                 updated.nlink -= 1;
@@ -1437,8 +1642,15 @@ mod tests {
         assert_eq!(fs.lookup_dirent(ROOT_INO, b"f").unwrap(), None);
         // Inode gone.
         assert_eq!(fs.get_inode(ino).unwrap(), None);
-        // Extents gone (visible scan returns nothing).
+        // Extents are no longer deleted in the unlink transaction: a
+        // deleted-inode work item is pending instead.
+        assert_eq!(fs.list_extents(ino).unwrap().len(), 2);
+        assert_eq!(fs.list_deleted_inodes().unwrap().len(), 1);
+
+        fs.reclaim_deleted_inodes(usize::MAX).unwrap();
+        // Reclaim removed both extent tombstones and the work item.
         assert_eq!(fs.list_extents(ino).unwrap().len(), 0);
+        assert_eq!(fs.list_deleted_inodes().unwrap().len(), 0);
     }
 
     #[test]
@@ -1516,6 +1728,114 @@ mod tests {
             Err(FsError::AlreadyExists) => {}
             other => panic!("expected AlreadyExists, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reclaim_deleted_inodes_respects_budget_and_persists_progress() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let ino = make_file(&mut fs, ROOT_INO, b"big");
+        for i in 0..5u64 {
+            fs.put_extent(ino, i * BLOCK_SIZE as u64, b"x").unwrap();
+        }
+        fs.unlink(ROOT_INO, b"big").unwrap();
+
+        // Unlink only records the work item.
+        assert_eq!(fs.list_extents(ino).unwrap().len(), 5);
+        let (_, _, next) = fs.list_deleted_inodes().unwrap()[0];
+        assert_eq!(next, 0);
+
+        // Two extents per call, with progress persisted between calls.
+        assert_eq!(fs.reclaim_deleted_inodes(2).unwrap(), 2);
+        assert_eq!(fs.list_extents(ino).unwrap().len(), 3);
+        let (_, _, next) = fs.list_deleted_inodes().unwrap()[0];
+        assert_eq!(next, BLOCK_SIZE as u64 + 1);
+
+        assert_eq!(fs.reclaim_deleted_inodes(2).unwrap(), 2);
+        assert_eq!(fs.list_extents(ino).unwrap().len(), 1);
+        let (_, _, next) = fs.list_deleted_inodes().unwrap()[0];
+        assert_eq!(next, 3 * BLOCK_SIZE as u64 + 1);
+
+        // Delete the final extent; the budget is now exhausted, so the orphan
+        // record itself waits for the next call.
+        assert_eq!(fs.reclaim_deleted_inodes(1).unwrap(), 1);
+        assert_eq!(fs.list_extents(ino).unwrap().len(), 0);
+        assert_eq!(fs.list_deleted_inodes().unwrap().len(), 1);
+
+        assert_eq!(fs.reclaim_deleted_inodes(1).unwrap(), 1);
+        assert_eq!(fs.list_deleted_inodes().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn reclaim_deleted_inodes_preserves_snapshot_view() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let ino = make_file(&mut fs, ROOT_INO, b"shared");
+        for i in 0..3u64 {
+            fs.put_extent(ino, i * BLOCK_SIZE as u64, b"x").unwrap();
+        }
+
+        let snap_subvol = fs.snapshot_subvol(ROOT_SUBVOL).unwrap();
+        // Delete in the writable src. Its orphan chain is src's new snap_id.
+        fs.unlink(ROOT_INO, b"shared").unwrap();
+        assert_eq!(fs.list_extents(ino).unwrap().len(), 3);
+        fs.reclaim_deleted_inodes(usize::MAX).unwrap();
+
+        // Src no longer sees the extents.
+        assert_eq!(fs.list_extents(ino).unwrap().len(), 0);
+        // The readonly snapshot still inherits them from ROOT_SNAP.
+        fs.switch_subvol(snap_subvol).unwrap();
+        assert_eq!(fs.list_extents(ino).unwrap().len(), 3);
+        fs.switch_subvol(ROOT_SUBVOL).unwrap();
+    }
+
+    #[test]
+    fn reclaim_deleted_inodes_discards_orphans_for_deleted_snapshots() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let snap_subvol = fs.snapshot_subvol(ROOT_SUBVOL).unwrap();
+
+        fs.switch_subvol(snap_subvol).unwrap();
+        let ino = make_file(&mut fs, ROOT_INO, b"only_here");
+        fs.unlink(ROOT_INO, b"only_here").unwrap();
+        fs.switch_subvol(ROOT_SUBVOL).unwrap();
+        assert_eq!(fs.list_deleted_inodes().unwrap().len(), 1);
+
+        // Deleting the snapshot removes the snap's keys but not the
+        // ROOT_SNAP-stored work item; reclaim then notices the missing
+        // snapshot metadata and discards the orphan.
+        fs.delete_snapshot(snap_subvol).unwrap();
+        assert_eq!(fs.list_deleted_inodes().unwrap().len(), 1);
+        fs.reclaim_deleted_inodes(usize::MAX).unwrap();
+        assert_eq!(fs.list_deleted_inodes().unwrap().len(), 0);
+        let _ = ino;
+    }
+
+    #[test]
+    fn reclaim_budget_tracks_journal_headroom() {
+        let mut fs = Fs::new();
+        // Seed writes (root snapshot/subvolume) are pending WAL records; drop
+        // them so the test starts from a clean log.
+        fs.tree.drain_log();
+        fs.next_journal_seq = 100;
+        fs.last_checkpoint_seq = 0;
+        assert_eq!(
+            fs.reclaim_budget_for_commit(),
+            (JOURNAL_RECLAIM_SOFT_LIMIT - 100 - RECLAIM_COMMIT_RESERVED_FRAMES) as usize
+        );
+
+        // One already-pending WAL record consumes one more frame.
+        fs.tree.insert_at(b"k", ROOT_SNAP, b"v").unwrap();
+        assert_eq!(
+            fs.reclaim_budget_for_commit(),
+            (JOURNAL_RECLAIM_SOFT_LIMIT - 100 - RECLAIM_COMMIT_RESERVED_FRAMES - 1) as usize
+        );
+
+        // A nearly-full ring leaves no room for reclaim.
+        fs.next_journal_seq = JOURNAL_RECLAIM_SOFT_LIMIT - 1;
+        assert_eq!(fs.reclaim_budget_for_commit(), 0);
+        fs.next_journal_seq = JOURNAL_RECLAIM_SOFT_LIMIT;
+        assert_eq!(fs.reclaim_budget_for_commit(), 0);
     }
 
     #[test]
@@ -1804,6 +2124,29 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("rfs-{label}-{pid}-{now_ns}.img"));
         PathGuard(p)
+    }
+
+    /// Fill the journal ring with small real commit groups until the
+    /// uncheckpointed span equals `target` frames. Used by tests that need a
+    /// nearly-full ring to observe the dynamic reclaim budget.
+    fn fill_journal_to(fs: &mut Fs, target: u64) {
+        let mut filler = 0u32;
+        while fs.next_journal_seq - fs.last_checkpoint_seq < target {
+            let frames_needed = target - (fs.next_journal_seq - fs.last_checkpoint_seq);
+            let ops = (frames_needed - 1).min(50);
+            for _ in 0..ops {
+                let name = filler.to_be_bytes();
+                filler += 1;
+                fs.put_dirent(ROOT_INO, &name, &DirentV1::new(999, FILE_KIND_REGULAR))
+                    .unwrap();
+            }
+            fs.journal_commit().unwrap();
+        }
+        assert_eq!(
+            fs.next_journal_seq - fs.last_checkpoint_seq,
+            target,
+            "journal fill should land exactly on the requested span"
+        );
     }
 
     #[test]
@@ -2104,6 +2447,99 @@ mod tests {
             b"alpha-pre-snap",
             "readonly snapshot subvol should see pre-snap write"
         );
+    }
+
+    /// With the journal ring nearly full, the reclaim budget derived from
+    /// remaining soft capacity is zero, so unlinking a large file must still
+    /// produce only the fixed three-op transaction + CommitEnd. After a
+    /// checkpoint frees the ring, the next commit reclaims the extents.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "fills the journal ring with hundreds of commit groups; slow under Miri"
+    )]
+    fn image_unlink_commit_is_bounded_when_ring_is_near_full() {
+        let img = tmp_image_path("unlink-bounded");
+        let ino;
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            make_root(&mut fs);
+            ino = make_file(&mut fs, ROOT_INO, b"big");
+            for i in 0..50u64 {
+                fs.put_extent(ino, i * BLOCK_SIZE as u64, b"x").unwrap();
+            }
+            fs.journal_commit().unwrap();
+
+            // Fill the ring with small, real commit groups until it is almost
+            // at the soft watermark. This is exactly the state the dynamic
+            // budget exists for.
+            fill_journal_to(&mut fs, JOURNAL_RECLAIM_SOFT_LIMIT - 5);
+
+            let seq_before = fs.next_journal_seq;
+            fs.unlink(ROOT_INO, b"big").unwrap();
+            fs.journal_commit().unwrap();
+            let group_frames = fs.next_journal_seq - seq_before;
+            assert_eq!(
+                group_frames, 4,
+                "near-full ring must not admit any reclaim frames into the unlink group"
+            );
+            assert_eq!(fs.list_deleted_inodes().unwrap().len(), 1);
+            assert_eq!(fs.list_extents(ino).unwrap().len(), 50);
+
+            // A checkpoint resets the headroom; the next commit should have
+            // budget for all 50 extents plus the orphan record.
+            fs.sync().unwrap();
+            fs.journal_commit().unwrap();
+            assert_eq!(fs.list_deleted_inodes().unwrap().len(), 0);
+            assert_eq!(fs.list_extents(ino).unwrap().len(), 0);
+        }
+        {
+            let fs = Fs::open(&img.0).unwrap();
+            assert_eq!(fs.get_inode(ino).unwrap(), None);
+            assert_eq!(fs.list_extents(ino).unwrap().len(), 0);
+        }
+    }
+
+    /// Partial reclaim progress must recover through the journal: extent
+    /// tombstones and the orphan's `next_offset` land in the same commit
+    /// group, so after a crash the next mount resumes exactly after the last
+    /// reclaimed offset.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "fills the journal ring and replays it on open; slow under Miri"
+    )]
+    fn image_reclaim_progress_recovers_from_journal() {
+        let img = tmp_image_path("reclaim-progress-jnl");
+        let ino;
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            make_root(&mut fs);
+            ino = make_file(&mut fs, ROOT_INO, b"big");
+            for i in 0..5u64 {
+                fs.put_extent(ino, i * BLOCK_SIZE as u64, b"x").unwrap();
+            }
+            fs.journal_commit().unwrap();
+
+            // Near-full ring: journal_commit itself must not reclaim.
+            fill_journal_to(&mut fs, JOURNAL_RECLAIM_SOFT_LIMIT - 5);
+
+            fs.unlink(ROOT_INO, b"big").unwrap();
+            assert_eq!(fs.reclaim_deleted_inodes(2).unwrap(), 2);
+            fs.journal_commit().unwrap();
+            // Crash without sync; only the journal has the partial progress.
+        }
+
+        let mut fs = Fs::open(&img.0).unwrap();
+        assert_eq!(fs.get_inode(ino).unwrap(), None);
+        assert_eq!(fs.list_extents(ino).unwrap().len(), 3);
+        let orphans = fs.list_deleted_inodes().unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].2, BLOCK_SIZE as u64 + 1);
+
+        fs.reclaim_deleted_inodes(usize::MAX).unwrap();
+        assert_eq!(fs.list_extents(ino).unwrap().len(), 0);
+        assert_eq!(fs.list_deleted_inodes().unwrap().len(), 0);
     }
 
     /// Snapshot deletion's metadata transaction must survive a crash through

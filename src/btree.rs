@@ -179,9 +179,17 @@ impl Btree {
         Ok(())
     }
 
+    /// Number of resolved-write records currently buffered for the WAL.
+    /// `Fs::journal_commit` uses this to compute how many frames are already
+    /// spoken for before it decides how much orphan reclaim can join the
+    /// commit group.
+    pub fn pending_log_len(&self) -> usize {
+        self.log.len()
+    }
+
     /// Current number of buffered log records (for transaction rollback).
     fn log_len(&self) -> usize {
-        self.log.len()
+        self.pending_log_len()
     }
 
     /// Truncate the log back to `len` (undo records from an aborted tx).
