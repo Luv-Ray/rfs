@@ -464,6 +464,9 @@ impl Fs {
             .map(|g| g.end.next_block_nr)
             .unwrap_or(sb.next_block_nr);
         store.set_next_block_nr(final_next_block_nr);
+        if sb.free_head != 0 {
+            store.load_free_list(sb.free_head)?;
+        }
         let mut tree = Btree::reopen(store.clone(), sb.root_block, sb.next_bset_seq);
         for group in &groups {
             for (op_kind, payload) in &group.ops {
@@ -605,6 +608,8 @@ impl Fs {
         // freshly-allocated blocks, so the previous checkpoint stays intact
         // until the superblock swap below.
         self.tree.checkpoint()?;
+        // Persist the free list as a chain of blocks before fsyncing.
+        let free_head = self.store.persist_free_list()?;
         // Flush data blocks + node blocks already written via BlockStore
         // (their pwrite is done at write time, but we want the kernel to push
         // them to the device before we publish the new superblock).
@@ -622,7 +627,8 @@ impl Fs {
             next_subvol_id: self.next_subvol_id,
             current_subvol: self.current_subvol,
             checksum: 0,
-            _reserved: [0; BLOCK_SIZE - 64],
+            free_head,
+            _reserved: [0; BLOCK_SIZE - 72],
         };
         self.store.write_superblock(&sb)?;
         // Second fsync makes the new root visible after a crash.
@@ -982,14 +988,17 @@ impl Fs {
 
             let mut finished = true;
             let mut last_offset = next_offset;
-            for (key, _extent) in extents {
+            for (key, extent_bytes) in extents {
                 if budget == 0 {
                     finished = false;
                     break;
                 }
+                let extent =
+                    ExtentV1::read_from_bytes(&extent_bytes).expect("extent value size mismatch");
                 let offset = extent_offset_from_key(&key);
                 self.tree
                     .delete_at(&extent_key(ino, offset), snap, &chain)?;
+                self.store.free(extent.data_block);
                 last_offset = offset;
                 budget -= 1;
                 issued += 1;
@@ -1033,9 +1042,6 @@ impl Fs {
     /// deleted-inode work item for the inode's extents. Extent reclamation
     /// happens later, bounded by the journal's available frames, in
     /// [`Fs::reclaim_deleted_inodes`] (called from `journal_commit`).
-    ///
-    /// Data blocks remain allocated (block reclamation is a separate TODO;
-    /// snapshots can still reference inherited extent entries).
     pub fn unlink(&mut self, parent: u64, name: &[u8]) -> FsResult<()> {
         let snap = self.current_snap();
         let chain = self.current_chain()?;
@@ -3123,5 +3129,25 @@ mod tests {
                 "inode 2 must survive after ring-full forced checkpoint + recovery"
             );
         }
+    }
+
+    #[test]
+    fn reclaim_frees_data_blocks_for_reuse() {
+        let mut fs = Fs::new();
+        make_root(&mut fs);
+        let ino = make_file(&mut fs, ROOT_INO, b"f");
+        fs.put_extent(ino, 0, b"hello").unwrap();
+        fs.put_extent(ino, BLOCK_SIZE as u64, b"world").unwrap();
+
+        let before = fs.store.next_block_nr();
+        fs.unlink(ROOT_INO, b"f").unwrap();
+        fs.reclaim_deleted_inodes(usize::MAX).unwrap();
+
+        // Allocating after reclaim should reuse freed blocks, not bump.
+        let reused = fs.store.alloc();
+        assert!(
+            reused < before,
+            "expected reused block < {before}, got {reused}"
+        );
     }
 }

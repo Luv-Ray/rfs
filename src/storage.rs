@@ -22,6 +22,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -50,9 +51,8 @@ pub const FIRST_DATA_BLOCK_NR: u64 = FIRST_JOURNAL_BLOCK + JOURNAL_BLOCKS; // 65
 /// Magic number stamped at the head of the superblock.
 pub const SUPERBLOCK_MAGIC: u32 = 0x5246_5342; // "RFSB"
 /// On-disk format version; bumped on incompatible layout changes.
-/// v3: journal switched from fixed 128-byte state entries to 256-byte
-/// framed records (logged ops + commit-end), see [`JournalFrame`].
-pub const SUPERBLOCK_VERSION: u32 = 3;
+/// v4: added `free_head` (on-disk free-list chain).
+pub const SUPERBLOCK_VERSION: u32 = 4;
 
 /// Superblock — the single source of truth for "where the live tree is".
 ///
@@ -88,7 +88,9 @@ pub struct Superblock {
     pub current_subvol: u32,
     /// CRC32 over the rest of the superblock (computed with this field == 0).
     pub checksum: u32,
-    pub _reserved: [u8; BLOCK_SIZE - 64],
+    /// Block number of the head of the on-disk free-list chain, or 0 if empty.
+    pub free_head: u64,
+    pub _reserved: [u8; BLOCK_SIZE - 72],
 }
 
 const _: () = assert!(std::mem::size_of::<Superblock>() == BLOCK_SIZE);
@@ -108,7 +110,8 @@ impl Superblock {
             next_subvol_id: 1,
             current_subvol: 0,
             checksum: 0,
-            _reserved: [0; BLOCK_SIZE - 64],
+            free_head: 0,
+            _reserved: [0; BLOCK_SIZE - 72],
         }
     }
 
@@ -376,6 +379,10 @@ pub struct BlockStore {
     node_cache: RwLock<HashMap<u64, Box<CachedNode>>>,
     data_cache: RwLock<HashMap<u64, Box<DataBlock>>>,
     next_block_nr: AtomicU64,
+    free_list: Mutex<Vec<u64>>,
+    /// Chain blocks written by the last `persist_free_list` call. Recycled
+    /// at the start of the next persist so they don't leak across syncs.
+    last_chain_blocks: Mutex<Vec<u64>>,
     backing: Backing,
     /// Test-only counter of node persists (`write_node` calls). Used to assert
     /// that in-place append collapses many hot-leaf writes into a handful of
@@ -392,6 +399,8 @@ impl BlockStore {
             node_cache: RwLock::new(HashMap::new()),
             data_cache: RwLock::new(HashMap::new()),
             next_block_nr: AtomicU64::new(FIRST_DATA_BLOCK_NR),
+            free_list: Mutex::new(Vec::new()),
+            last_chain_blocks: Mutex::new(Vec::new()),
             backing: Backing::Memory,
             #[cfg(test)]
             node_writes: AtomicU64::new(0),
@@ -410,6 +419,8 @@ impl BlockStore {
             node_cache: RwLock::new(HashMap::new()),
             data_cache: RwLock::new(HashMap::new()),
             next_block_nr: AtomicU64::new(FIRST_DATA_BLOCK_NR),
+            free_list: Mutex::new(Vec::new()),
+            last_chain_blocks: Mutex::new(Vec::new()),
             backing: Backing::Image { file },
             #[cfg(test)]
             node_writes: AtomicU64::new(0),
@@ -424,6 +435,8 @@ impl BlockStore {
             node_cache: RwLock::new(HashMap::new()),
             data_cache: RwLock::new(HashMap::new()),
             next_block_nr: AtomicU64::new(FIRST_DATA_BLOCK_NR),
+            free_list: Mutex::new(Vec::new()),
+            last_chain_blocks: Mutex::new(Vec::new()),
             backing: Backing::Image { file },
             #[cfg(test)]
             node_writes: AtomicU64::new(0),
@@ -435,9 +448,21 @@ impl BlockStore {
         matches!(self.backing, Backing::Image { .. })
     }
 
-    /// Hand out the next free block number. Bumps the counter.
+    /// Allocate a block number. Reuses a previously freed block if available,
+    /// otherwise bumps the high-water mark.
     pub fn alloc(&self) -> u64 {
+        if let Some(nr) = self.free_list.lock().unwrap().pop() {
+            return nr;
+        }
         self.next_block_nr.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Return a block to the free list for future reuse. Evicts the block
+    /// from both caches so stale data is never served.
+    pub fn free(&self, nr: u64) {
+        self.node_cache.write().unwrap().remove(&nr);
+        self.data_cache.write().unwrap().remove(&nr);
+        self.free_list.lock().unwrap().push(nr);
     }
 
     /// Current value of the allocator counter (for snapshotting into
@@ -735,6 +760,70 @@ impl BlockStore {
         Ok(())
     }
 
+    // ---------- Free-list persistence ----------
+
+    const FREE_CHAIN_ENTRIES: usize = (BLOCK_SIZE - 16) / 8; // 510
+
+    /// Persist the in-memory free list as a chain of blocks on disk. Each
+    /// chain block layout: `[next_block: u64, n_entries: u64, entries…]`.
+    /// Returns the head block number (or 0 if the list is empty).
+    /// Consumes fresh blocks from the bump allocator for the chain itself.
+    pub fn persist_free_list(&self) -> Result<u64> {
+        {
+            let old_chain = std::mem::take(&mut *self.last_chain_blocks.lock().unwrap());
+            let mut fl = self.free_list.lock().unwrap();
+            fl.extend(old_chain);
+        }
+        let list = self.free_list.lock().unwrap().clone();
+        if list.is_empty() {
+            return Ok(0);
+        }
+        let mut head: u64 = 0;
+        let mut chain_blocks = Vec::new();
+        for chunk in list.chunks(Self::FREE_CHAIN_ENTRIES) {
+            let block_nr = self.next_block_nr.fetch_add(1, Ordering::Relaxed);
+            let mut buf = [0u8; BLOCK_SIZE];
+            buf[..8].copy_from_slice(&head.to_le_bytes());
+            let n = chunk.len() as u64;
+            buf[8..16].copy_from_slice(&n.to_le_bytes());
+            for (i, &entry) in chunk.iter().enumerate() {
+                let off = 16 + i * 8;
+                buf[off..off + 8].copy_from_slice(&entry.to_le_bytes());
+            }
+            self.write_data(block_nr, &buf)?;
+            head = block_nr;
+            chain_blocks.push(block_nr);
+        }
+        *self.last_chain_blocks.lock().unwrap() = chain_blocks;
+        Ok(head)
+    }
+
+    /// Load the on-disk free-list chain starting at `head` into the in-memory
+    /// free list. Chain blocks themselves are also added to the free list
+    /// (they are reclaimable after this checkpoint is superseded).
+    pub fn load_free_list(&self, head: u64) -> Result<()> {
+        let mut cur = head;
+        let mut list = Vec::new();
+        let mut chain_blocks = Vec::new();
+        while cur != 0 {
+            chain_blocks.push(cur);
+            let buf = self.read_data(cur)?;
+            let next = u64::from_le_bytes(buf[..8].try_into().unwrap());
+            let n = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
+            for i in 0..n.min(Self::FREE_CHAIN_ENTRIES) {
+                let off = 16 + i * 8;
+                let entry = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                list.push(entry);
+            }
+            cur = next;
+        }
+        // The chain blocks themselves are now free (they won't be referenced
+        // after the next checkpoint writes a new chain).
+        list.extend(chain_blocks);
+        *self.free_list.lock().unwrap() = list;
+        Ok(())
+    }
+
     /// Clone the backing file handle. Returns an error for memory-only stores.
     pub fn try_clone_file(&self) -> Result<std::fs::File> {
         match &self.backing {
@@ -796,5 +885,38 @@ mod journal_tests {
         assert_eq!(f.kind(), Some(FrameKind::LoggedOp));
         assert_eq!(f.op_kind, 3);
         assert_eq!(f.op_payload(), payload);
+    }
+
+    #[test]
+    fn free_list_persist_and_load_roundtrip() {
+        let store = BlockStore::in_memory();
+        // Burn a few blocks so the bump allocator is past FIRST_DATA_BLOCK_NR.
+        let a = store.alloc();
+        let b = store.alloc();
+        let c = store.alloc();
+        store.free(b);
+        store.free(a);
+
+        let head = store.persist_free_list().unwrap();
+        assert_ne!(head, 0);
+
+        // Create a second store and load from the chain.
+        let store2 = BlockStore::in_memory();
+        // Seed the same data block into store2's cache so load can read it.
+        let buf = store.read_data(head).unwrap();
+        store2.write_data(head, &buf).unwrap();
+        store2.load_free_list(head).unwrap();
+
+        // After loading, allocs should yield the freed blocks (+ the chain block).
+        let got1 = store2.alloc();
+        let got2 = store2.alloc();
+        let got3 = store2.alloc();
+        let mut got = [got1, got2, got3];
+        got.sort();
+        assert!(got.contains(&a));
+        assert!(got.contains(&b));
+        assert!(got.contains(&head)); // chain block itself is recycled
+        // c was never freed, must not appear.
+        assert!(!got.contains(&c));
     }
 }
