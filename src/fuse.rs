@@ -4,19 +4,21 @@
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
     OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, WriteFlags,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
-use libc::{S_IFDIR, S_IFMT, S_IFREG};
+use libc::{S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 
 use crate::btree;
 use crate::fs::{
-    DirentV1, FILE_KIND_DIR, FILE_KIND_REGULAR, Fs, FsError, InodeV1, MAX_NAME_LEN, ROOT_INO,
+    DirentV1, FILE_KIND_DIR, FILE_KIND_REGULAR, FILE_KIND_SYMLINK, Fs, FsError, InodeV1,
+    MAX_NAME_LEN, ROOT_INO,
 };
 
 const BLOCK_SIZE: u64 = 4096;
@@ -91,10 +93,10 @@ fn now_secs() -> u64 {
 }
 
 fn to_attr(ino: u64, inode: &InodeV1) -> FileAttr {
-    let kind = if inode.mode & S_IFMT as u32 == S_IFDIR as u32 {
-        FileType::Directory
-    } else {
-        FileType::RegularFile
+    let kind = match inode.mode & S_IFMT as u32 {
+        x if x == S_IFDIR as u32 => FileType::Directory,
+        x if x == S_IFLNK as u32 => FileType::Symlink,
+        _ => FileType::RegularFile,
     };
     let to_st = |s: u64| UNIX_EPOCH + Duration::from_secs(s);
     FileAttr {
@@ -190,6 +192,27 @@ fn validate_name(name: &OsStr) -> Result<&[u8], Errno> {
         return Err(Errno::ENAMETOOLONG);
     }
     Ok(bytes)
+}
+
+/// Truncate file extents beyond `new_size`. Removes whole blocks past the
+/// boundary and zero-fills the partial tail block.
+fn truncate_extents(fs: &mut Fs, ino: u64, new_size: u64) -> btree::Result<()> {
+    let boundary_block = new_size & !(BLOCK_SIZE - 1);
+    let tail_offset = (new_size % BLOCK_SIZE) as usize;
+
+    for (ext_off, ext) in fs.list_extents(ino)? {
+        if ext_off >= new_size {
+            fs.delete_extent(ino, ext_off)?;
+            fs.free_data_block(ext.data_block);
+        } else if ext_off == boundary_block && tail_offset > 0 && (ext.len as u64) > new_size - ext_off {
+            let mut buf = fs.read_data_block(ext.data_block)?;
+            for b in &mut buf[tail_offset..ext.len as usize] {
+                *b = 0;
+            }
+            fs.put_extent(ino, ext_off, &buf[..tail_offset])?;
+        }
+    }
+    Ok(())
 }
 
 /// Map an FsError to a POSIX errno for FUSE replies.
@@ -309,10 +332,10 @@ impl Filesystem for FuseFs {
         entries.push((ino, FileType::Directory, b".".to_vec()));
         entries.push((inode.parent_ino, FileType::Directory, b"..".to_vec()));
         for (name, d) in dirents {
-            let kind = if d.kind == FILE_KIND_DIR {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
+            let kind = match d.kind {
+                FILE_KIND_DIR => FileType::Directory,
+                FILE_KIND_SYMLINK => FileType::Symlink,
+                _ => FileType::RegularFile,
             };
             entries.push((d.target_ino, kind, name));
         }
@@ -597,6 +620,255 @@ impl Filesystem for FuseFs {
         }
     }
 
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let ino = ino.0;
+        let mut fs = self.fs.lock().unwrap();
+        let mut inode = match fs.get_inode(ino) {
+            Ok(Some(i)) => i,
+            Ok(None) => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        if let Some(m) = mode {
+            inode.mode = (inode.mode & S_IFMT as u32) | (m & 0o7777);
+        }
+        if let Some(u) = uid {
+            inode.uid = u;
+        }
+        if let Some(g) = gid {
+            inode.gid = g;
+        }
+        if let Some(new_size) = size {
+            if new_size < inode.size {
+                if truncate_extents(&mut fs, ino, new_size).is_err() {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            }
+            inode.size = new_size;
+        }
+        let now = now_secs();
+        match atime {
+            Some(TimeOrNow::SpecificTime(t)) => {
+                inode.atime = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            }
+            Some(TimeOrNow::Now) => inode.atime = now,
+            None => {}
+        }
+        match mtime {
+            Some(TimeOrNow::SpecificTime(t)) => {
+                inode.mtime = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            }
+            Some(TimeOrNow::Now) => inode.mtime = now,
+            None => {}
+        }
+        inode.ctime = now;
+        if fs.put_inode(ino, &inode).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        if fs.journal_commit().is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        reply.attr(&TTL, &to_attr(ino, &inode));
+    }
+
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let parent = parent.0;
+        let mut fs = self.fs.lock().unwrap();
+        let name_bytes = match validate_name(link_name) {
+            Ok(b) => b,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        if let Ok(Some(_)) = fs.lookup_dirent(parent, name_bytes) {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+        let target_bytes = target.as_os_str().as_encoded_bytes();
+        if target_bytes.len() > BLOCK_SIZE_USIZE {
+            reply.error(Errno::ENAMETOOLONG);
+            return;
+        }
+        let new_ino = fs.alloc_ino();
+        let now = now_secs();
+        let inode = InodeV1 {
+            mode: S_IFLNK as u32 | 0o777,
+            uid: req.uid(),
+            gid: req.gid(),
+            nlink: 1,
+            size: target_bytes.len() as u64,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            parent_ino: parent,
+        };
+        if fs.put_inode(new_ino, &inode).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        if fs.put_extent(new_ino, 0, target_bytes).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let d = DirentV1::new(new_ino, FILE_KIND_SYMLINK);
+        if fs.put_dirent(parent, name_bytes, &d).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        if fs.journal_commit().is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        reply.entry(&TTL, &to_attr(new_ino, &inode), GENERATION);
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let fs = self.fs.lock().unwrap();
+        let inode = match fs.get_inode(ino.0) {
+            Ok(Some(i)) => i,
+            Ok(None) => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        if inode.mode & S_IFMT as u32 != S_IFLNK as u32 {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        match do_read(&fs, ino.0, 0, inode.size as u32) {
+            Ok(buf) => reply.data(&buf),
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let ino = ino.0;
+        let newparent = newparent.0;
+        let mut fs = self.fs.lock().unwrap();
+        let name_bytes = match validate_name(newname) {
+            Ok(b) => b,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        let mut inode = match fs.get_inode(ino) {
+            Ok(Some(i)) => i,
+            Ok(None) => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        if inode.mode & S_IFMT as u32 == S_IFDIR as u32 {
+            reply.error(Errno::EPERM);
+            return;
+        }
+        if let Ok(Some(_)) = fs.lookup_dirent(newparent, name_bytes) {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+        inode.nlink += 1;
+        inode.ctime = now_secs();
+        if fs.put_inode(ino, &inode).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let kind = if inode.mode & S_IFMT as u32 == S_IFLNK as u32 {
+            FILE_KIND_SYMLINK
+        } else {
+            FILE_KIND_REGULAR
+        };
+        let d = DirentV1::new(ino, kind);
+        if fs.put_dirent(newparent, name_bytes, &d).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        if fs.journal_commit().is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        reply.entry(&TTL, &to_attr(ino, &inode), GENERATION);
+    }
+
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        let fs = self.fs.lock().unwrap();
+        let total_blocks = fs.store_next_block_nr();
+        let free_blocks = fs.free_block_count();
+        reply.statfs(
+            total_blocks,
+            free_blocks,
+            free_blocks,
+            0,
+            0,
+            BLOCK_SIZE as u32,
+            MAX_NAME_LEN as u32,
+            BLOCK_SIZE as u32,
+        );
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let mut fs = self.fs.lock().unwrap();
+        match fs.journal_commit() {
+            Ok(()) => reply.ok(),
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
     fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         reply.opened(FileHandle(0), FopenFlags::empty());
     }
@@ -787,5 +1059,37 @@ mod tests {
     #[test]
     fn validate_name_accepts_normal_name() {
         assert!(validate_name(OsStr::new("hello.txt")).is_ok());
+    }
+
+    #[test]
+    fn to_attr_maps_symlink_kind() {
+        let mut i = fresh_inode(FILE_KIND_REGULAR);
+        i.mode = S_IFLNK as u32 | 0o777;
+        assert_eq!(to_attr(3, &i).kind, FileType::Symlink);
+    }
+
+    #[test]
+    fn truncate_extents_removes_blocks_past_boundary() {
+        let mut fs = Fs::new();
+        let ino = fs.alloc_ino();
+        let inode = InodeV1 {
+            mode: S_IFREG as u32 | 0o644,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size: BLOCK_SIZE * 3,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            parent_ino: ROOT_INO,
+        };
+        fs.put_inode(ino, &inode).unwrap();
+        for i in 0..3u64 {
+            fs.put_extent(ino, i * BLOCK_SIZE, b"x").unwrap();
+        }
+        truncate_extents(&mut fs, ino, BLOCK_SIZE).unwrap();
+        let remaining = fs.list_extents(ino).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, 0);
     }
 }

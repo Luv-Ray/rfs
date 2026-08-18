@@ -41,6 +41,7 @@ fn decode_log_record(op_kind: u8, payload: &[u8]) -> Result<LogRecord> {
 
 pub const FILE_KIND_REGULAR: u8 = 1;
 pub const FILE_KIND_DIR: u8 = 2;
+pub const FILE_KIND_SYMLINK: u8 = 3;
 
 // ---------- Key kinds ----------
 //
@@ -702,6 +703,21 @@ impl Fs {
     /// is always written before being read).
     fn alloc_data_block(&self) -> u64 {
         self.store.alloc()
+    }
+
+    /// Return a data block to the free list for future reuse.
+    pub fn free_data_block(&self, block_nr: u64) {
+        self.store.free(block_nr);
+    }
+
+    /// Total block number high-water mark (for statfs).
+    pub fn store_next_block_nr(&self) -> u64 {
+        self.store.next_block_nr()
+    }
+
+    /// Number of blocks currently on the free list.
+    pub fn free_block_count(&self) -> u64 {
+        self.store.free_count()
     }
 
     // -- Snapshot tree --

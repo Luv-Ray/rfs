@@ -465,6 +465,11 @@ impl BlockStore {
         self.free_list.lock().unwrap().push(nr);
     }
 
+    /// Number of blocks on the free list (for statfs reporting).
+    pub fn free_count(&self) -> u64 {
+        self.free_list.lock().unwrap().len() as u64
+    }
+
     /// Current value of the allocator counter (for snapshotting into
     /// the superblock at sync time).
     pub fn next_block_nr(&self) -> u64 {
