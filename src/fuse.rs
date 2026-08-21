@@ -204,7 +204,10 @@ fn truncate_extents(fs: &mut Fs, ino: u64, new_size: u64) -> btree::Result<()> {
         if ext_off >= new_size {
             fs.delete_extent(ino, ext_off)?;
             fs.free_data_block(ext.data_block);
-        } else if ext_off == boundary_block && tail_offset > 0 && (ext.len as u64) > new_size - ext_off {
+        } else if ext_off == boundary_block
+            && tail_offset > 0
+            && (ext.len as u64) > new_size - ext_off
+        {
             let mut buf = fs.read_data_block(ext.data_block)?;
             for b in &mut buf[tail_offset..ext.len as usize] {
                 *b = 0;
@@ -661,25 +664,29 @@ impl Filesystem for FuseFs {
             inode.gid = g;
         }
         if let Some(new_size) = size {
-            if new_size < inode.size {
-                if truncate_extents(&mut fs, ino, new_size).is_err() {
-                    reply.error(Errno::EIO);
-                    return;
-                }
+            if new_size < inode.size && truncate_extents(&mut fs, ino, new_size).is_err() {
+                reply.error(Errno::EIO);
+                return;
             }
             inode.size = new_size;
         }
         let now = now_secs();
         match atime {
             Some(TimeOrNow::SpecificTime(t)) => {
-                inode.atime = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                inode.atime = t
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
             }
             Some(TimeOrNow::Now) => inode.atime = now,
             None => {}
         }
         match mtime {
             Some(TimeOrNow::SpecificTime(t)) => {
-                inode.mtime = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                inode.mtime = t
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
             }
             Some(TimeOrNow::Now) => inode.mtime = now,
             None => {}

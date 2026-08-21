@@ -18,13 +18,19 @@ Snapshots:
 - Writable snapshots via `snapshot_subvol` / `switch_subvol`
 
 FUSE (`fuser` 0.17, pure Rust):
-- `lookup / getattr / readdir / read / write / create / mkdir / unlink / rmdir / rename`
+- `lookup / getattr / setattr / readdir / read / write / create / mkdir /
+  unlink / rmdir / rename / symlink / readlink / link / statfs / fsync /
+  open / release / flush`
+- `setattr` covers truncate (shrink frees extents past the boundary), chmod,
+  chown, and utimens
 - Multi-block writes (4 KB chunks) and zero-filled sparse reads
 - Atomic multi-key transactions for metadata ops
 
 Persistence:
 - Single backing image file with superblock, CRC32 per node block
 - `BlockStore` with a dirty-tracked mutable node/data cache
+- Block free-list with an on-disk chain, so freed blocks are reused across
+  mounts
 - In-place bset append: between checkpoints, writes a hot leaf can absorb
   mutate the cached node at a stable block number (no per-op root→leaf COW);
   a checkpoint relocates the dirty nodes onto fresh blocks and swaps the root
@@ -33,40 +39,33 @@ Persistence:
   logged ops in atomic commit groups; replay-on-open recovery from the last
   superblock checkpoint; superblock checkpoint on sync
 
+Snapshot lifecycle:
+- `needs_whiteout` bit + whiteout-only compaction (per-bset flag,
+  `Btree::compact_whiteouts` drops only whiteouts at dead snap_ids; a winning
+  whiteout drop also drops shadowed duplicate copies via merged compaction, so
+  lower-seq versions cannot resurface)
+- Snapshot deletion (`Fs::delete_snapshot`: validates leaf snapshot /
+  non-active subvol, atomically tombstones snapshot+subvol metadata,
+  `Btree::drop_snapshot_keys` compacts away every key version at the dead
+  snap_id, then sweeps unreferenced internal snapshot nodes)
+- `deleted_inodes` btree + lazy reclaim (bcachefs style): unlink records a
+  `(inode, snap_id, next_offset)` work item and tombstones only dirent+inode in
+  the transaction; `Fs::journal_commit` reclaims a slice of extents with a
+  budget derived from the journal ring's remaining soft capacity, so unlinking
+  a large file can no longer overflow one commit group
+
 ## TODO
 
 Functionality gaps (user-visible):
-- [ ] `setattr`: truncate / chmod / utimens (truncate especially — files can
-      currently only grow; `O_TRUNC` / `ftruncate` don't work)
 - [ ] Expose subvolume / snapshot management via FUSE (`snapshot_subvol` /
-      `switch_subvol` exist but have no mount-side entry point)
-
-Snapshot lifecycle (one connected piece):
-- [x] `needs_whiteout` bit + whiteout-only compaction (per-bset flag,
-      `Btree::compact_whiteouts` drops only whiteouts at dead snap_ids; a
-      winning whiteout drop also drops shadowed duplicate copies via merged
-      compaction, so lower-seq versions cannot resurface)
-- [x] Snapshot deletion (`Fs::delete_snapshot`: validates leaf snapshot /
-      non-active subvol, atomically tombstones snapshot+subvol metadata,
-      `Btree::drop_snapshot_keys` compacts away every key version at the
-      dead snap_id, then sweeps unreferenced internal snapshot nodes)
-- [x] `deleted_inodes` btree + lazy reclaim (bcachefs style): unlink now
-      records a `(inode, snap_id, next_offset)` work item and tombstones only
-      dirent+inode in the transaction; `Fs::journal_commit` reclaims a slice
-      of extents with a budget derived from the journal ring's remaining soft
-      capacity, so unlinking a large file can no longer overflow one commit
-      group.
+      `switch_subvol` / `delete_snapshot` exist but have no mount-side entry
+      point)
 
 Write-amplification path (prerequisite chain for larger nodes):
-- [x] Node cache rewrite: `FrozenMap` → dirty-tracked mutable cache
-- [x] Journal: fixed-size checkpoint → variable-length logical WAL (key-level
-      ops in commit groups) + replay-from-checkpoint recovery
-- [x] In-place bset append: hot writes mutate the cached node at a stable block
-      number; checkpoint relocates dirty nodes and swaps the root
 - [ ] On-disk incremental flush: persist appended bsets alone (per-bset checksum
       + `journal_seq`, bsets found by scan not authoritative `bset_count`);
       recovery drops a torn tail bset. Currently a checkpoint still rewrites each
-      dirty node whole — this amortizes that for large nodes.
+      dirty node whole — the in-place bset append amortizes that for large nodes.
 - [ ] Raise node size to 64–256 KB (needs COW write-amp benchmarks)
 
 Optimizations / deferrable (don't block anything):
