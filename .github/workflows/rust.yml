@@ -51,3 +51,46 @@ jobs:
       env:
         MIRIFLAGS: -Zmiri-disable-isolation
       run: cargo miri test --lib --verbose
+
+  fuzz:
+    # Differential fuzz of the Fs layer (fuzz/fuzz_targets/fs_ops.rs) against an
+    # in-memory oracle: random op sequences run on a real image-backed Fs and a
+    # shadow model, checked for agreement after every mutation and again after
+    # gc / journal-replay reopen. Ten minutes per run.
+    #
+    # push-to-main only: a 10-minute job would be a heavy tax on every PR, and
+    # fuzzing is a soak test, not a gate. PRs still get build/clippy/test/miri.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install nightly + cargo-fuzz
+      run: |
+        rustup toolchain install nightly
+        rustup override set nightly
+        cargo install cargo-fuzz --locked
+    # Persist the corpus between runs so coverage accumulates across pushes
+    # rather than starting cold every time. Keyed by SHA with a rolling
+    # restore so each run seeds from the most recent prior corpus.
+    - name: Restore fuzz corpus
+      uses: actions/cache@v4
+      with:
+        path: fuzz/corpus
+        key: fuzz-corpus-${{ github.sha }}
+        restore-keys: |
+          fuzz-corpus-
+    - name: Fuzz fs_ops for 10 minutes
+      # -max_total_time=600: ten minutes of fuzzing.
+      # -timeout=60: flag any single input that hangs for 60s (a livelock in
+      # reclaim/gc would otherwise stall the whole run silently).
+      run: cargo fuzz run fs_ops -- -max_total_time=600 -timeout=60
+    # If the run found a crash, keep the reproducer so it can be replayed
+    # locally with `cargo fuzz run fs_ops <artifact>`.
+    - name: Upload crash artifacts
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: fuzz-artifacts
+        path: fuzz/artifacts
+        if-no-files-found: ignore

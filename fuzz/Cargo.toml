@@ -1,0 +1,29 @@
+[package]
+name = "rfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+tempfile = "3"
+
+[dependencies.rfs]
+path = ".."
+
+# Keep debug assertions on in the fuzz build: they encode real invariants
+# (e.g. ancestor_chain snap-id ordering) we want the fuzzer to trip.
+[profile.release]
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "fs_ops"
+path = "fuzz_targets/fs_ops.rs"
+test = false
+doc = false
+bench = false
