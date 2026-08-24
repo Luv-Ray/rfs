@@ -1894,7 +1894,8 @@ mod tests {
         let ino = make_file(&mut fs, ROOT_INO, b"shared");
         // Distinct byte per block so a clobbered block is detectable by value.
         for i in 0..3u64 {
-            fs.put_extent(ino, i * BLOCK_SIZE as u64, &[b'A' + i as u8; 8]).unwrap();
+            fs.put_extent(ino, i * BLOCK_SIZE as u64, &[b'A' + i as u8; 8])
+                .unwrap();
         }
 
         let snap_subvol = fs.snapshot_subvol(ROOT_SUBVOL).unwrap();
@@ -1922,7 +1923,8 @@ mod tests {
         // the assertion-blindness that hid the original bug).
         let scratch = make_file(&mut fs, ROOT_INO, b"scratch");
         for i in 0..24u64 {
-            fs.put_extent(scratch, i * BLOCK_SIZE as u64, &[b'Z'; 8]).unwrap();
+            fs.put_extent(scratch, i * BLOCK_SIZE as u64, &[b'Z'; 8])
+                .unwrap();
         }
 
         // The snapshot's data must still be byte-intact.
@@ -3433,9 +3435,13 @@ mod tests {
             let hwm_before = fs.store.next_block_nr();
 
             let reclaimed = fs.gc().unwrap();
-            assert!(
-                reclaimed >= 40,
-                "expected ~49 overwrite orphans reclaimed, got {reclaimed}"
+            // Exactly the 49 superseded blocks are orphans; the 50th (live) one
+            // must NOT be swept. Bounding reclaimed from ABOVE is the load-
+            // bearing half: a GC that wrongly swept the live block would push
+            // reclaimed to 50 and sail past a bare `>= 40` lower bound.
+            assert_eq!(
+                reclaimed, 49,
+                "should reclaim exactly the 49 superseded blocks, not the live one"
             );
             // GC frees far more than the few free-list chain blocks its trailing
             // sync bump-allocates, so the high-water mark barely moves.
@@ -3445,17 +3451,28 @@ mod tests {
                 hwm_before,
                 fs.store.next_block_nr()
             );
-            // The live version is intact right after GC.
+            // Capture the live block, then apply reuse pressure: allocate and
+            // overwrite enough fresh blocks to drain the free list. If GC had
+            // wrongly swept the live block, one of these scratch writes reuses
+            // and clobbers it — without this, a read-back returns stale-correct
+            // bytes (free() doesn't zero) and hides the bug.
+            let live_block = fs
+                .get_extent(ino, 0)
+                .unwrap()
+                .expect("live extent")
+                .data_block;
+            let scratch = make_file(&mut fs, ROOT_INO, b"scratch");
+            let drain = fs.store.free_count() + 8;
+            for i in 0..drain {
+                fs.put_extent(scratch, i * BLOCK_SIZE as u64, b"ZZZZZ")
+                    .unwrap();
+            }
+            // The live extent's block must be unchanged and still hold v0049.
             let ext = fs.get_extent(ino, 0).unwrap().expect("live extent");
+            assert_eq!(ext.data_block, live_block, "live extent moved unexpectedly");
             let blk = fs.read_data_block(ext.data_block).unwrap();
-            assert_eq!(&blk[..5], b"v0049");
-            // The reclaimed blocks are on the free list, available to satisfy
-            // future allocations without bumping the high-water mark.
-            assert!(
-                fs.store.free_count() >= 40,
-                "reclaimed blocks should be on the free list, free_count={}",
-                fs.store.free_count()
-            );
+            assert_eq!(&blk[..5], b"v0049", "live block clobbered — GC swept it");
+            fs.sync().unwrap();
         }
         // Reopen: the live content survives and no live block was clobbered.
         {
@@ -3485,20 +3502,41 @@ mod tests {
         }
         fs.sync().unwrap();
         let reclaimed = fs.gc().unwrap();
-        assert!(reclaimed >= 3, "expected ~4 orphans, got {reclaimed}");
-        let ext = fs.get_extent(ino, 0).unwrap().expect("live extent");
-        assert_eq!(&fs.read_data_block(ext.data_block).unwrap()[..2], b"v4");
+        // Exactly the 4 superseded blocks, never the live 5th (upper bound is
+        // the half that catches a GC sweeping the live block).
+        assert_eq!(reclaimed, 4, "expected exactly 4 overwrite orphans");
 
-        // Draining the free list must never hand out the same block twice.
-        // Regression guard: the leading sync's free-list chain blocks must be
-        // marked live, or they'd be swept AND re-added via last_chain_blocks,
-        // duplicating an entry that alloc() would then dispense twice.
+        // Reuse pressure BEFORE reading the live block: overwrite fresh blocks
+        // to drain the free list, so a wrongly-swept live block gets clobbered
+        // rather than returning stale-correct bytes. The set check also guards
+        // the double-hand-out regression (chain blocks must be marked live, or
+        // they'd be swept and re-added, dispensing one block twice).
+        let live_block = fs
+            .get_extent(ino, 0)
+            .unwrap()
+            .expect("live extent")
+            .data_block;
+        let scratch = make_file(&mut fs, ROOT_INO, b"scratch");
+        let drain = fs.store.free_count() + 4;
         let mut seen = std::collections::HashSet::new();
-        let n = fs.store.free_count();
-        for _ in 0..n {
-            let nr = fs.store.alloc();
-            assert!(seen.insert(nr), "block {nr} handed out twice after GC");
+        for i in 0..drain {
+            fs.put_extent(scratch, i * BLOCK_SIZE as u64, b"ZZ")
+                .unwrap();
+            let blk = fs
+                .get_extent(scratch, i * BLOCK_SIZE as u64)
+                .unwrap()
+                .unwrap()
+                .data_block;
+            assert!(seen.insert(blk), "block {blk} handed out twice after GC");
         }
+        // Live content intact and block unmoved despite the reuse churn.
+        let ext = fs.get_extent(ino, 0).unwrap().expect("live extent");
+        assert_eq!(ext.data_block, live_block, "live extent moved unexpectedly");
+        assert_eq!(
+            &fs.read_data_block(ext.data_block).unwrap()[..2],
+            b"v4",
+            "live block clobbered — GC swept it"
+        );
     }
 
     /// GC must not reclaim a block still referenced by a sibling snapshot: the

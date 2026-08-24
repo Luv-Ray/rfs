@@ -2648,23 +2648,36 @@ mod tests {
         );
 
         // Dirty a single leaf, then checkpoint again. Only the touched root→leaf
-        // path relocates, and each freed old block is reusable: the high-water
-        // mark must advance by fewer blocks than we allocate, i.e. the free list
-        // is actually drained by the relocation's own allocs.
+        // path relocates (a handful of nodes), while the free list holds the
+        // whole previous tree's worth of blocks (free_before, ~20). So every
+        // relocation alloc must come from the free list and the high-water mark
+        // must NOT move at all. (The earlier `hwm_growth < free_before` bound
+        // was far too loose — it passed even with block reuse fully disabled,
+        // since the path is ~3 nodes and free_before ~20; assert the exact
+        // no-growth property instead.)
         tree.insert(&key(0), &val(999)).unwrap();
         let hwm_before = tree.store.next_block_nr();
         let free_before = tree.store.free_count();
+        assert!(
+            free_before > 0,
+            "first checkpoint must have freed blocks to reuse"
+        );
         tree.checkpoint().unwrap();
         let hwm_after = tree.store.next_block_nr();
-        // The relocation allocated (root→leaf) blocks; because free_before > 0
-        // those came from the free list, not the bump allocator, so the
-        // high-water mark grows by strictly less than the path length.
-        let path_len = free_before; // >= number of nodes on the touched path
-        assert!(
-            hwm_after - hwm_before < path_len,
-            "relocation should reuse freed blocks (hwm grew {} with {} free)",
-            hwm_after - hwm_before,
-            free_before
+        assert_eq!(
+            hwm_after, hwm_before,
+            "relocation must reuse freed blocks, not bump the allocator \
+             (free_before={free_before})"
+        );
+        // Reuse is net-neutral by construction: relocating the k-node path frees
+        // k old blocks and allocs k fresh ones from the list, so free_count
+        // returns to free_before. The load-bearing assertion is the no-growth
+        // check above — with block reuse disabled the alloc would bump hwm by
+        // the path length instead.
+        assert_eq!(
+            tree.store.free_count(),
+            free_before,
+            "path relocation should free as many old blocks as it consumes"
         );
 
         // Content is intact and the freed count is still non-trivial.
@@ -4100,4 +4113,3 @@ mod tests {
         );
     }
 }
-
