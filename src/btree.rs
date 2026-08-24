@@ -815,9 +815,9 @@ fn verify_node(store: &BlockStore, block_nr: u64, lo: Option<&[u8]>, hi: Option<
     let n = node.nkeys();
 
     if node.level() == 0 {
-        debug_assert!(n <= MAX_ENTRIES, "leaf blk={block_nr} nkeys={n}");
+        assert!(n <= MAX_ENTRIES, "leaf blk={block_nr} nkeys={n}");
     } else {
-        debug_assert!(n <= MAX_INTERNAL_KEYS, "internal blk={block_nr} nkeys={n}");
+        assert!(n <= MAX_INTERNAL_KEYS, "internal blk={block_nr} nkeys={n}");
     }
 
     if node.level() == 0 {
@@ -828,16 +828,16 @@ fn verify_node(store: &BlockStore, block_nr: u64, lo: Option<&[u8]>, hi: Option<
         for (b, i) in MergedIter::new(&node) {
             let k = node.entry_at(b, i).key_bytes().to_vec();
             if let Some(p) = &prev {
-                debug_assert!(
+                assert!(
                     p.as_slice() < k.as_slice(),
                     "blk={block_nr} merged-view not strictly sorted: {p:?} >= {k:?}"
                 );
             }
             if let Some(lo) = lo {
-                debug_assert!(k.as_slice() >= lo, "blk={block_nr} key {k:?} < lo {lo:?}");
+                assert!(k.as_slice() >= lo, "blk={block_nr} key {k:?} < lo {lo:?}");
             }
             if let Some(hi) = hi {
-                debug_assert!(k.as_slice() < hi, "blk={block_nr} key {k:?} >= hi {hi:?}");
+                assert!(k.as_slice() < hi, "blk={block_nr} key {k:?} >= hi {hi:?}");
             }
             prev = Some(k);
         }
@@ -849,7 +849,7 @@ fn verify_node(store: &BlockStore, block_nr: u64, lo: Option<&[u8]>, hi: Option<
                 continue;
             }
             for entry in node.bset_entries(b) {
-                debug_assert!(
+                assert!(
                     entry.kind_enum() != EntryKind::Whiteout,
                     "blk={block_nr} bset {b} contains a whiteout but the \
                      needs-whiteout flag is clear"
@@ -861,7 +861,7 @@ fn verify_node(store: &BlockStore, block_nr: u64, lo: Option<&[u8]>, hi: Option<
 
     // Internal nodes: single-bset, classic separator layout.
     for i in 1..n {
-        debug_assert!(
+        assert!(
             node.entry(i - 1).key_bytes() < node.entry(i).key_bytes(),
             "blk={block_nr} keys not sorted at idx {}: {:?} >= {:?}",
             i - 1,
@@ -884,18 +884,18 @@ fn verify_node(store: &BlockStore, block_nr: u64, lo: Option<&[u8]>, hi: Option<
             );
         }
         if let Some(hi) = hi {
-            debug_assert!(k < hi, "blk={block_nr} key[{i}]={k:?} >= hi={hi:?}");
+            assert!(k < hi, "blk={block_nr} key[{i}]={k:?} >= hi={hi:?}");
         }
     }
 
     for i in 0..=n {
         let child_nr = node.child_block(i);
-        debug_assert!(
+        assert!(
             store.read_node_copy(child_nr).is_ok(),
             "blk={block_nr} child[{i}]={child_nr} not in store"
         );
         let child = store.read_node_copy(child_nr).unwrap();
-        debug_assert_eq!(
+        assert_eq!(
             child.level(),
             node.level() - 1,
             "blk={block_nr} child[{i}] level mismatch"
@@ -4100,3 +4100,4 @@ mod tests {
         );
     }
 }
+
