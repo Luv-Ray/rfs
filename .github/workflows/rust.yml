@@ -94,3 +94,31 @@ jobs:
         name: fuzz-artifacts
         path: fuzz/artifacts
         if-no-files-found: ignore
+
+  mount-smoke:
+    # End-to-end smoke tests that drive the real kernel FUSE path
+    # (syscall -> VFS -> /dev/fuse -> fuser -> src/fuse.rs -> Fs), which the
+    # library-layer `cargo test` and the fuzz target both bypass. This is the
+    # only CI coverage of the fuse.rs translation layer, kernel-contract errno
+    # mapping (EEXIST / ENOTEMPTY / ENOTDIR), readdir + path resolution, and
+    # the cross-process unmount/remount persistence lifecycle. It's fast, so
+    # unlike fuzz it gates PRs too.
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    # fuser 0.17 shells out to `fusermount3` to mount; /dev/fuse is available
+    # on GitHub's ubuntu runners, but the fuse3 userspace tools are not
+    # installed by default.
+    - name: Install FUSE
+      run: sudo apt-get update && sudo apt-get install -y fuse3
+    - name: Build
+      run: cargo build --verbose
+    # umask 002 so the perm assertion in mount_smoke.sh (expects 664 for a
+    # freshly created file) holds; the runner's default umask is 022 (644).
+    - name: Mount smoke test
+      run: |
+        umask 002
+        ./scripts/mount_smoke.sh
+    - name: Persistence smoke test
+      run: ./scripts/persist_smoke.sh
