@@ -34,6 +34,16 @@ Persistence:
 - In-place bset append: between checkpoints, writes a hot leaf can absorb
   mutate the cached node at a stable block number (no per-op root→leaf COW);
   a checkpoint relocates the dirty nodes onto fresh blocks and swaps the root
+- Block reclaim, two paths:
+  - Incremental: a checkpoint returns each node's superseded (relocated) old
+    block to the free list once the walk completes (crash-safe: freed after
+    the walk, before the free-list chain is persisted, before the superblock
+    swap)
+  - `Fs::gc()`: stop-the-world mark-and-sweep for COW-overwrite orphan data
+    blocks. Syncs to a quiescent checkpoint, marks every node reachable from
+    the root plus every data block referenced by an extent at *any* snap_id,
+    then sweeps the rest — so a block a sibling snapshot still references is
+    never reclaimed (no per-block refcount needed, bcachefs style)
 - `Fs::create` / `Fs::open` / `Fs::sync`; FUSE auto-syncs on destroy
 - Write-ahead journal (ring buffer, seq + CRC per frame) recording key-level
   logged ops in atomic commit groups; replay-on-open recovery from the last
@@ -69,8 +79,11 @@ Write-amplification path (prerequisite chain for larger nodes):
 - [ ] Raise node size to 64–256 KB (needs COW write-amp benchmarks)
 
 Optimizations / deferrable (don't block anything):
-- [ ] Block reclaim / GC: mark-and-sweep for orphaned COW blocks + reclaim on
-      overwrite / unlink (needs per-block refcounting with snapshots)
+- [ ] Incremental / online GC: `Fs::gc()` is stop-the-world and full-scan.
+      Eager reclaim on overwrite would need per-extent backpointers or (with
+      snapshots) reflink-style refcounts to know a block is unshared; the
+      speculative blocks a cascading split/promote allocates but abandons are
+      still leaked until the next `gc()`.
 - [ ] Sibling merge / rebalance on sparse leaves (delete never shrinks the tree)
 - [ ] Direct I/O + aligned buffers
 - [ ] Multi-superblock for atomic superblock update

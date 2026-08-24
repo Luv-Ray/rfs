@@ -638,6 +638,94 @@ impl Fs {
         Ok(())
     }
 
+    /// Mark-and-sweep garbage collection of orphaned blocks.
+    ///
+    /// Reclaims blocks that no live structure references but that neither the
+    /// checkpoint reclaim (relocated node blocks) nor unlink/truncate (own-snap
+    /// data blocks) frees: chiefly COW-overwrite orphans, where `put_extent`
+    /// always writes a fresh data block and the superseded one is only unsafe
+    /// to free eagerly because a sibling snapshot might still reference it.
+    /// A full scan settles that safely — a data block is live iff some extent
+    /// key at *any* snap_id points at it.
+    ///
+    /// Crash-safety model: this is stop-the-world and syncs first. After the
+    /// leading `sync`, the on-disk checkpoint root is the single source of
+    /// truth and the WAL is empty, so "reachable from `tree.root_block`" is the
+    /// complete live set — there are no journaled-but-uncheckpointed extents
+    /// whose blocks a scan could miss. The freed blocks are returned to the
+    /// allocator's free list, then a trailing `sync` persists that list into a
+    /// fresh on-disk chain. A crash between the two syncs simply loses the
+    /// reclaim (the blocks stay allocated-but-orphaned, exactly as before GC
+    /// ran); it can never free a live block.
+    ///
+    /// In-memory (RAM-only) filesystems have no persistence and no sync; GC is
+    /// a no-op there. Returns the number of blocks reclaimed.
+    pub fn gc(&mut self) -> Result<u64> {
+        if !self.store.is_persistent() {
+            return Ok(0);
+        }
+        // Quiesce: make the on-disk checkpoint root authoritative and drain the
+        // WAL so no uncheckpointed extent references escape the scan.
+        self.sync()?;
+
+        let hwm = self.store.next_block_nr();
+        // mark[i] = block i is live (must not be swept). Sized to the current
+        // high-water mark; blocks >= hwm don't exist yet.
+        let mut mark = vec![false; hwm as usize];
+        let set = |mark: &mut [bool], nr: u64| {
+            if (nr as usize) < mark.len() {
+                mark[nr as usize] = true;
+            }
+        };
+
+        // 1. Reserved region: superblock + journal ring are never data/node
+        //    blocks and must never be swept.
+        for nr in 0..crate::storage::FIRST_DATA_BLOCK_NR {
+            set(&mut mark, nr);
+        }
+        // 2. Live metadata: every node reachable from the checkpoint root.
+        for nr in self.tree.collect_live_node_blocks()? {
+            set(&mut mark, nr);
+        }
+        // 3. Live data: every data block referenced by an extent at any snap_id.
+        let extents = self
+            .tree
+            .range_scan_all(&[KIND_EXTENT], &[KIND_EXTENT + 1])?;
+        for (_logical, _snap, kind, value) in extents {
+            // Only live extents pin a data block. Deleted/Whiteout tombstones
+            // carry no payload (and their superseded block is exactly what GC
+            // is here to reclaim).
+            if kind == EntryKind::Live {
+                let ext = ExtentV1::read_from_bytes(&value).expect("extent value size mismatch");
+                set(&mut mark, ext.data_block);
+            }
+        }
+        // 4. Blocks already on the free list are "live" for sweep purposes —
+        //    they're accounted for; re-freeing would duplicate them.
+        for nr in self.store.free_list_snapshot() {
+            set(&mut mark, nr);
+        }
+        // 5. The on-disk free-list chain blocks the leading sync just wrote are
+        //    allocated containers, not orphans. Sweeping them would double-free:
+        //    the next persist_free_list recycles them via last_chain_blocks.
+        for nr in self.store.chain_blocks_snapshot() {
+            set(&mut mark, nr);
+        }
+
+        // Sweep: every allocated block not marked live is an orphan.
+        let mut reclaimed = 0u64;
+        for nr in crate::storage::FIRST_DATA_BLOCK_NR..hwm {
+            if !mark[nr as usize] {
+                self.store.free(nr);
+                reclaimed += 1;
+            }
+        }
+
+        // Persist the enlarged free list into a fresh on-disk chain.
+        self.sync()?;
+        Ok(reclaimed)
+    }
+
     fn seed(tree: Btree, store: Arc<BlockStore>, root_ino: u64) -> Self {
         let mut fs = Fs {
             tree,
@@ -3277,6 +3365,135 @@ mod tests {
         assert!(
             reused < before,
             "expected reused block < {before}, got {reused}"
+        );
+    }
+
+    /// GC reclaims COW-overwrite orphans: overwriting the same file block N
+    /// times leaves N-1 superseded data blocks that neither checkpoint reclaim
+    /// nor unlink frees (the file is still live). A full mark-and-sweep frees
+    /// them, the live content is untouched, and the reclaim survives reopen.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "image IO + repeated sync; slow under Miri. gc_reclaims_overwrite_orphans_small covers the path"
+    )]
+    fn gc_reclaims_cow_overwrite_orphans() {
+        let img = tmp_image_path("gc-overwrite");
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            make_root(&mut fs);
+            let ino = make_file(&mut fs, ROOT_INO, b"f");
+            // Overwrite offset 0 fifty times: each put_extent allocs a fresh
+            // data block and orphans the previous one.
+            for i in 0..50u32 {
+                let payload = format!("v{i:04}");
+                fs.put_extent(ino, 0, payload.as_bytes()).unwrap();
+            }
+            fs.sync().unwrap();
+            let hwm_before = fs.store.next_block_nr();
+
+            let reclaimed = fs.gc().unwrap();
+            assert!(
+                reclaimed >= 40,
+                "expected ~49 overwrite orphans reclaimed, got {reclaimed}"
+            );
+            // GC frees far more than the few free-list chain blocks its trailing
+            // sync bump-allocates, so the high-water mark barely moves.
+            assert!(
+                fs.store.next_block_nr() <= hwm_before + 2,
+                "GC should not meaningfully grow the image: {} -> {}",
+                hwm_before,
+                fs.store.next_block_nr()
+            );
+            // The live version is intact right after GC.
+            let ext = fs.get_extent(ino, 0).unwrap().expect("live extent");
+            let blk = fs.read_data_block(ext.data_block).unwrap();
+            assert_eq!(&blk[..5], b"v0049");
+            // The reclaimed blocks are on the free list, available to satisfy
+            // future allocations without bumping the high-water mark.
+            assert!(
+                fs.store.free_count() >= 40,
+                "reclaimed blocks should be on the free list, free_count={}",
+                fs.store.free_count()
+            );
+        }
+        // Reopen: the live content survives and no live block was clobbered.
+        {
+            let fs = Fs::open(&img.0).unwrap();
+            let ino = fs
+                .lookup_dirent(ROOT_INO, b"f")
+                .unwrap()
+                .unwrap()
+                .target_ino;
+            let ext = fs.get_extent(ino, 0).unwrap().expect("live extent");
+            let blk = fs.read_data_block(ext.data_block).unwrap();
+            assert_eq!(&blk[..5], b"v0049", "live content lost after GC + reopen");
+        }
+    }
+
+    /// Miri-friendly core of `gc_reclaims_cow_overwrite_orphans`: a handful of
+    /// overwrites, one GC, assert orphans are reclaimed and the live block is
+    /// preserved. Small scale so it runs under Miri.
+    #[test]
+    fn gc_reclaims_overwrite_orphans_small() {
+        let img = tmp_image_path("gc-overwrite-small");
+        let mut fs = Fs::create(&img.0).unwrap();
+        make_root(&mut fs);
+        let ino = make_file(&mut fs, ROOT_INO, b"f");
+        for i in 0..5u32 {
+            fs.put_extent(ino, 0, format!("v{i}").as_bytes()).unwrap();
+        }
+        fs.sync().unwrap();
+        let reclaimed = fs.gc().unwrap();
+        assert!(reclaimed >= 3, "expected ~4 orphans, got {reclaimed}");
+        let ext = fs.get_extent(ino, 0).unwrap().expect("live extent");
+        assert_eq!(&fs.read_data_block(ext.data_block).unwrap()[..2], b"v4");
+
+        // Draining the free list must never hand out the same block twice.
+        // Regression guard: the leading sync's free-list chain blocks must be
+        // marked live, or they'd be swept AND re-added via last_chain_blocks,
+        // duplicating an entry that alloc() would then dispense twice.
+        let mut seen = std::collections::HashSet::new();
+        let n = fs.store.free_count();
+        for _ in 0..n {
+            let nr = fs.store.alloc();
+            assert!(seen.insert(nr), "block {nr} handed out twice after GC");
+        }
+    }
+
+    /// GC must not reclaim a block still referenced by a sibling snapshot: the
+    /// whole reason eager free-on-overwrite is unsafe. Write a block, snapshot,
+    /// switch back and overwrite in the parent — the snapshot's inherited
+    /// extent still points at the original block, so GC must keep it.
+    #[test]
+    fn gc_preserves_blocks_referenced_by_snapshots() {
+        let img = tmp_image_path("gc-snap");
+        let mut fs = Fs::create(&img.0).unwrap();
+        make_root(&mut fs);
+        let ino = make_file(&mut fs, ROOT_INO, b"f");
+        fs.put_extent(ino, 0, b"original").unwrap();
+        fs.sync().unwrap();
+
+        // Snapshot the root subvol, then overwrite in the active tree.
+        let snap = fs.snapshot_subvol(ROOT_SUBVOL).unwrap();
+        fs.put_extent(ino, 0, b"modified").unwrap();
+        fs.sync().unwrap();
+
+        let reclaimed = fs.gc().unwrap();
+
+        // The active version reads "modified"; the snapshot still reads
+        // "original" — its data block was NOT reclaimed.
+        let active = fs.get_extent(ino, 0).unwrap().unwrap();
+        assert_eq!(
+            &fs.read_data_block(active.data_block).unwrap()[..8],
+            b"modified"
+        );
+        fs.switch_subvol(snap).unwrap();
+        let snap_ext = fs.get_extent(ino, 0).unwrap().expect("snapshot extent");
+        assert_eq!(
+            &fs.read_data_block(snap_ext.data_block).unwrap()[..8],
+            b"original",
+            "GC reclaimed a block still referenced by a snapshot (reclaimed={reclaimed})"
         );
     }
 }

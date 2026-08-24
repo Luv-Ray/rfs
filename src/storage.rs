@@ -470,6 +470,21 @@ impl BlockStore {
         self.free_list.lock().unwrap().len() as u64
     }
 
+    /// Snapshot of the block numbers currently on the free list. Used by GC to
+    /// mark already-free blocks as live so the sweep doesn't double-free them.
+    pub fn free_list_snapshot(&self) -> Vec<u64> {
+        self.free_list.lock().unwrap().clone()
+    }
+
+    /// Block numbers holding the on-disk free-list chain written by the last
+    /// `persist_free_list`. These are allocated-and-accounted-for containers,
+    /// not orphans: GC must mark them live, or the sweep would free them while
+    /// the next `persist_free_list` (which recycles them via `last_chain_blocks`)
+    /// re-adds them — duplicating a block on the free list.
+    pub fn chain_blocks_snapshot(&self) -> Vec<u64> {
+        self.last_chain_blocks.lock().unwrap().clone()
+    }
+
     /// Current value of the allocator counter (for snapshotting into
     /// the superblock at sync time).
     pub fn next_block_nr(&self) -> u64 {

@@ -193,6 +193,19 @@ impl Btree {
         Ok(())
     }
 
+    /// Collect the block number of every node reachable from the current root.
+    /// Used by `Fs::gc` to mark live metadata blocks before sweeping orphans.
+    ///
+    /// Must be called on a tree whose in-cache and on-disk state agree — i.e.
+    /// right after a `checkpoint`/`sync`, with no dirty (in-place-appended)
+    /// nodes pending relocation — so that "reachable from root_block" is the
+    /// authoritative live set. `Fs::gc` guarantees this by syncing first.
+    pub fn collect_live_node_blocks(&self) -> Result<Vec<u64>> {
+        let mut blocks = Vec::new();
+        collect_node_blocks_rec(&self.store, self.root_block, &mut blocks)?;
+        Ok(blocks)
+    }
+
     /// Number of resolved-write records currently buffered for the WAL.
     /// `Fs::journal_commit` uses this to compute how many frames are already
     /// spoken for before it decides how much orphan reclaim can join the
@@ -693,6 +706,24 @@ impl Default for Btree {
 }
 
 /// Count total keys in the subtree rooted at `block_nr`.
+/// Post-order walk collecting the block number of every node reachable from
+/// `block_nr` (this node plus all descendants). Backs
+/// [`Btree::collect_live_node_blocks`].
+fn collect_node_blocks_rec(store: &BlockStore, block_nr: u64, out: &mut Vec<u64>) -> Result<()> {
+    out.push(block_nr);
+    let children: Vec<u64> = store.with_node(block_nr, |node| {
+        if node.level() == 0 {
+            Vec::new()
+        } else {
+            (0..=node.nkeys()).map(|i| node.child_block(i)).collect()
+        }
+    })?;
+    for child in children {
+        collect_node_blocks_rec(store, child, out)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn count_keys(store: &BlockStore, block_nr: u64) -> usize {
     let node = store.read_node_copy(block_nr).unwrap();
