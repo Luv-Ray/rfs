@@ -3479,10 +3479,32 @@ mod tests {
         fs.put_extent(ino, 0, b"modified").unwrap();
         fs.sync().unwrap();
 
+        // Record the snapshot's inherited data block before GC so we can prove
+        // it was not reclaimed even against block reuse.
+        fs.switch_subvol(snap).unwrap();
+        let snap_block = fs
+            .get_extent(ino, 0)
+            .unwrap()
+            .expect("snapshot extent")
+            .data_block;
+        fs.switch_subvol(ROOT_SUBVOL).unwrap();
+
         let reclaimed = fs.gc().unwrap();
 
+        // Reuse pressure: if GC wrongly freed the snapshot's block, a fresh
+        // write must reuse and overwrite it. Without this, a dangling free is
+        // invisible — free() doesn't zero the block, so a stale read still
+        // returns the old bytes. Allocate several new blocks to drain the free
+        // list past any mistakenly-freed one.
+        let scratch = make_file(&mut fs, ROOT_INO, b"scratch");
+        for i in 0..(reclaimed as u64 + 8) {
+            fs.put_extent(scratch, i * BLOCK_SIZE as u64, b"XXXXXXXX")
+                .unwrap();
+        }
+
         // The active version reads "modified"; the snapshot still reads
-        // "original" — its data block was NOT reclaimed.
+        // "original" — and crucially its data block is unchanged, i.e. it was
+        // never handed to the scratch writes above.
         let active = fs.get_extent(ino, 0).unwrap().unwrap();
         assert_eq!(
             &fs.read_data_block(active.data_block).unwrap()[..8],
@@ -3490,6 +3512,7 @@ mod tests {
         );
         fs.switch_subvol(snap).unwrap();
         let snap_ext = fs.get_extent(ino, 0).unwrap().expect("snapshot extent");
+        assert_eq!(snap_ext.data_block, snap_block, "snapshot's extent moved");
         assert_eq!(
             &fs.read_data_block(snap_ext.data_block).unwrap()[..8],
             b"original",
