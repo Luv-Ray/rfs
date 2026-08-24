@@ -3157,6 +3157,12 @@ mod tests {
     /// high-water mark staying bounded across many cycles proves the per-
     /// checkpoint node leak is actually plugged.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "40 sync cycles × 58 inodes of image IO; slow under Miri. \
+                  checkpoint_reclaim_reuse_survives_reopen covers the same \
+                  reclaim/reuse/recovery path at Miri-friendly scale"
+    )]
     fn checkpoint_reclaim_is_crash_safe_and_bounds_growth() {
         let img = tmp_image_path("ckpt-reclaim");
         let mut hwm_after_first: u64 = 0;
@@ -3175,7 +3181,8 @@ mod tests {
             // high-water mark without bound.
             for round in 0..40u64 {
                 for ino in 2..60u64 {
-                    fs.put_inode(ino, &sample_inode(ino + round * 1000)).unwrap();
+                    fs.put_inode(ino, &sample_inode(ino + round * 1000))
+                        .unwrap();
                 }
                 fs.sync().unwrap();
                 if round == 0 {
@@ -3196,10 +3203,57 @@ mod tests {
         {
             let fs = Fs::open(&img.0).unwrap();
             for ino in 2..60u64 {
-                let inode = fs.get_inode(ino).unwrap().expect("inode survived reclaim cycles");
+                let inode = fs
+                    .get_inode(ino)
+                    .unwrap()
+                    .expect("inode survived reclaim cycles");
                 assert_eq!(
                     inode.size,
                     ino + 39 * 1000,
+                    "inode {ino} corrupted — reclaim freed a live block"
+                );
+            }
+        }
+    }
+
+    /// Miri-friendly core of `checkpoint_reclaim_is_crash_safe_and_bounds_growth`:
+    /// a few sync cycles that relocate nodes and reclaim their old blocks, then
+    /// a reopen. Small scale (3 cycles, 6 inodes) so it runs under Miri, while
+    /// still exercising the risky path — a block freed by one checkpoint gets
+    /// reused by a later one, and recovery must not read a clobbered live block.
+    #[test]
+    fn checkpoint_reclaim_reuse_survives_reopen() {
+        let img = tmp_image_path("ckpt-reclaim-small");
+        {
+            let mut fs = Fs::create(&img.0).unwrap();
+            make_root(&mut fs);
+            for ino in 2..8u64 {
+                fs.put_inode(ino, &sample_inode(ino)).unwrap();
+            }
+            fs.sync().unwrap();
+            let hwm_before_cycles = fs.store.next_block_nr();
+            for round in 0..3u64 {
+                for ino in 2..8u64 {
+                    fs.put_inode(ino, &sample_inode(ino + round * 1000))
+                        .unwrap();
+                }
+                fs.sync().unwrap();
+            }
+            // Reclaim must feed reuse: three relocating checkpoints grow the
+            // high-water mark by far less than three fresh trees would.
+            assert!(
+                fs.store.next_block_nr() - hwm_before_cycles < 20,
+                "high-water mark grew {} — freed blocks not reused",
+                fs.store.next_block_nr() - hwm_before_cycles
+            );
+        }
+        {
+            let fs = Fs::open(&img.0).unwrap();
+            for ino in 2..8u64 {
+                let inode = fs.get_inode(ino).unwrap().expect("inode recovered");
+                assert_eq!(
+                    inode.size,
+                    ino + 2 * 1000,
                     "inode {ino} corrupted — reclaim freed a live block"
                 );
             }

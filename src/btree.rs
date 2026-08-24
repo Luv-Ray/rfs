@@ -2591,7 +2591,10 @@ mod tests {
         // Content is intact and the freed count is still non-trivial.
         for i in 0..500u32 {
             let want = if i == 0 { val(999) } else { val(i) };
-            assert_eq!(tree.find(&key(i)).unwrap().as_deref(), Some(want.as_slice()));
+            assert_eq!(
+                tree.find(&key(i)).unwrap().as_deref(),
+                Some(want.as_slice())
+            );
         }
         assert_eq!(count_keys(&tree.store, tree.root_block), 500);
         let _ = reclaimed;
