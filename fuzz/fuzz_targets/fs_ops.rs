@@ -2,29 +2,43 @@
 //! Differential fuzz of the `Fs` library layer against an in-memory oracle.
 //!
 //! A random byte stream is decoded into a sequence of filesystem operations
-//! (write / unlink / sync / gc / snapshot / reopen). Each op runs against a
-//! real image-backed `Fs` and, in parallel, against a `HashMap` shadow model
-//! of the *durable* extent contents. After every mutation the two are checked
-//! for agreement, and `gc` / `reopen` are checked to preserve that agreement —
-//! so this catches GC reclaiming a live block, journal replay losing a write,
-//! or a snapshot changing what the active subvolume sees, not merely panics.
+//! (write / unlink / sync / gc / reclaim / snapshot / delete-snapshot /
+//! reopen). Each op runs against a real image-backed `Fs` and, in parallel,
+//! against `HashMap` shadow models — one for the active subvolume and one
+//! frozen copy per readonly snapshot. After every mutation both the active
+//! view and every live snapshot are checked for agreement, so this catches:
+//!   - GC reclaiming a live block,
+//!   - journal replay losing a write,
+//!   - and (the class of the reclaim bug we fixed) unlink/reclaim/gc freeing
+//!     a COW-shared block that a sibling readonly snapshot still references.
 //!
-//! Every write is `journal_commit`ed immediately, so the shadow model always
-//! equals what a crash-recovery `open` must reconstruct: the oracle invariant
-//! is simply "committed extents == shadow", checked continuously and again
-//! after each reopen.
+//! Snapshot oracle: `snapshot_subvol` bumps the active subvol to a fresh
+//! writable snap_id and creates a readonly snapshot at a sibling snap_id.
+//! Subsequent active writes land on the writable snap_id and never touch the
+//! ancestor snap_ids the readonly view depends on, so a readonly snapshot's
+//! content is exactly the active content *frozen at creation time* and must
+//! stay byte-identical forever. We model that by cloning the active shadow at
+//! snapshot time and re-verifying it against the snapshot subvol after every
+//! later op. Writes always target the root subvol; snapshots are read-only.
+//!
+//! Every write is `journal_commit`ed immediately, so the shadow equals what a
+//! crash-recovery `open` must reconstruct: the invariant is "committed extents
+//! == shadow", checked continuously and again after each reopen.
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use std::collections::HashMap;
 
 use rfs::block_btree::BLOCK_SIZE;
-use rfs::fs::{DirentV1, FILE_KIND_REGULAR, Fs, InodeV1, ROOT_INO, ROOT_SUBVOL};
+use rfs::fs::{DirentV1, FILE_KIND_REGULAR, Fs, InodeV1, ROOT_INO, ROOT_SUBVOL, SubvolId};
 
 const N_FILES: u64 = 5; // inodes 2..7
 const N_OFFSETS: u64 = 4; // block offsets 0..4
 const MAX_OPS: usize = 256;
+const MAX_SNAPS: usize = 4; // cap tracked snapshots to bound verification cost
 const BLOCK: u64 = BLOCK_SIZE as u64;
+
+type Shadow = HashMap<(u64, u64), Cell>;
 
 #[derive(Arbitrary, Debug)]
 enum Op {
@@ -38,8 +52,10 @@ enum Op {
     Gc,
     /// Reclaim a slice of deleted-inode work items.
     Reclaim,
-    /// Snapshot the root subvolume (does not switch the active view).
+    /// Snapshot the root subvolume, capturing a frozen readonly view.
     Snapshot,
+    /// Delete a previously-taken readonly snapshot.
+    DeleteSnap { which: u8 },
     /// Close and reopen the image, forcing journal-replay recovery.
     Reopen,
 }
@@ -51,6 +67,13 @@ enum Op {
 struct Cell {
     fill: u8,
     len: usize,
+}
+
+/// A tracked readonly snapshot: its subvol id and the frozen content it must
+/// forever return.
+struct Snap {
+    subvol: SubvolId,
+    content: Shadow,
 }
 
 fn ino_of(file: u8) -> u64 {
@@ -68,7 +91,6 @@ fn offset_of(off: u8) -> u64 {
 /// Build a fresh image with the root dir and N_FILES empty regular files.
 fn fresh(path: &std::path::Path) -> Fs {
     let mut fs = Fs::create(path).expect("create image");
-    // Root inode + self dirent, mirroring the test helpers.
     let root = InodeV1 {
         mode: 0o040755,
         uid: 0,
@@ -102,13 +124,11 @@ fn fresh(path: &std::path::Path) -> Fs {
     fs
 }
 
-/// Assert every shadow cell matches the fs, and the fs holds nothing extra for
-/// the tracked inodes. Only valid while the active subvol is the original one.
-fn check_agreement(fs: &Fs, shadow: &HashMap<(u64, u64), Cell>, live: &[bool]) {
+/// Compare `fs`'s current view against `shadow` over the whole tracked
+/// file/offset space: matching cells must be byte-identical, and neither side
+/// may hold an extent the other lacks. `label`/`subvol` are for panic context.
+fn check_view(fs: &Fs, shadow: &Shadow, label: &str, subvol: SubvolId) {
     for file in 0..N_FILES as u8 {
-        if !live[file as usize] {
-            continue;
-        }
         let ino = ino_of(file);
         for off_idx in 0..N_OFFSETS as u8 {
             let off = offset_of(off_idx);
@@ -117,23 +137,38 @@ fn check_agreement(fs: &Fs, shadow: &HashMap<(u64, u64), Cell>, live: &[bool]) {
                 (Some(cell), Some(ext)) => {
                     assert_eq!(
                         ext.len as usize, cell.len,
-                        "len mismatch ino={ino} off={off}"
+                        "{label} subvol={subvol} len mismatch ino={ino} off={off}"
                     );
                     let block = fs.read_data_block(ext.data_block).expect("read block");
                     for (i, b) in block.iter().enumerate() {
                         let want = if i < cell.len { cell.fill } else { 0 };
                         assert_eq!(
                             *b, want,
-                            "byte {i} mismatch ino={ino} off={off}: got {b} want {want}"
+                            "{label} subvol={subvol} byte {i} mismatch ino={ino} off={off}: \
+                             got {b} want {want}"
                         );
                     }
                 }
                 (None, None) => {}
-                (Some(_), None) => panic!("shadow has extent but fs lost it: ino={ino} off={off}"),
-                (None, Some(_)) => panic!("fs has extent shadow never wrote: ino={ino} off={off}"),
+                (Some(_), None) => panic!(
+                    "{label} subvol={subvol} lost an extent it must have: ino={ino} off={off}"
+                ),
+                (None, Some(_)) => panic!(
+                    "{label} subvol={subvol} sees an extent it must not: ino={ino} off={off}"
+                ),
             }
         }
     }
+}
+
+/// Verify every tracked snapshot still returns its frozen content. Switches
+/// into each snapshot subvol and back to root; requires `&mut` for the switch.
+fn check_snapshots(fs: &mut Fs, snaps: &[Snap]) {
+    for snap in snaps {
+        fs.switch_subvol(snap.subvol).expect("switch into snapshot");
+        check_view(fs, &snap.content, "snapshot", snap.subvol);
+    }
+    fs.switch_subvol(ROOT_SUBVOL).expect("switch back to root");
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -141,12 +176,9 @@ fuzz_target!(|data: &[u8]| {
     let path = dir.path().join("fuzz.img");
     let mut fs = fresh(&path);
 
-    // Shadow of durable extent contents, and which inodes are still linked.
-    let mut shadow: HashMap<(u64, u64), Cell> = HashMap::new();
+    let mut active: Shadow = HashMap::new();
     let mut live = [true; N_FILES as usize];
-    // We never switch the active subvolume, so the shadow of the root
-    // subvol's durable extents stays authoritative for the whole run —
-    // snapshotting must not change what the active view reads.
+    let mut snaps: Vec<Snap> = Vec::new();
 
     let mut u = arbitrary::Unstructured::new(data);
     let mut ops = 0;
@@ -161,30 +193,25 @@ fuzz_target!(|data: &[u8]| {
                 let ino = ino_of(file);
                 let offset = offset_of(off);
                 let len = (len as usize % BLOCK_SIZE) + 1; // 1..=BLOCK
-                let payload = vec![fill; len];
-                fs.put_extent(ino, offset, &payload).expect("put_extent");
+                fs.put_extent(ino, offset, &vec![fill; len]).expect("put_extent");
                 fs.journal_commit().expect("commit write");
-                shadow.insert((ino, offset), Cell { fill, len });
+                active.insert((ino, offset), Cell { fill, len });
             }
             Op::Unlink { file } => {
                 let slot = (file % N_FILES as u8) as usize;
                 if !live[slot] {
                     continue;
                 }
-                // Unlink may legitimately fail (e.g. mid-state); tolerate it.
                 if fs.unlink(ROOT_INO, &name_of(file)).is_ok() {
                     fs.journal_commit().expect("commit unlink");
-                    // Reclaim drops the extents; drop them from the shadow too.
                     let _ = fs.reclaim_deleted_inodes(usize::MAX);
                     fs.journal_commit().expect("commit reclaim");
                     let ino = ino_of(file);
-                    shadow.retain(|&(i, _), _| i != ino);
+                    active.retain(|&(i, _), _| i != ino);
                     live[slot] = false;
                 }
             }
-            Op::Sync => {
-                fs.sync().expect("sync");
-            }
+            Op::Sync => fs.sync().expect("sync"),
             Op::Gc => {
                 fs.gc().expect("gc");
             }
@@ -193,25 +220,50 @@ fuzz_target!(|data: &[u8]| {
                 fs.journal_commit().expect("commit reclaim");
             }
             Op::Snapshot => {
-                // May exhaust the snap-id space over a long run; that's fine.
-                let _ = fs.snapshot_subvol(ROOT_SUBVOL);
-                fs.journal_commit().expect("commit snapshot");
+                // Always exercise the code; only track up to MAX_SNAPS so
+                // verification stays bounded. Tracking requires active ==
+                // ROOT_SUBVOL (always true here — we never switch for writes).
+                match fs.snapshot_subvol(ROOT_SUBVOL) {
+                    Ok(sub) => {
+                        fs.journal_commit().expect("commit snapshot");
+                        if snaps.len() < MAX_SNAPS {
+                            snaps.push(Snap { subvol: sub, content: active.clone() });
+                        }
+                    }
+                    Err(_) => {} // snap-id exhaustion etc. — tolerate.
+                }
+            }
+            Op::DeleteSnap { which } => {
+                if snaps.is_empty() {
+                    continue;
+                }
+                let idx = (which as usize) % snaps.len();
+                let sub = snaps[idx].subvol;
+                // delete_snapshot requires a readonly, non-active, leaf
+                // snapshot — all our tracked snaps qualify. On success, stop
+                // tracking it (its exclusively-owned blocks may now be gc'd).
+                if fs.delete_snapshot(sub).is_ok() {
+                    fs.journal_commit().expect("commit delete_snapshot");
+                    snaps.remove(idx);
+                }
             }
             Op::Reopen => {
-                // Ensure the current view is durable, then reopen from disk.
                 fs.sync().expect("sync before reopen");
                 drop(fs);
                 fs = Fs::open(&path).expect("reopen image");
             }
         }
-        check_agreement(&fs, &shadow, &live);
+        check_view(&fs, &active, "active", ROOT_SUBVOL);
+        check_snapshots(&mut fs, &snaps);
     }
 
-    // Final gauntlet: gc then reopen must both preserve the durable state.
+    // Final gauntlet: gc then reopen must both preserve every view.
     fs.gc().expect("final gc");
-    check_agreement(&fs, &shadow, &live);
+    check_view(&fs, &active, "active", ROOT_SUBVOL);
+    check_snapshots(&mut fs, &snaps);
     fs.sync().expect("final sync");
     drop(fs);
-    let fs = Fs::open(&path).expect("final reopen");
-    check_agreement(&fs, &shadow, &live);
+    let mut fs = Fs::open(&path).expect("final reopen");
+    check_view(&fs, &active, "active", ROOT_SUBVOL);
+    check_snapshots(&mut fs, &snaps);
 });
