@@ -779,6 +779,13 @@ impl Fs {
         self.current_subvol
     }
 
+    /// The journal seq recorded by the most recent checkpoint (superblock).
+    /// On a freshly opened image this is the `journal_seq` the loaded
+    /// superblock carried, i.e. the point recovery replayed forward from.
+    pub fn last_checkpoint_seq(&self) -> u64 {
+        self.last_checkpoint_seq
+    }
+
     pub fn alloc_ino(&mut self) -> u64 {
         let ino = self.next_ino;
         self.next_ino += 1;
@@ -2922,13 +2929,16 @@ mod tests {
             // Drop without sync — simulates crash after journal commit.
         }
 
-        // Reopen — recovery should find the journal entry and see inode 2.
+        // Reopen — recovery should find the journal entry and see inode 2
+        // with the exact value it was written with. Checking `size == 99`
+        // (not just `is_some`) means a replay that restored the key with a
+        // mis-decoded value would fail here.
         {
             let fs = Fs::open(&img.0).unwrap();
-            let got = fs.get_inode(2).unwrap();
-            assert!(
-                got.is_some(),
-                "inode 2 must be visible after journal recovery"
+            let got = fs.get_inode(2).unwrap().expect("inode 2 recovered");
+            assert_eq!(
+                got.size, 99,
+                "recovered inode 2 must have its journaled size"
             );
         }
     }
@@ -2982,18 +2992,19 @@ mod tests {
 
         {
             let fs = Fs::open(&img.0).unwrap();
-            assert!(
-                fs.get_inode(2).unwrap().is_some(),
-                "inode 2 must survive journal recovery"
-            );
-            assert!(
-                fs.get_inode(3).unwrap().is_some(),
-                "inode 3 must survive journal recovery"
-            );
-            assert!(
-                fs.lookup_dirent(2, b"hello").unwrap().is_some(),
-                "dirent 'hello' under inode 2 must survive journal recovery"
-            );
+            // Check exact values, not just presence: a replay that restored a
+            // key at the right position with wrong content would pass an
+            // is_some() check but fail these.
+            let i2 = fs.get_inode(2).unwrap().expect("inode 2 survives recovery");
+            assert_eq!(i2.mode, 0o040755, "inode 2 mode must survive intact");
+            let i3 = fs.get_inode(3).unwrap().expect("inode 3 survives recovery");
+            assert_eq!(i3.mode, 0o100644, "inode 3 mode must survive intact");
+            assert_eq!(i3.parent_ino, 2, "inode 3 parent must survive intact");
+            let d = fs
+                .lookup_dirent(2, b"hello")
+                .unwrap()
+                .expect("dirent 'hello' survives recovery");
+            assert_eq!(d.target_ino, 3, "dirent must point at the right inode");
         }
     }
 
@@ -3045,15 +3056,25 @@ mod tests {
 
         {
             let fs = Fs::open(&img.0).unwrap();
+            // The checkpoint actually advanced the journal seq — the superblock
+            // recorded a non-zero checkpoint point, and recovery started replay
+            // from there rather than from seq 0. Without this assertion the test
+            // is tautological: a full replay from the start would restore both
+            // inodes even if sync() never checkpointed, so `is_some()` on both
+            // proves nothing about the checkpoint/replay split the test names.
+            assert!(
+                fs.last_checkpoint_seq() > 0,
+                "reopen must resume from the checkpoint the first sync recorded"
+            );
             // inode 2 was included in the checkpoint so the superblock covers it.
             assert!(
                 fs.get_inode(2).unwrap().is_some(),
                 "inode 2 must be visible: included in checkpoint superblock"
             );
-            // inode 3 was journaled after the checkpoint; recovery replays seq 2.
+            // inode 3 was journaled after the checkpoint; recovery replays it.
             assert!(
                 fs.get_inode(3).unwrap().is_some(),
-                "inode 3 must be visible: recovered from journal entry at seq 2"
+                "inode 3 must be visible: recovered from journal entry after checkpoint"
             );
         }
     }
