@@ -28,6 +28,11 @@ fn sortable_key(logical: &[u8], snap: SnapId) -> ([u8; MAX_KEY_SIZE], usize) {
 /// Aliased for readability (clippy nags at the inline form).
 pub type AllSnapRow = (Vec<u8>, SnapId, EntryKind, Vec<u8>);
 
+/// One row of `Btree::range_scan_visible_with_snap`: the visible `(logical
+/// key, snap_id it's stored at, value)`. Aliased to appease clippy's
+/// type-complexity lint.
+pub type VisibleSnapRow = (Vec<u8>, SnapId, Vec<u8>);
+
 #[derive(Debug)]
 pub enum Error {
     /// A block referenced by the tree is missing from the block map.
@@ -465,6 +470,49 @@ impl Btree {
             match kind {
                 EntryKind::Live => {
                     out.push((logical, value));
+                    current_decided = true;
+                }
+                EntryKind::Deleted | EntryKind::Whiteout => {
+                    current_decided = true;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Like [`Self::range_scan_visible`], but each emitted row also carries the
+    /// snap_id at which the visible entry is physically stored.
+    ///
+    /// Reclaim needs this to decide whether a data block is exclusively owned:
+    /// if the visible extent sits at `target`'s own snap_id, deleting it frees
+    /// the block for real; if it is inherited from an ancestor (visible_snap !=
+    /// target), an ancestor snapshot still references the block and freeing it
+    /// would corrupt that snapshot.
+    pub fn range_scan_visible_with_snap(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        chain: &[SnapId],
+    ) -> Result<Vec<VisibleSnapRow>> {
+        let chain_set: std::collections::HashSet<SnapId> = chain.iter().copied().collect();
+        let raw = self.range_scan_all(start, end)?;
+        let mut out: Vec<VisibleSnapRow> = Vec::new();
+        let mut current_logical: Option<Vec<u8>> = None;
+        let mut current_decided = false;
+        for (logical, snap, kind, value) in raw {
+            if current_logical.as_deref() != Some(logical.as_slice()) {
+                current_logical = Some(logical.clone());
+                current_decided = false;
+            }
+            if current_decided {
+                continue;
+            }
+            if !chain_set.contains(&snap) {
+                continue;
+            }
+            match kind {
+                EntryKind::Live => {
+                    out.push((logical, snap, value));
                     current_decided = true;
                 }
                 EntryKind::Deleted | EntryKind::Whiteout => {

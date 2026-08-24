@@ -1088,11 +1088,13 @@ impl Fs {
             let chain = self.ancestor_chain(snap)?;
             let (_, end) = extent_range(ino);
             let start = extent_key(ino, next_offset);
-            let extents = self.tree.range_scan_visible(&start, &end, &chain)?;
+            let extents = self
+                .tree
+                .range_scan_visible_with_snap(&start, &end, &chain)?;
 
             let mut finished = true;
             let mut last_offset = next_offset;
-            for (key, extent_bytes) in extents {
+            for (key, visible_snap, extent_bytes) in extents {
                 if budget == 0 {
                     finished = false;
                     break;
@@ -1102,7 +1104,16 @@ impl Fs {
                 let offset = extent_offset_from_key(&key);
                 self.tree
                     .delete_at(&extent_key(ino, offset), snap, &chain)?;
-                self.store.free(extent.data_block);
+                // Only free the data block if this extent is stored at the
+                // orphan's OWN snap_id. If it's inherited from an ancestor
+                // (visible_snap != snap), delete_at wrote a whiteout to shadow
+                // it, but the ancestor's Live extent — and a sibling snapshot
+                // sharing this block via COW — still references it. Freeing it
+                // would corrupt that snapshot; leave the block for Fs::gc(),
+                // whose mark-and-sweep checks every snap_id before reclaiming.
+                if visible_snap == snap {
+                    self.store.free(extent.data_block);
+                }
                 last_offset = offset;
                 budget -= 1;
                 issued += 1;
@@ -1881,8 +1892,9 @@ mod tests {
         let mut fs = Fs::new();
         make_root(&mut fs);
         let ino = make_file(&mut fs, ROOT_INO, b"shared");
+        // Distinct byte per block so a clobbered block is detectable by value.
         for i in 0..3u64 {
-            fs.put_extent(ino, i * BLOCK_SIZE as u64, b"x").unwrap();
+            fs.put_extent(ino, i * BLOCK_SIZE as u64, &[b'A' + i as u8; 8]).unwrap();
         }
 
         let snap_subvol = fs.snapshot_subvol(ROOT_SUBVOL).unwrap();
@@ -1896,6 +1908,34 @@ mod tests {
         // The readonly snapshot still inherits them from ROOT_SNAP.
         fs.switch_subvol(snap_subvol).unwrap();
         assert_eq!(fs.list_extents(ino).unwrap().len(), 3);
+        let snap_blocks: Vec<u64> = fs
+            .list_extents(ino)
+            .unwrap()
+            .iter()
+            .map(|(_, e)| e.data_block)
+            .collect();
+        fs.switch_subvol(ROOT_SUBVOL).unwrap();
+
+        // Reuse pressure: reclaim must NOT have freed the snapshot's inherited
+        // blocks. If it did, these fresh writes reuse and clobber them (free()
+        // doesn't zero, so without reuse the corruption is invisible — this is
+        // the assertion-blindness that hid the original bug).
+        let scratch = make_file(&mut fs, ROOT_INO, b"scratch");
+        for i in 0..24u64 {
+            fs.put_extent(scratch, i * BLOCK_SIZE as u64, &[b'Z'; 8]).unwrap();
+        }
+
+        // The snapshot's data must still be byte-intact.
+        fs.switch_subvol(snap_subvol).unwrap();
+        for (i, &blk) in snap_blocks.iter().enumerate() {
+            let data = fs.read_data_block(blk).unwrap();
+            assert_eq!(
+                &data[..8],
+                &[b'A' + i as u8; 8],
+                "snapshot block {blk} (offset {i}) clobbered — reclaim freed a \
+                 block a sibling snapshot still references"
+            );
+        }
         fs.switch_subvol(ROOT_SUBVOL).unwrap();
     }
 
