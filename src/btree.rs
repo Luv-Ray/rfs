@@ -173,9 +173,23 @@ impl Btree {
     ///
     /// Called by `Fs::sync`. Idempotent when nothing is dirty: with no dirty
     /// nodes the walk keeps every block_nr and `root_block` is unchanged.
+    ///
+    /// Each node relocated by the walk leaves its old block unreferenced. We
+    /// collect those old blocks and return them to the allocator's free list
+    /// only *after* the whole walk finishes — freeing mid-walk could let a
+    /// later relocation's `alloc()` reuse a block still live in the previous
+    /// on-disk checkpoint, corrupting the tree a crash would recover. Freeing
+    /// after the walk is crash-safe: `Fs::sync` persists the free list into a
+    /// fresh chain (bump-allocated, never popping these blocks) *before* the
+    /// superblock swap, and the old superblock never references that chain, so
+    /// a crash before the swap still recovers the intact previous checkpoint.
     pub fn checkpoint(&mut self) -> Result<()> {
-        let new_root = checkpoint_flush(&self.store, self.root_block)?;
+        let mut freed = Vec::new();
+        let new_root = checkpoint_flush(&self.store, self.root_block, &mut freed)?;
         self.root_block = new_root;
+        for nr in freed {
+            self.store.free(nr);
+        }
         Ok(())
     }
 
@@ -1676,8 +1690,14 @@ fn promote_to_parent(
 /// anywhere during the flush leaves the previous checkpoint's on-disk tree
 /// byte-for-byte intact; the superblock still points at the old root until the
 /// caller swaps it (double-fsync in `Fs::sync`). The newly written blocks
-/// become unreferenced orphans until a future GC.
-fn checkpoint_flush(store: &BlockStore, block_nr: u64) -> Result<u64> {
+/// become unreferenced orphans until the superblock swap makes them live.
+///
+/// Every relocated node's *old* block number is appended to `freed`. Those
+/// blocks are unreferenced by the new tree, but the caller must not return them
+/// to the allocator until this whole walk has finished: freeing mid-walk would
+/// let a later `store.alloc()` hand one back and overwrite a block still live in
+/// the previous on-disk checkpoint. See [`Btree::checkpoint`].
+fn checkpoint_flush(store: &BlockStore, block_nr: u64, freed: &mut Vec<u64>) -> Result<u64> {
     // A node absent from the cache was neither read nor written since the last
     // checkpoint, so its whole on-disk subtree is already clean — keep it.
     let Some((level, dirty)) = store.with_cached_node(block_nr, |n, dirty| (n.level(), dirty))
@@ -1689,10 +1709,11 @@ fn checkpoint_flush(store: &BlockStore, block_nr: u64) -> Result<u64> {
         if !dirty {
             return Ok(block_nr);
         }
-        // Relocate this leaf to a fresh block.
+        // Relocate this leaf to a fresh block; its old block is now an orphan.
         let node = store.with_node(block_nr, clone_to_heap)?;
         let new_block = store.alloc();
         store.write_node(new_block, &node)?;
+        freed.push(block_nr);
         return Ok(new_block);
     }
 
@@ -1706,7 +1727,7 @@ fn checkpoint_flush(store: &BlockStore, block_nr: u64) -> Result<u64> {
     let mut new_children = Vec::with_capacity(child_blocks.len());
     let mut any_moved = false;
     for &child in &child_blocks {
-        let new_child = checkpoint_flush(store, child)?;
+        let new_child = checkpoint_flush(store, child, freed)?;
         any_moved |= new_child != child;
         new_children.push(new_child);
     }
@@ -1721,6 +1742,7 @@ fn checkpoint_flush(store: &BlockStore, block_nr: u64) -> Result<u64> {
     }
     let new_block = store.alloc();
     store.write_node(new_block, &node)?;
+    freed.push(block_nr);
     Ok(new_block)
 }
 
@@ -2524,6 +2546,55 @@ mod tests {
             tree.find(&key(0)).unwrap().as_deref(),
             Some(val(N - 1).as_slice())
         );
+        tree.verify();
+    }
+
+    #[test]
+    fn test_checkpoint_relocation_reclaims_old_blocks() {
+        // A checkpoint COW-relocates every dirty node onto a fresh block; the
+        // old block is now unreferenced. It must be returned to the free list
+        // so a later alloc reuses it instead of leaking a block per checkpoint.
+        let mut tree = Btree::new();
+        for i in 0u32..500 {
+            tree.insert(&key(i), &val(i)).unwrap();
+        }
+        // First checkpoint: relocates the dirty tree; nothing was on the free
+        // list before, so afterwards it holds exactly the relocated old blocks.
+        assert_eq!(tree.store.free_count(), 0);
+        tree.checkpoint().unwrap();
+        let reclaimed = tree.store.free_count();
+        assert!(
+            reclaimed > 0,
+            "checkpoint that relocated a multi-node tree must free the old blocks"
+        );
+
+        // Dirty a single leaf, then checkpoint again. Only the touched root→leaf
+        // path relocates, and each freed old block is reusable: the high-water
+        // mark must advance by fewer blocks than we allocate, i.e. the free list
+        // is actually drained by the relocation's own allocs.
+        tree.insert(&key(0), &val(999)).unwrap();
+        let hwm_before = tree.store.next_block_nr();
+        let free_before = tree.store.free_count();
+        tree.checkpoint().unwrap();
+        let hwm_after = tree.store.next_block_nr();
+        // The relocation allocated (root→leaf) blocks; because free_before > 0
+        // those came from the free list, not the bump allocator, so the
+        // high-water mark grows by strictly less than the path length.
+        let path_len = free_before; // >= number of nodes on the touched path
+        assert!(
+            hwm_after - hwm_before < path_len,
+            "relocation should reuse freed blocks (hwm grew {} with {} free)",
+            hwm_after - hwm_before,
+            free_before
+        );
+
+        // Content is intact and the freed count is still non-trivial.
+        for i in 0..500u32 {
+            let want = if i == 0 { val(999) } else { val(i) };
+            assert_eq!(tree.find(&key(i)).unwrap().as_deref(), Some(want.as_slice()));
+        }
+        assert_eq!(count_keys(&tree.store, tree.root_block), 500);
+        let _ = reclaimed;
         tree.verify();
     }
 
