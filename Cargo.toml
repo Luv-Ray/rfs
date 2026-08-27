@@ -11,4 +11,3 @@ elsa = "1.10"
 crc32fast = "1.4"
 
 [dev-dependencies]
-tempfile = "3.27.0"

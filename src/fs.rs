@@ -387,10 +387,8 @@ pub struct Fs {
     next_ino: u64,
     /// Smallest snap_id allocated so far minus one. New snapshots take ids
     /// counting down from `next_snap_id`. bcachefs: parent always > child.
-    #[allow(dead_code)] // wired up in Phase 8 (snapshot_subvol)
     next_snap_id: SnapId,
     /// Smallest subvol_id not yet used. Subvol ids count up from ROOT_SUBVOL.
-    #[allow(dead_code)] // wired up in Phase 8 (snapshot_subvol)
     next_subvol_id: SubvolId,
     /// The currently active subvolume — every fs op reads/writes at this
     /// subvol's snap_id. v1 always uses ROOT_SUBVOL; multi-subvol switching
@@ -421,13 +419,13 @@ impl Fs {
     /// immediately openable.
     pub fn create(path: &std::path::Path) -> Result<Self> {
         let store = Arc::new(BlockStore::create_image(path)?);
-        let file = store.try_clone_file()?;
-        // Extend the file to cover the journal region.
-        file.set_len(
+        let device = store.device();
+        // Extend the device to cover the journal region.
+        device.set_len(
             (crate::storage::FIRST_JOURNAL_BLOCK + crate::storage::JOURNAL_BLOCKS)
                 * crate::block_btree::BLOCK_SIZE as u64,
         )?;
-        let journal = crate::journal::Journal::new(file);
+        let journal = crate::journal::Journal::new(device);
         let tree = Btree::create_in(store.clone());
         let mut fs = Self::seed(tree, store, ROOT_INO);
         fs.journal = Some(journal);
@@ -449,7 +447,7 @@ impl Fs {
         let store = Arc::new(BlockStore::open_image(path)?);
         let sb = store.read_superblock()?;
 
-        let journal = crate::journal::Journal::new(store.try_clone_file()?);
+        let journal = crate::journal::Journal::new(store.device());
         // Scan complete commit groups after the last checkpoint, then replay
         // each group's logged ops onto the checkpoint tree and adopt the last
         // group's CommitEnd state scalars.
@@ -3099,11 +3097,10 @@ mod tests {
             // discard it entirely.
             let mut bad = crate::storage::JournalFrame::commit_end(4, 999, 999, 999, 999, 0, 0, 0);
             bad.checksum = 0xDEAD_BEEF; // deliberately wrong CRC
-            use std::os::unix::fs::FileExt;
             use zerocopy::IntoBytes;
-            let file = fs.store.try_clone_file().unwrap();
+            let device = fs.store.device();
             let offset = crate::journal::Journal::frame_offset(4);
-            file.write_all_at(bad.as_bytes(), offset).unwrap();
+            device.write_at(bad.as_bytes(), offset).unwrap();
             // Drop without sync — superblock still at the create() checkpoint
             // (journal_seq = 0). Journal has group 1 complete, group 2 torn.
         }
@@ -3165,14 +3162,14 @@ mod tests {
             let end_seq = torn_start + 2;
             let mut bad = crate::storage::JournalFrame::commit_end(end_seq, 9, 9, 9, 9, 0, 0, 0);
             bad.checksum = 0xDEAD_BEEF;
-            use std::os::unix::fs::FileExt;
             use zerocopy::IntoBytes;
-            let file = fs.store.try_clone_file().unwrap();
-            file.write_all_at(
-                bad.as_bytes(),
-                crate::journal::Journal::frame_offset(end_seq),
-            )
-            .unwrap();
+            let device = fs.store.device();
+            device
+                .write_at(
+                    bad.as_bytes(),
+                    crate::journal::Journal::frame_offset(end_seq),
+                )
+                .unwrap();
         }
         {
             let fs = Fs::open(&img2.0).unwrap();
@@ -3596,7 +3593,7 @@ mod tests {
         // returns the old bytes. Allocate several new blocks to drain the free
         // list past any mistakenly-freed one.
         let scratch = make_file(&mut fs, ROOT_INO, b"scratch");
-        for i in 0..(reclaimed as u64 + 8) {
+        for i in 0..(reclaimed + 8) {
             fs.put_extent(scratch, i * BLOCK_SIZE as u64, b"XXXXXXXX")
                 .unwrap();
         }

@@ -22,6 +22,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -335,14 +336,98 @@ impl DataBlock {
 const _: () = assert!(std::mem::size_of::<DataBlock>() == BLOCK_SIZE);
 const _: () = assert!(std::mem::align_of::<DataBlock>() == BLOCK_SIZE);
 
-/// Backing for a `BlockStore`.
+/// A fixed-offset block device: the single IO abstraction under `BlockStore`
+/// and `Journal`. Both the real image file ([`FileDevice`]) and the in-RAM
+/// simulation ([`MemDevice`]) implement it, so every read/write path is
+/// identical regardless of backing — there is no `match` on the backing kind.
 ///
-/// `Memory` keeps everything in the cache forever — used by the existing
-/// pure-RAM tests so they don't need to touch the filesystem. `Image` adds
-/// pread/pwrite against a single backing file.
-enum Backing {
-    Memory,
-    Image { file: File },
+/// Offsets are absolute byte offsets into the device. Implementations model a
+/// zeroed, sparse address space: a `read_at` of a region never written returns
+/// zeros rather than erroring (`FileDevice` relies on the file being
+/// `set_len`-extended and zero-filled to the same effect). Correct COW callers
+/// never read a block before writing it, so the two devices are
+/// indistinguishable in normal operation.
+pub trait BlockDevice: Send + Sync {
+    /// Fill `buf` from the device starting at `offset`.
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
+    /// Write all of `buf` to the device starting at `offset`.
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
+    /// Flush durably (data + as needed metadata). No-op for volatile devices.
+    fn sync(&self) -> io::Result<()>;
+    /// Resize the device, zero-filling any growth.
+    fn set_len(&self, len: u64) -> io::Result<()>;
+}
+
+/// Image-file device: pread/pwrite/fdatasync against a single backing file.
+pub struct FileDevice {
+    file: File,
+}
+
+impl FileDevice {
+    pub fn new(file: File) -> Self {
+        FileDevice { file }
+    }
+}
+
+impl BlockDevice for FileDevice {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        self.file.read_exact_at(buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        self.file.write_all_at(buf, offset)
+    }
+    fn sync(&self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.file.set_len(len)
+    }
+}
+
+/// In-RAM simulated device: a single growable, zero-filled byte vector. Used by
+/// pure-RAM filesystems and tests so they exercise the same IO paths as an
+/// image without touching disk. `sync` is a no-op (volatile); `read_at` past
+/// the written region returns zeros; `write_at` auto-grows the backing vector.
+#[derive(Default)]
+pub struct MemDevice {
+    data: RwLock<Vec<u8>>,
+}
+
+impl MemDevice {
+    pub fn new() -> Self {
+        MemDevice::default()
+    }
+}
+
+impl BlockDevice for MemDevice {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        // Zeroed sparse semantics: fill with zeros, then overlay whatever bytes
+        // have actually been written into this range.
+        buf.fill(0);
+        let data = self.data.read().unwrap();
+        let start = offset as usize;
+        if start < data.len() {
+            let end = (start + buf.len()).min(data.len());
+            buf[..end - start].copy_from_slice(&data[start..end]);
+        }
+        Ok(())
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        let mut data = self.data.write().unwrap();
+        let end = offset as usize + buf.len();
+        if data.len() < end {
+            data.resize(end, 0);
+        }
+        data[offset as usize..end].copy_from_slice(buf);
+        Ok(())
+    }
+    fn sync(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.data.write().unwrap().resize(len as usize, 0);
+        Ok(())
+    }
 }
 
 /// A cached btree node plus its dirty bit.
@@ -383,7 +468,13 @@ pub struct BlockStore {
     /// Chain blocks written by the last `persist_free_list` call. Recycled
     /// at the start of the next persist so they don't leak across syncs.
     last_chain_blocks: Mutex<Vec<u64>>,
-    backing: Backing,
+    /// The block device every read/write goes through — a real image file
+    /// ([`FileDevice`]) or the in-RAM simulation ([`MemDevice`]).
+    device: Arc<dyn BlockDevice>,
+    /// Whether this store is durable. RAM-backed stores set this false so
+    /// `Fs` can skip sync/gc/checkpoint work that only matters on disk, even
+    /// though the IO path itself is device-uniform.
+    persistent: bool,
     /// Test-only counter of node persists (`write_node` calls). Used to assert
     /// that in-place append collapses many hot-leaf writes into a handful of
     /// node persists per checkpoint instead of one COW rewrite per op.
@@ -392,19 +483,26 @@ pub struct BlockStore {
 }
 
 impl BlockStore {
-    /// Pure-RAM store: no image file. Compatible with the previous
-    /// `HashMap<u64, BtreeNodeRaw>` mode used by every in-process test.
-    pub fn in_memory() -> Self {
+    /// Assemble a store over an already-constructed device.
+    fn with_device(device: Arc<dyn BlockDevice>, persistent: bool) -> Self {
         BlockStore {
             node_cache: RwLock::new(HashMap::new()),
             data_cache: RwLock::new(HashMap::new()),
             next_block_nr: AtomicU64::new(FIRST_DATA_BLOCK_NR),
             free_list: Mutex::new(Vec::new()),
             last_chain_blocks: Mutex::new(Vec::new()),
-            backing: Backing::Memory,
+            device,
+            persistent,
             #[cfg(test)]
             node_writes: AtomicU64::new(0),
         }
+    }
+
+    /// Pure-RAM store backed by a [`MemDevice`]. Marked non-persistent so `Fs`
+    /// skips disk-only work (sync/gc/checkpoint), but every IO still flows
+    /// through the same device path as an image.
+    pub fn in_memory() -> Self {
+        Self::with_device(Arc::new(MemDevice::new()), false)
     }
 
     /// Create a brand-new image file at `path` and return a store backed by
@@ -415,37 +513,25 @@ impl BlockStore {
             .write(true)
             .create_new(true)
             .open(path)?;
-        Ok(BlockStore {
-            node_cache: RwLock::new(HashMap::new()),
-            data_cache: RwLock::new(HashMap::new()),
-            next_block_nr: AtomicU64::new(FIRST_DATA_BLOCK_NR),
-            free_list: Mutex::new(Vec::new()),
-            last_chain_blocks: Mutex::new(Vec::new()),
-            backing: Backing::Image { file },
-            #[cfg(test)]
-            node_writes: AtomicU64::new(0),
-        })
+        Ok(Self::with_device(Arc::new(FileDevice::new(file)), true))
     }
 
     /// Open an existing image file. Caller is responsible for then loading
     /// the superblock and seeding `next_block_nr`.
     pub fn open_image(path: &Path) -> Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        Ok(BlockStore {
-            node_cache: RwLock::new(HashMap::new()),
-            data_cache: RwLock::new(HashMap::new()),
-            next_block_nr: AtomicU64::new(FIRST_DATA_BLOCK_NR),
-            free_list: Mutex::new(Vec::new()),
-            last_chain_blocks: Mutex::new(Vec::new()),
-            backing: Backing::Image { file },
-            #[cfg(test)]
-            node_writes: AtomicU64::new(0),
-        })
+        Ok(Self::with_device(Arc::new(FileDevice::new(file)), true))
     }
 
-    /// Whether this store is backed by an image file.
+    /// Whether this store is durable (image-backed). RAM stores return false.
     pub fn is_persistent(&self) -> bool {
-        matches!(self.backing, Backing::Image { .. })
+        self.persistent
+    }
+
+    /// Clone the underlying device handle (a cheap `Arc` bump). Used by
+    /// `Journal`, which shares the same device as the store.
+    pub fn device(&self) -> Arc<dyn BlockDevice> {
+        Arc::clone(&self.device)
     }
 
     /// Allocate a block number. Reuses a previously freed block if available,
@@ -505,8 +591,10 @@ impl BlockStore {
     /// NOT call another `with_node` from within `f` (it would re-enter the
     /// lock and can deadlock).
     ///
-    /// On a cache miss with an image backing, the node is faulted in from
-    /// disk (magic + CRC verified) and published before `f` runs.
+    /// On a cache miss the node is faulted in from the device (magic + CRC
+    /// verified) and published before `f` runs. A block never written reads
+    /// back as zeros and fails the magic check — the device equivalent of
+    /// "not found" for both image and RAM backings.
     pub fn with_node<R>(&self, nr: u64, f: impl FnOnce(&BtreeNodeRaw) -> R) -> Result<R> {
         // Fast path: already cached.
         {
@@ -515,32 +603,28 @@ impl BlockStore {
                 return Ok(f(&c.node));
             }
         }
-        // Miss: fault in (image only), then publish and run under the lock.
-        match &self.backing {
-            Backing::Memory => Err(Error::BlockNotFound(nr)),
-            Backing::Image { file } => {
-                // Allocate an aligned BtreeNodeRaw box, fill it from disk,
-                // verify magic + CRC, then publish to the cache.
-                let mut node = unsafe {
-                    // SAFETY: BtreeNodeRaw is a POD `#[derive(FromBytes)]`
-                    // type and Box::new_zeroed gives us properly aligned,
-                    // zero-initialized memory. We immediately read_at into
-                    // it, fully overwriting before any read.
-                    Box::<BtreeNodeRaw>::new_zeroed().assume_init()
-                };
-                file.read_exact_at(node.as_mut_bytes(), nr * BLOCK_SIZE as u64)?;
-                verify_node_in_place(nr, &node)?;
-                let mut cache = self.node_cache.write().unwrap();
-                // Another thread may have raced us in; either copy is valid.
-                let entry = cache.entry(nr).or_insert_with(|| {
-                    Box::new(CachedNode {
-                        node: *node,
-                        dirty: false,
-                    })
-                });
-                Ok(f(&entry.node))
-            }
-        }
+        // Miss: fault in from the device, then publish and run under the lock.
+        // Allocate an aligned BtreeNodeRaw box, fill it, verify magic + CRC,
+        // then publish to the cache.
+        let mut node = unsafe {
+            // SAFETY: BtreeNodeRaw is a POD `#[derive(FromBytes)]` type and
+            // Box::new_zeroed gives us properly aligned, zero-initialized
+            // memory. We immediately read_at into it, fully overwriting before
+            // any read.
+            Box::<BtreeNodeRaw>::new_zeroed().assume_init()
+        };
+        self.device
+            .read_at(node.as_mut_bytes(), nr * BLOCK_SIZE as u64)?;
+        verify_node_in_place(nr, &node)?;
+        let mut cache = self.node_cache.write().unwrap();
+        // Another thread may have raced us in; either copy is valid.
+        let entry = cache.entry(nr).or_insert_with(|| {
+            Box::new(CachedNode {
+                node: *node,
+                dirty: false,
+            })
+        });
+        Ok(f(&entry.node))
     }
 
     /// Read a full owned copy of a btree node. Only for test assertions —
@@ -561,9 +645,9 @@ impl BlockStore {
     /// the duration of `f`. Do NOT call another `with_node*` from within `f`
     /// (it would re-enter the lock and deadlock).
     ///
-    /// On a cache miss with an image backing, the node is faulted in from disk
-    /// (magic + CRC verified) before `f` runs, so an in-place edit of a node
-    /// that was flushed in a prior checkpoint works transparently.
+    /// On a cache miss the node is faulted in from the device (magic + CRC
+    /// verified) before `f` runs, so an in-place edit of a node that was
+    /// flushed in a prior checkpoint works transparently.
     ///
     /// Safety of "dirty but not persisted": between checkpoints the on-disk
     /// bytes of a node are never read by recovery — `Fs::open` reopens at the
@@ -579,29 +663,25 @@ impl BlockStore {
                 return Ok(r);
             }
         }
-        // Miss: fault in (image only), publish, then mutate under the lock.
-        match &self.backing {
-            Backing::Memory => Err(Error::BlockNotFound(nr)),
-            Backing::Image { file } => {
-                let mut node = unsafe {
-                    // SAFETY: see `with_node` — POD FromBytes type, zeroed +
-                    // aligned by new_zeroed, fully overwritten by read_exact_at.
-                    Box::<BtreeNodeRaw>::new_zeroed().assume_init()
-                };
-                file.read_exact_at(node.as_mut_bytes(), nr * BLOCK_SIZE as u64)?;
-                verify_node_in_place(nr, &node)?;
-                let mut cache = self.node_cache.write().unwrap();
-                let entry = cache.entry(nr).or_insert_with(|| {
-                    Box::new(CachedNode {
-                        node: *node,
-                        dirty: false,
-                    })
-                });
-                let r = f(&mut entry.node);
-                entry.dirty = true;
-                Ok(r)
-            }
-        }
+        // Miss: fault in from the device, publish, then mutate under the lock.
+        let mut node = unsafe {
+            // SAFETY: see `with_node` — POD FromBytes type, zeroed + aligned by
+            // new_zeroed, fully overwritten by read_at.
+            Box::<BtreeNodeRaw>::new_zeroed().assume_init()
+        };
+        self.device
+            .read_at(node.as_mut_bytes(), nr * BLOCK_SIZE as u64)?;
+        verify_node_in_place(nr, &node)?;
+        let mut cache = self.node_cache.write().unwrap();
+        let entry = cache.entry(nr).or_insert_with(|| {
+            Box::new(CachedNode {
+                node: *node,
+                dirty: false,
+            })
+        });
+        let r = f(&mut entry.node);
+        entry.dirty = true;
+        Ok(r)
     }
 
     /// Peek a node **only if it is already cached**, running `f(node, dirty)`.
@@ -627,7 +707,7 @@ impl BlockStore {
 
     /// Write a btree node, stamping CRC into its header before persisting.
     ///
-    /// Write-through: the block is pwritten immediately (image backing) and the
+    /// Write-through: the block is written to the device immediately and the
     /// cache entry is marked clean. Used by the paths that produce a node at a
     /// *fresh* block — split / promote, and `checkpoint_flush`'s COW-relocate —
     /// where an immediate persist to a never-before-written block is always
@@ -640,9 +720,8 @@ impl BlockStore {
         copy.header.checksum = 0;
         let crc = crc32fast::hash(copy.as_bytes()) as u64;
         copy.header.checksum = crc;
-        if let Backing::Image { file } = &self.backing {
-            file.write_all_at(copy.as_bytes(), nr * BLOCK_SIZE as u64)?;
-        }
+        self.device
+            .write_at(copy.as_bytes(), nr * BLOCK_SIZE as u64)?;
         self.node_cache.write().unwrap().insert(
             nr,
             Box::new(CachedNode {
@@ -683,9 +762,8 @@ impl BlockStore {
         c.node.header.checksum = 0;
         let crc = crc32fast::hash(c.node.as_bytes()) as u64;
         c.node.header.checksum = crc;
-        if let Backing::Image { file } = &self.backing {
-            file.write_all_at(c.node.as_bytes(), nr * BLOCK_SIZE as u64)?;
-        }
+        self.device
+            .write_at(c.node.as_bytes(), nr * BLOCK_SIZE as u64)?;
         c.dirty = false;
         Ok(())
     }
@@ -723,23 +801,16 @@ impl BlockStore {
                 return Ok(b.0);
             }
         }
-        match &self.backing {
-            Backing::Memory => Err(Error::BlockNotFound(nr)),
-            Backing::Image { file } => {
-                let mut block = Box::new(DataBlock::zeroed());
-                file.read_exact_at(&mut block.0, nr * BLOCK_SIZE as u64)?;
-                let bytes = block.0;
-                self.data_cache.write().unwrap().insert(nr, block);
-                Ok(bytes)
-            }
-        }
+        let mut block = Box::new(DataBlock::zeroed());
+        self.device.read_at(&mut block.0, nr * BLOCK_SIZE as u64)?;
+        let bytes = block.0;
+        self.data_cache.write().unwrap().insert(nr, block);
+        Ok(bytes)
     }
 
     /// Write a 4 KB data block.
     pub fn write_data(&self, nr: u64, bytes: &[u8; BLOCK_SIZE]) -> Result<()> {
-        if let Backing::Image { file } = &self.backing {
-            file.write_all_at(bytes, nr * BLOCK_SIZE as u64)?;
-        }
+        self.device.write_at(bytes, nr * BLOCK_SIZE as u64)?;
         self.data_cache
             .write()
             .unwrap()
@@ -752,31 +823,24 @@ impl BlockStore {
     /// Write the superblock at block 0 (with CRC stamped). Does not fsync.
     pub fn write_superblock(&self, sb: &Superblock) -> Result<()> {
         let bytes = sb.to_bytes();
-        if let Backing::Image { file } = &self.backing {
-            file.write_all_at(&bytes, SUPERBLOCK_BLOCK_NR * BLOCK_SIZE as u64)?;
-        }
+        self.device
+            .write_at(&bytes, SUPERBLOCK_BLOCK_NR * BLOCK_SIZE as u64)?;
         // Don't cache the superblock alongside node/data — its layout differs.
         Ok(())
     }
 
-    /// Read and verify the superblock from block 0. Memory-only stores
-    /// have no superblock and return `BlockNotFound`.
+    /// Read and verify the superblock from block 0. A store whose superblock
+    /// was never written reads back zeros and fails `parse` with `BadMagic`.
     pub fn read_superblock(&self) -> Result<Superblock> {
-        match &self.backing {
-            Backing::Memory => Err(Error::BlockNotFound(SUPERBLOCK_BLOCK_NR)),
-            Backing::Image { file } => {
-                let mut buf = vec![0u8; BLOCK_SIZE];
-                file.read_exact_at(&mut buf, SUPERBLOCK_BLOCK_NR * BLOCK_SIZE as u64)?;
-                Superblock::parse(&buf)
-            }
-        }
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        self.device
+            .read_at(&mut buf, SUPERBLOCK_BLOCK_NR * BLOCK_SIZE as u64)?;
+        Superblock::parse(&buf)
     }
 
-    /// fdatasync the backing file. No-op on memory-only stores.
+    /// Flush the device durably. No-op for volatile (RAM) devices.
     pub fn fsync(&self) -> Result<()> {
-        if let Backing::Image { file } = &self.backing {
-            file.sync_data()?;
-        }
+        self.device.sync()?;
         Ok(())
     }
 
@@ -842,14 +906,6 @@ impl BlockStore {
         list.extend(chain_blocks);
         *self.free_list.lock().unwrap() = list;
         Ok(())
-    }
-
-    /// Clone the backing file handle. Returns an error for memory-only stores.
-    pub fn try_clone_file(&self) -> Result<std::fs::File> {
-        match &self.backing {
-            Backing::Memory => Err(Error::Io(std::io::Error::other("no backing file"))),
-            Backing::Image { file } => Ok(file.try_clone()?),
-        }
     }
 }
 

@@ -1,9 +1,9 @@
-use std::os::unix::fs::FileExt;
+use std::sync::Arc;
 
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromZeros, IntoBytes};
 
 use crate::block_btree::BLOCK_SIZE;
-use crate::btree::{Error, Result};
+use crate::btree::Result;
 use crate::storage::*;
 
 /// One recovered commit group: the logged-op frames of the group followed by
@@ -16,12 +16,12 @@ pub struct CommitGroup {
 }
 
 pub struct Journal {
-    file: std::fs::File,
+    device: Arc<dyn BlockDevice>,
 }
 
 impl Journal {
-    pub fn new(file: std::fs::File) -> Self {
-        Journal { file }
+    pub fn new(device: Arc<dyn BlockDevice>) -> Self {
+        Journal { device }
     }
 
     /// Byte offset of the frame slot for a given seq (fixed-size ring).
@@ -35,26 +35,22 @@ impl Journal {
     /// Append a single frame at its seq's ring slot. Caller fsyncs.
     pub fn append(&self, frame: &JournalFrame) -> Result<()> {
         let offset = Self::frame_offset(frame.seq);
-        self.file.write_all_at(frame.as_bytes(), offset)?;
+        self.device.write_at(frame.as_bytes(), offset)?;
         Ok(())
     }
 
     /// Read the frame at `seq`, returning it only if it is valid for that seq.
     pub fn read_frame(&self, seq: u64) -> Result<Option<JournalFrame>> {
         let offset = Self::frame_offset(seq);
-        let mut buf = [0u8; JOURNAL_FRAME_SIZE];
-        self.file.read_exact_at(&mut buf, offset)?;
-        // Copy out with `read_from_bytes` — a `[u8; N]` stack buffer is only
-        // 1-byte aligned, but JournalFrame has u64 fields needing 8-byte
-        // alignment, so a borrowing `ref_from_bytes` would be UB on misaligned
-        // reads (Miri flags it). The owned copy sidesteps the requirement.
-        let frame = JournalFrame::read_from_bytes(&buf)
-            .map_err(|_| Error::Io(std::io::Error::other("journal frame size mismatch")))?;
-        if frame.is_valid(seq) {
-            Ok(Some(frame))
-        } else {
-            Ok(None)
-        }
+        // Read straight into a `JournalFrame` value. As a `#[repr(C)]` type with
+        // u64 fields it is 8-byte aligned by construction, so its own byte slice
+        // is a valid, correctly-aligned read target — no misaligned-cast UB and
+        // no intermediate `[u8; N]` buffer + `read_from_bytes` copy. `read_exact_at`
+        // fills exactly `size_of::<JournalFrame>()` bytes or errors, so there is
+        // no size-mismatch case to handle here.
+        let mut frame = JournalFrame::new_zeroed();
+        self.device.read_at(frame.as_mut_bytes(), offset)?;
+        Ok(frame.is_valid(seq).then_some(frame))
     }
 
     /// Scan forward from `start_seq`, returning every *complete* commit group
@@ -119,15 +115,14 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
-
-    fn make_journal() -> (NamedTempFile, Journal) {
-        let tmp = NamedTempFile::new().unwrap();
-        tmp.as_file()
+    fn make_journal() -> Journal {
+        // Back the journal with an in-RAM device — the ring is just a byte
+        // range, so no on-disk file is needed to exercise append/scan.
+        let device = Arc::new(MemDevice::new());
+        device
             .set_len((FIRST_JOURNAL_BLOCK + JOURNAL_BLOCKS) * BLOCK_SIZE as u64)
             .unwrap();
-        let journal = Journal::new(tmp.as_file().try_clone().unwrap());
-        (tmp, journal)
+        Journal::new(device)
     }
 
     fn end_frame(seq: u64, root_block: u64) -> JournalFrame {
@@ -144,7 +139,7 @@ mod tests {
 
     #[test]
     fn append_and_read_back() {
-        let (_tmp, journal) = make_journal();
+        let journal = make_journal();
         journal.append(&end_frame(1, 65)).unwrap();
         let read = journal.read_frame(1).unwrap().unwrap();
         assert_eq!(read.root_block, 65);
@@ -153,7 +148,7 @@ mod tests {
 
     #[test]
     fn scan_groups_collects_ops_then_end() {
-        let (_tmp, journal) = make_journal();
+        let journal = make_journal();
         // Group 1: two ops + end.
         journal.append(&op_frame(1, 3, b"op-a")).unwrap();
         journal.append(&op_frame(2, 3, b"op-b")).unwrap();
@@ -174,7 +169,7 @@ mod tests {
 
     #[test]
     fn scan_groups_discards_torn_tail() {
-        let (_tmp, journal) = make_journal();
+        let journal = make_journal();
         // One complete group, then a dangling op with no CommitEnd (crash).
         journal.append(&op_frame(1, 3, b"op-a")).unwrap();
         journal.append(&end_frame(2, 65)).unwrap();
@@ -189,14 +184,14 @@ mod tests {
 
     #[test]
     fn scan_returns_empty_on_empty() {
-        let (_tmp, journal) = make_journal();
+        let journal = make_journal();
         assert!(journal.scan_groups(1).unwrap().is_empty());
         assert_eq!(journal.next_seq_after_scan(1).unwrap(), 1);
     }
 
     #[test]
     fn ring_wrap() {
-        let (_tmp, journal) = make_journal();
+        let journal = make_journal();
         // Groups that wrap the ring boundary.
         let start = JOURNAL_CAPACITY - 2;
         journal.append(&op_frame(start, 3, b"x")).unwrap();
