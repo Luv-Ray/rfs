@@ -42,12 +42,6 @@ impl Journal {
     /// Read the frame at `seq`, returning it only if it is valid for that seq.
     pub fn read_frame(&self, seq: u64) -> Result<Option<JournalFrame>> {
         let offset = Self::frame_offset(seq);
-        // Read straight into a `JournalFrame` value. As a `#[repr(C)]` type with
-        // u64 fields it is 8-byte aligned by construction, so its own byte slice
-        // is a valid, correctly-aligned read target — no misaligned-cast UB and
-        // no intermediate `[u8; N]` buffer + `read_from_bytes` copy. `read_exact_at`
-        // fills exactly `size_of::<JournalFrame>()` bytes or errors, so there is
-        // no size-mismatch case to handle here.
         let mut frame = JournalFrame::new_zeroed();
         self.device.read_at(frame.as_mut_bytes(), offset)?;
         Ok(frame.is_valid(seq).then_some(frame))

@@ -388,6 +388,25 @@ impl BlockDevice for FileDevice {
 /// pure-RAM filesystems and tests so they exercise the same IO paths as an
 /// image without touching disk. `sync` is a no-op (volatile); `read_at` past
 /// the written region returns zeros; `write_at` auto-grows the backing vector.
+///
+/// Backing assumption — **dense, contiguous block numbers**. The `Vec` indexes
+/// bytes at `block_nr * BLOCK_SIZE`, so memory grows to the *highest* offset
+/// ever written, and any gap below it is materialized as real zero bytes. A
+/// real image file gets sparse holes for free from the OS (an unwritten range
+/// costs no physical blocks); this `Vec` does not model that. It is fine today
+/// because the allocator hands out block numbers monotonically from
+/// `FIRST_DATA_BLOCK_NR` with free-list reuse, so the space stays compact with
+/// no large holes.
+///
+/// If a future allocator introduces sparse/structured block numbers — e.g.
+/// bcachefs-style per-device partitioning or zoning, where addresses become
+/// `(device, bucket, offset)` rather than one compact `u64` — this `Vec`
+/// backing would balloon to fill the holes. At that point swap it for a
+/// per-block sparse map (`HashMap<u64, Box<[u8; BLOCK_SIZE]>>`: a missing key =
+/// a hole = reads-as-zero), which matches an extent tree's "no entry = hole"
+/// semantics. (Identity-addressed layouts like `block = f(ino)` are *not* on
+/// this path: in the bcachefs style the btree already provides the
+/// identity→location indirection.)
 #[derive(Default)]
 pub struct MemDevice {
     data: RwLock<Vec<u8>>,
