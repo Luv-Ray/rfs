@@ -31,6 +31,7 @@ use std::collections::HashMap;
 
 use rfs::block_btree::BLOCK_SIZE;
 use rfs::fs::{DirentV1, FILE_KIND_REGULAR, Fs, InodeV1, ROOT_INO, ROOT_SUBVOL, SubvolId};
+use rfs::fuse::do_read;
 
 const N_FILES: u64 = 5; // inodes 2..7
 const N_OFFSETS: u64 = 4; // block offsets 0..4
@@ -44,6 +45,11 @@ type Shadow = HashMap<(u64, u64), Cell>;
 enum Op {
     /// Write a single block of `fill`-bytes (length 1..=BLOCK) at slot.
     Write { file: u8, off: u8, fill: u8, len: u16 },
+    /// Read an arbitrary byte range via `do_read` and diff against the oracle.
+    /// `off`/`len` are intentionally unconstrained (non-block-aligned, may
+    /// straddle blocks and run past EOF) to exercise the read path's scan
+    /// window and zero-fill.
+    Read { file: u8, off: u16, len: u16 },
     /// Unlink a file: tombstone dirent+inode, then run reclaim.
     Unlink { file: u8 },
     /// Checkpoint + persist superblock.
@@ -161,6 +167,30 @@ fn check_view(fs: &Fs, shadow: &Shadow, label: &str, subvol: SubvolId) {
     }
 }
 
+/// Reconstruct what `do_read(ino, off, len)` must return from the shadow.
+/// Mirrors the read contract: clip `[off, off+len)` to `size`, then fill each
+/// byte from its covering cell (a block-keyed extent holds `fill` for its
+/// first `cell.len` bytes, zero past that up to the block end) or zero where no
+/// extent exists.
+fn expected_read(shadow: &Shadow, ino: u64, size: u64, off: u64, len: u32) -> Vec<u8> {
+    if off >= size {
+        return Vec::new();
+    }
+    let end = (off + len as u64).min(size);
+    let mut out = vec![0u8; (end - off) as usize];
+    for (i, b) in out.iter_mut().enumerate() {
+        let pos = off + i as u64;
+        let block_off = pos & !(BLOCK - 1);
+        if let Some(cell) = shadow.get(&(ino, block_off)) {
+            let in_block = (pos - block_off) as usize;
+            if in_block < cell.len {
+                *b = cell.fill;
+            }
+        }
+    }
+    out
+}
+
 /// Verify every tracked snapshot still returns its frozen content. Switches
 /// into each snapshot subvol and back to root; requires `&mut` for the switch.
 fn check_snapshots(fs: &mut Fs, snaps: &[Snap]) {
@@ -177,6 +207,11 @@ fuzz_target!(|data: &[u8]| {
     let mut fs = fresh(&path);
 
     let mut active: Shadow = HashMap::new();
+    // Per-file EOF, mirroring inode.size. Grows monotonically on write (like
+    // the real `max`), so a shrinking overwrite does not lower it — which the
+    // block-granular `active` map alone cannot represent. Read clamping needs
+    // this. Reset to 0 on unlink (files are never recreated here).
+    let mut sizes = [0u64; N_FILES as usize];
     let mut live = [true; N_FILES as usize];
     let mut snaps: Vec<Snap> = Vec::new();
 
@@ -194,8 +229,32 @@ fuzz_target!(|data: &[u8]| {
                 let offset = offset_of(off);
                 let len = (len as usize % BLOCK_SIZE) + 1; // 1..=BLOCK
                 fs.put_extent(ino, offset, &vec![fill; len]).expect("put_extent");
+                // Mirror the FUSE write path: it grows inode.size to cover the
+                // written range (see `FuseFs::write`). do_read clamps to
+                // inode.size, so the oracle must track it too.
+                let mut inode = fs.get_inode(ino).expect("get_inode").expect("inode exists");
+                inode.size = inode.size.max(offset + len as u64);
+                fs.put_inode(ino, &inode).expect("put_inode");
                 fs.journal_commit().expect("commit write");
                 active.insert((ino, offset), Cell { fill, len });
+                let slot = (file % N_FILES as u8) as usize;
+                sizes[slot] = sizes[slot].max(offset + len as u64);
+            }
+            Op::Read { file, off, len } => {
+                let slot = (file % N_FILES as u8) as usize;
+                let ino = ino_of(file);
+                // Keep the range within the tracked block space (0..N_OFFSETS
+                // blocks) but allow non-aligned starts and past-EOF tails.
+                let span = N_OFFSETS * BLOCK;
+                let off = off as u64 % (span + 1);
+                let len = len as u32 % (span as u32 + 1);
+                let got = do_read(&fs, ino, off, len).expect("do_read");
+                let want = expected_read(&active, ino, sizes[slot], off, len);
+                assert_eq!(
+                    got, want,
+                    "read mismatch ino={ino} off={off} len={len} size={}",
+                    sizes[slot]
+                );
             }
             Op::Unlink { file } => {
                 let slot = (file % N_FILES as u8) as usize;
@@ -208,6 +267,7 @@ fuzz_target!(|data: &[u8]| {
                     fs.journal_commit().expect("commit reclaim");
                     let ino = ino_of(file);
                     active.retain(|&(i, _), _| i != ino);
+                    sizes[slot] = 0;
                     live[slot] = false;
                 }
             }

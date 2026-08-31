@@ -1008,6 +1008,17 @@ impl Fs {
             .insert_at(&extent_key(ino, offset), snap, extent.as_bytes())
     }
 
+    /// EXACT-match point lookup: returns an extent only when its stored key
+    /// equals `(ino, offset)`, not the extent that merely *covers* `offset`.
+    /// Callers must pass a key that lands on an extent boundary — today that
+    /// means a block-aligned offset, since extents are one-per-block keyed on
+    /// their block boundary.
+    ///
+    /// NOTE: this contract breaks under variable-length extents, where one
+    /// extent spans many blocks under a single start-offset key: an `offset`
+    /// mid-extent has no matching key and returns `None`. That regime needs a
+    /// covering/seek query (start <= offset < start+len), not this exact lookup
+    /// and not a full `list_extents` scan.
     pub fn get_extent(&self, ino: u64, offset: u64) -> Result<Option<ExtentV1>> {
         let chain = self.current_chain()?;
         let bytes = self.tree.find_visible(&extent_key(ino, offset), &chain)?;
@@ -1027,7 +1038,43 @@ impl Fs {
     pub fn list_extents(&self, ino: u64) -> Result<Vec<(u64, ExtentV1)>> {
         let chain = self.current_chain()?;
         let (start, end) = extent_range(ino);
-        let entries = self.tree.range_scan_visible(&start, &end, &chain)?;
+        self.collect_extents(&start, &end, &chain)
+    }
+
+    /// Visible extents of `ino` whose *keyed offset* falls in
+    /// `[start_off, end_off)`, in offset order.
+    ///
+    /// Unlike [`Self::list_extents`], this narrows the B-tree scan window to
+    /// the requested range instead of walking the whole inode, so a read no
+    /// longer costs O(total extents in file). Callers that only touch a byte
+    /// range (e.g. `read`) should use this. `start_off` is expected to be
+    /// block-aligned: because each extent is keyed on its block boundary, the
+    /// extent covering byte `start_off` has key `start_off` itself, so the
+    /// lower bound never clips it. (Under variable-length extents that no
+    /// longer holds — the covering extent's key can be < start_off — and this
+    /// lower bound would need to back up to the predecessor key instead.)
+    pub fn extents_in_range(
+        &self,
+        ino: u64,
+        start_off: u64,
+        end_off: u64,
+    ) -> Result<Vec<(u64, ExtentV1)>> {
+        if end_off <= start_off {
+            return Ok(Vec::new());
+        }
+        let chain = self.current_chain()?;
+        let start = extent_key(ino, start_off);
+        let end = extent_key(ino, end_off);
+        self.collect_extents(&start, &end, &chain)
+    }
+
+    fn collect_extents(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        chain: &[SnapId],
+    ) -> Result<Vec<(u64, ExtentV1)>> {
+        let entries = self.tree.range_scan_visible(start, end, chain)?;
         Ok(entries
             .into_iter()
             .map(|(k, v)| {
@@ -1554,6 +1601,29 @@ mod tests {
     }
 
     #[test]
+    fn extents_in_range_windows_and_edges() {
+        let mut fs = Fs::new();
+        fs.put_extent(5, 0, b"a").unwrap();
+        fs.put_extent(5, 4096, b"b").unwrap();
+        fs.put_extent(5, 8192, b"c").unwrap();
+        // Extents keyed in [start, end): end is exclusive.
+        let offsets = |v: Vec<(u64, ExtentV1)>| v.iter().map(|(o, _)| *o).collect::<Vec<_>>();
+        assert_eq!(
+            offsets(fs.extents_in_range(5, 4096, 8192).unwrap()),
+            vec![4096]
+        );
+        assert_eq!(
+            offsets(fs.extents_in_range(5, 0, 8193).unwrap()),
+            vec![0, 4096, 8192]
+        );
+        // Empty / inverted windows yield nothing without touching the tree.
+        assert!(fs.extents_in_range(5, 4096, 4096).unwrap().is_empty());
+        assert!(fs.extents_in_range(5, 8192, 100).unwrap().is_empty());
+        // A window below the first key is empty; other inos are isolated.
+        assert!(fs.extents_in_range(6, 0, 100_000).unwrap().is_empty());
+    }
+
+    #[test]
     fn extent_isolated_across_inos() {
         let mut fs = Fs::new();
         fs.put_extent(5, 0, b"aaa").unwrap();
@@ -1733,7 +1803,7 @@ mod tests {
     fn make_root(fs: &mut Fs) {
         // alloc_ino() returns ROOT_INO=1 first (matching fuse.rs convention).
         let r = fs.alloc_ino();
-        debug_assert_eq!(r, ROOT_INO);
+        assert_eq!(r, ROOT_INO);
         fs.put_inode(ROOT_INO, &sample_inode(0)).unwrap();
     }
 

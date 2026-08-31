@@ -57,7 +57,7 @@ impl FuseFs {
     fn bootstrap_root(mut fs: Fs) -> Self {
         // First alloc returns ROOT_INO=1 by construction; use it for the root.
         let root_ino = fs.alloc_ino();
-        debug_assert_eq!(root_ino, ROOT_INO);
+        assert_eq!(root_ino, ROOT_INO);
         let now = now_secs();
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
@@ -120,7 +120,11 @@ fn to_attr(ino: u64, inode: &InodeV1) -> FileAttr {
 
 /// Read `[offset, offset+size)` from `ino`, clipped to inode.size, zero-filling
 /// gaps between extents.
-fn do_read(fs: &Fs, ino: u64, offset: u64, size: u32) -> btree::Result<Vec<u8>> {
+///
+/// `pub` only so the differential fuzz target can drive it directly; not a
+/// stable API.
+#[doc(hidden)]
+pub fn do_read(fs: &Fs, ino: u64, offset: u64, size: u32) -> btree::Result<Vec<u8>> {
     let Some(inode) = fs.get_inode(ino)? else {
         return Ok(Vec::new());
     };
@@ -130,7 +134,12 @@ fn do_read(fs: &Fs, ino: u64, offset: u64, size: u32) -> btree::Result<Vec<u8>> 
     let end = (offset + size as u64).min(inode.size);
     let out_len = (end - offset) as usize;
     let mut out = vec![0u8; out_len];
-    for (ext_off, ext) in fs.list_extents(ino)? {
+    // Scan only the extents overlapping [offset, end) instead of the whole
+    // inode. Extents are keyed on their block boundary, so the one covering
+    // `offset` has key `offset & !(BLOCK_SIZE-1)`; start the window there so it
+    // isn't clipped by the lower bound.
+    let scan_start = offset & !(BLOCK_SIZE - 1);
+    for (ext_off, ext) in fs.extents_in_range(ino, scan_start, end)? {
         let ext_end = ext_off + ext.len as u64;
         if ext_end <= offset || ext_off >= end {
             continue;
@@ -162,6 +171,10 @@ fn do_write(fs: &mut Fs, ino: u64, offset: u64, data: &[u8]) -> btree::Result<us
 
         let mut buf = [0u8; BLOCK_SIZE_USIZE];
         let mut existing_len = 0;
+        // `block_off` is block-aligned, so this exact-match lookup hits the
+        // extent covering the block (if any) for a read-modify-write. See
+        // `Fs::get_extent` for why this depends on the one-extent-per-block
+        // keying and what changes under variable-length extents.
         if let Some(ext) = fs.get_extent(ino, block_off)? {
             existing_len = ext.len as usize;
             let src = fs
@@ -1051,6 +1064,26 @@ mod tests {
 
         let got = do_read(&fs, ino, BLOCK_SIZE, 6).unwrap();
         assert_eq!(got, b"second");
+    }
+
+    // Regression guard for the scan window's lower bound. The extent covering a
+    // read is keyed on its block boundary, so a read starting *inside* a
+    // non-first block (offset > key) must align the scan start down to that
+    // boundary. If do_read passed the raw offset as the lower bound instead of
+    // `offset & !(BLOCK_SIZE-1)`, extents_in_range would exclude the covering
+    // extent (its key < offset) and the read would wrongly return zeros.
+    #[test]
+    fn read_from_mid_high_block_includes_covering_extent() {
+        let (mut fs, ino) = setup_fs_with_file(0);
+        do_write(&mut fs, ino, BLOCK_SIZE, b"ABCDEFGH").unwrap();
+        let mut i = fs.get_inode(ino).unwrap().unwrap();
+        i.size = BLOCK_SIZE + 8;
+        fs.put_inode(ino, &i).unwrap();
+
+        // Start two bytes into block 1: offset=BLOCK_SIZE+2, whose covering
+        // extent is keyed at BLOCK_SIZE (< offset).
+        let got = do_read(&fs, ino, BLOCK_SIZE + 2, 6).unwrap();
+        assert_eq!(got, b"CDEFGH");
     }
 
     #[test]
