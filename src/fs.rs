@@ -1085,6 +1085,103 @@ impl Fs {
             .collect())
     }
 
+    /// Read `[offset, offset+size)` from `ino`, clipped to `inode.size`,
+    /// zero-filling holes between extents. Returns an empty buffer for a
+    /// missing inode or a read starting at/after EOF.
+    pub fn read_at(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
+        let Some(inode) = self.get_inode(ino)? else {
+            return Ok(Vec::new());
+        };
+        if offset >= inode.size {
+            return Ok(Vec::new());
+        }
+        let end = (offset + size as u64).min(inode.size);
+        let out_len = (end - offset) as usize;
+        let mut out = vec![0u8; out_len];
+        // Scan only the extents overlapping [offset, end) instead of the whole
+        // inode. Extents are keyed on their block boundary, so the one covering
+        // `offset` has key `offset & !(BLOCK_SIZE-1)`; start the window there so
+        // it isn't clipped by the lower bound.
+        let scan_start = offset & !(BLOCK_SIZE as u64 - 1);
+        for (ext_off, ext) in self.extents_in_range(ino, scan_start, end)? {
+            let ext_end = ext_off + ext.len as u64;
+            if ext_end <= offset || ext_off >= end {
+                continue;
+            }
+            let copy_start = offset.max(ext_off);
+            let copy_end = end.min(ext_end);
+            let src_block = self
+                .read_data_block(ext.data_block)
+                .expect("data block missing");
+            let src = &src_block[(copy_start - ext_off) as usize..(copy_end - ext_off) as usize];
+            let dst_off = (copy_start - offset) as usize;
+            out[dst_off..dst_off + src.len()].copy_from_slice(src);
+        }
+        Ok(out)
+    }
+
+    /// Write `data` at `offset` into `ino`, split into BLOCK_SIZE-aligned
+    /// chunks. Each chunk is read-modify-write against any existing extent at
+    /// that block offset so partial-block writes preserve surrounding bytes.
+    /// Returns the number of bytes written (== `data.len()`). Does not update
+    /// `inode.size`; the caller owns inode metadata.
+    pub fn write_at(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
+        let total = data.len();
+        let mut cursor = offset;
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let block_off = cursor & !(BLOCK_SIZE as u64 - 1);
+            let in_block = (cursor - block_off) as usize;
+            let take = (BLOCK_SIZE - in_block).min(remaining.len());
+
+            let mut buf = [0u8; BLOCK_SIZE];
+            let mut existing_len = 0;
+            // `block_off` is block-aligned, so this exact-match lookup hits the
+            // extent covering the block (if any) for a read-modify-write. See
+            // `get_extent` for why this depends on the one-extent-per-block
+            // keying and what changes under variable-length extents.
+            if let Some(ext) = self.get_extent(ino, block_off)? {
+                existing_len = ext.len as usize;
+                let src = self
+                    .read_data_block(ext.data_block)
+                    .expect("data block missing");
+                buf[..existing_len].copy_from_slice(&src[..existing_len]);
+            }
+            buf[in_block..in_block + take].copy_from_slice(&remaining[..take]);
+            let new_len = (in_block + take).max(existing_len);
+            self.put_extent(ino, block_off, &buf[..new_len])?;
+
+            cursor += take as u64;
+            remaining = &remaining[take..];
+        }
+        Ok(total)
+    }
+
+    /// Truncate `ino`'s extents down to `new_size`: free whole blocks past the
+    /// boundary and zero-fill the partial tail block. Does not update
+    /// `inode.size`; the caller owns inode metadata.
+    pub fn truncate_extents(&mut self, ino: u64, new_size: u64) -> Result<()> {
+        let boundary_block = new_size & !(BLOCK_SIZE as u64 - 1);
+        let tail_offset = (new_size % BLOCK_SIZE as u64) as usize;
+
+        for (ext_off, ext) in self.list_extents(ino)? {
+            if ext_off >= new_size {
+                self.delete_extent(ino, ext_off)?;
+                self.free_data_block(ext.data_block);
+            } else if ext_off == boundary_block
+                && tail_offset > 0
+                && (ext.len as u64) > new_size - ext_off
+            {
+                let mut buf = self.read_data_block(ext.data_block)?;
+                for b in &mut buf[tail_offset..ext.len as usize] {
+                    *b = 0;
+                }
+                self.put_extent(ino, ext_off, &buf[..tail_offset])?;
+            }
+        }
+        Ok(())
+    }
+
     /// Record one pending deleted-inode work item at `snap` (the snap_id at
     /// which the file was unlinked). Work items are stored at ROOT_SNAP so
     /// they are visible from every subvolume, exactly like snapshot/subvol
@@ -1621,6 +1718,21 @@ mod tests {
         assert!(fs.extents_in_range(5, 8192, 100).unwrap().is_empty());
         // A window below the first key is empty; other inos are isolated.
         assert!(fs.extents_in_range(6, 0, 100_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn truncate_extents_removes_blocks_past_boundary() {
+        let mut fs = Fs::new();
+        let ino = fs.alloc_ino();
+        fs.put_inode(ino, &sample_inode(BLOCK_SIZE as u64 * 3))
+            .unwrap();
+        for i in 0..3u64 {
+            fs.put_extent(ino, i * BLOCK_SIZE as u64, b"x").unwrap();
+        }
+        fs.truncate_extents(ino, BLOCK_SIZE as u64).unwrap();
+        let remaining = fs.list_extents(ino).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, 0);
     }
 
     #[test]

@@ -118,80 +118,6 @@ fn to_attr(ino: u64, inode: &InodeV1) -> FileAttr {
     }
 }
 
-/// Read `[offset, offset+size)` from `ino`, clipped to inode.size, zero-filling
-/// gaps between extents.
-///
-/// `pub` only so the differential fuzz target can drive it directly; not a
-/// stable API.
-#[doc(hidden)]
-pub fn do_read(fs: &Fs, ino: u64, offset: u64, size: u32) -> btree::Result<Vec<u8>> {
-    let Some(inode) = fs.get_inode(ino)? else {
-        return Ok(Vec::new());
-    };
-    if offset >= inode.size {
-        return Ok(Vec::new());
-    }
-    let end = (offset + size as u64).min(inode.size);
-    let out_len = (end - offset) as usize;
-    let mut out = vec![0u8; out_len];
-    // Scan only the extents overlapping [offset, end) instead of the whole
-    // inode. Extents are keyed on their block boundary, so the one covering
-    // `offset` has key `offset & !(BLOCK_SIZE-1)`; start the window there so it
-    // isn't clipped by the lower bound.
-    let scan_start = offset & !(BLOCK_SIZE - 1);
-    for (ext_off, ext) in fs.extents_in_range(ino, scan_start, end)? {
-        let ext_end = ext_off + ext.len as u64;
-        if ext_end <= offset || ext_off >= end {
-            continue;
-        }
-        let copy_start = offset.max(ext_off);
-        let copy_end = end.min(ext_end);
-        let src_block = fs
-            .read_data_block(ext.data_block)
-            .expect("data block missing");
-        let src = &src_block[(copy_start - ext_off) as usize..(copy_end - ext_off) as usize];
-        let dst_off = (copy_start - offset) as usize;
-        out[dst_off..dst_off + src.len()].copy_from_slice(src);
-    }
-    Ok(out)
-}
-
-/// Write `data` at `offset` into `ino`, split into BLOCK_SIZE-aligned chunks.
-/// Each chunk is read-modify-write against any existing extent at that
-/// block offset so partial-block writes preserve surrounding bytes. Returns
-/// the number of bytes written (== data.len()).
-fn do_write(fs: &mut Fs, ino: u64, offset: u64, data: &[u8]) -> btree::Result<usize> {
-    let total = data.len();
-    let mut cursor = offset;
-    let mut remaining = data;
-    while !remaining.is_empty() {
-        let block_off = cursor & !(BLOCK_SIZE - 1);
-        let in_block = (cursor - block_off) as usize;
-        let take = (BLOCK_SIZE_USIZE - in_block).min(remaining.len());
-
-        let mut buf = [0u8; BLOCK_SIZE_USIZE];
-        let mut existing_len = 0;
-        // `block_off` is block-aligned, so this exact-match lookup hits the
-        // extent covering the block (if any) for a read-modify-write. See
-        // `Fs::get_extent` for why this depends on the one-extent-per-block
-        // keying and what changes under variable-length extents.
-        if let Some(ext) = fs.get_extent(ino, block_off)? {
-            existing_len = ext.len as usize;
-            let src = fs
-                .read_data_block(ext.data_block)
-                .expect("data block missing");
-            buf[..existing_len].copy_from_slice(&src[..existing_len]);
-        }
-        buf[in_block..in_block + take].copy_from_slice(&remaining[..take]);
-        let new_len = (in_block + take).max(existing_len);
-        fs.put_extent(ino, block_off, &buf[..new_len])?;
-
-        cursor += take as u64;
-        remaining = &remaining[take..];
-    }
-    Ok(total)
-}
-
 /// Reject names that can't be stored as a dirent key or are reserved.
 fn validate_name(name: &OsStr) -> Result<&[u8], Errno> {
     let bytes = name.as_encoded_bytes();
@@ -205,30 +131,6 @@ fn validate_name(name: &OsStr) -> Result<&[u8], Errno> {
         return Err(Errno::ENAMETOOLONG);
     }
     Ok(bytes)
-}
-
-/// Truncate file extents beyond `new_size`. Removes whole blocks past the
-/// boundary and zero-fills the partial tail block.
-fn truncate_extents(fs: &mut Fs, ino: u64, new_size: u64) -> btree::Result<()> {
-    let boundary_block = new_size & !(BLOCK_SIZE - 1);
-    let tail_offset = (new_size % BLOCK_SIZE) as usize;
-
-    for (ext_off, ext) in fs.list_extents(ino)? {
-        if ext_off >= new_size {
-            fs.delete_extent(ino, ext_off)?;
-            fs.free_data_block(ext.data_block);
-        } else if ext_off == boundary_block
-            && tail_offset > 0
-            && (ext.len as u64) > new_size - ext_off
-        {
-            let mut buf = fs.read_data_block(ext.data_block)?;
-            for b in &mut buf[tail_offset..ext.len as usize] {
-                *b = 0;
-            }
-            fs.put_extent(ino, ext_off, &buf[..tail_offset])?;
-        }
-    }
-    Ok(())
 }
 
 /// Map an FsError to a POSIX errno for FUSE replies.
@@ -377,7 +279,7 @@ impl Filesystem for FuseFs {
         reply: ReplyData,
     ) {
         let fs = self.fs.lock().unwrap();
-        match do_read(&fs, ino.0, offset, size) {
+        match fs.read_at(ino.0, offset, size) {
             Ok(buf) => reply.data(&buf),
             Err(_) => reply.error(Errno::EIO),
         }
@@ -397,7 +299,7 @@ impl Filesystem for FuseFs {
     ) {
         let ino = ino.0;
         let mut fs = self.fs.lock().unwrap();
-        let written = match do_write(&mut fs, ino, offset, data) {
+        let written = match fs.write_at(ino, offset, data) {
             Ok(n) => n,
             Err(_) => {
                 reply.error(Errno::EIO);
@@ -677,7 +579,7 @@ impl Filesystem for FuseFs {
             inode.gid = g;
         }
         if let Some(new_size) = size {
-            if new_size < inode.size && truncate_extents(&mut fs, ino, new_size).is_err() {
+            if new_size < inode.size && fs.truncate_extents(ino, new_size).is_err() {
                 reply.error(Errno::EIO);
                 return;
             }
@@ -792,7 +694,7 @@ impl Filesystem for FuseFs {
             reply.error(Errno::EINVAL);
             return;
         }
-        match do_read(&fs, ino.0, 0, inode.size as u32) {
+        match fs.read_at(ino.0, 0, inode.size as u32) {
             Ok(buf) => reply.data(&buf),
             Err(_) => reply.error(Errno::EIO),
         }
@@ -1007,18 +909,18 @@ mod tests {
     #[test]
     fn write_then_read_small() {
         let (mut fs, ino) = setup_fs_with_file(0);
-        do_write(&mut fs, ino, 0, b"hello").unwrap();
+        fs.write_at(ino, 0, b"hello").unwrap();
         let mut i = fs.get_inode(ino).unwrap().unwrap();
         i.size = 5;
         fs.put_inode(ino, &i).unwrap();
-        let got = do_read(&fs, ino, 0, 100).unwrap();
+        let got = fs.read_at(ino, 0, 100).unwrap();
         assert_eq!(got, b"hello");
     }
 
     #[test]
     fn read_zero_fills_past_inode_size() {
         let (fs, ino) = setup_fs_with_file(5);
-        let got = do_read(&fs, ino, 0, 100).unwrap();
+        let got = fs.read_at(ino, 0, 100).unwrap();
         assert_eq!(got, vec![0u8; 5]);
     }
 
@@ -1026,7 +928,7 @@ mod tests {
     fn write_crosses_block_boundary() {
         let (mut fs, ino) = setup_fs_with_file(0);
         let data = b"ABCDEFGH";
-        do_write(&mut fs, ino, 4094, data).unwrap();
+        fs.write_at(ino, 4094, data).unwrap();
         let mut i = fs.get_inode(ino).unwrap().unwrap();
         i.size = 4094 + 8;
         fs.put_inode(ino, &i).unwrap();
@@ -1036,53 +938,53 @@ mod tests {
         assert_eq!(extents[0].0, 0);
         assert_eq!(extents[1].0, BLOCK_SIZE);
 
-        let got = do_read(&fs, ino, 4094, 8).unwrap();
+        let got = fs.read_at(ino, 4094, 8).unwrap();
         assert_eq!(got, data);
     }
 
     #[test]
     fn write_rmw_preserves_surrounding_bytes() {
         let (mut fs, ino) = setup_fs_with_file(0);
-        do_write(&mut fs, ino, 0, &[b'A'; 10]).unwrap();
-        do_write(&mut fs, ino, 4, b"XX").unwrap();
+        fs.write_at(ino, 0, &[b'A'; 10]).unwrap();
+        fs.write_at(ino, 4, b"XX").unwrap();
         let mut i = fs.get_inode(ino).unwrap().unwrap();
         i.size = 10;
         fs.put_inode(ino, &i).unwrap();
 
-        let got = do_read(&fs, ino, 0, 10).unwrap();
+        let got = fs.read_at(ino, 0, 10).unwrap();
         assert_eq!(got, b"AAAAXXAAAA");
     }
 
     #[test]
     fn read_skips_extents_outside_range() {
         let (mut fs, ino) = setup_fs_with_file(0);
-        do_write(&mut fs, ino, 0, b"first").unwrap();
-        do_write(&mut fs, ino, BLOCK_SIZE, b"second").unwrap();
+        fs.write_at(ino, 0, b"first").unwrap();
+        fs.write_at(ino, BLOCK_SIZE, b"second").unwrap();
         let mut i = fs.get_inode(ino).unwrap().unwrap();
         i.size = BLOCK_SIZE + 6;
         fs.put_inode(ino, &i).unwrap();
 
-        let got = do_read(&fs, ino, BLOCK_SIZE, 6).unwrap();
+        let got = fs.read_at(ino, BLOCK_SIZE, 6).unwrap();
         assert_eq!(got, b"second");
     }
 
     // Regression guard for the scan window's lower bound. The extent covering a
     // read is keyed on its block boundary, so a read starting *inside* a
     // non-first block (offset > key) must align the scan start down to that
-    // boundary. If do_read passed the raw offset as the lower bound instead of
+    // boundary. If read_at passed the raw offset as the lower bound instead of
     // `offset & !(BLOCK_SIZE-1)`, extents_in_range would exclude the covering
     // extent (its key < offset) and the read would wrongly return zeros.
     #[test]
     fn read_from_mid_high_block_includes_covering_extent() {
         let (mut fs, ino) = setup_fs_with_file(0);
-        do_write(&mut fs, ino, BLOCK_SIZE, b"ABCDEFGH").unwrap();
+        fs.write_at(ino, BLOCK_SIZE, b"ABCDEFGH").unwrap();
         let mut i = fs.get_inode(ino).unwrap().unwrap();
         i.size = BLOCK_SIZE + 8;
         fs.put_inode(ino, &i).unwrap();
 
         // Start two bytes into block 1: offset=BLOCK_SIZE+2, whose covering
         // extent is keyed at BLOCK_SIZE (< offset).
-        let got = do_read(&fs, ino, BLOCK_SIZE + 2, 6).unwrap();
+        let got = fs.read_at(ino, BLOCK_SIZE + 2, 6).unwrap();
         assert_eq!(got, b"CDEFGH");
     }
 
@@ -1106,30 +1008,5 @@ mod tests {
         let mut i = fresh_inode(FILE_KIND_REGULAR);
         i.mode = S_IFLNK as u32 | 0o777;
         assert_eq!(to_attr(3, &i).kind, FileType::Symlink);
-    }
-
-    #[test]
-    fn truncate_extents_removes_blocks_past_boundary() {
-        let mut fs = Fs::new();
-        let ino = fs.alloc_ino();
-        let inode = InodeV1 {
-            mode: S_IFREG as u32 | 0o644,
-            uid: 0,
-            gid: 0,
-            nlink: 1,
-            size: BLOCK_SIZE * 3,
-            atime: 0,
-            mtime: 0,
-            ctime: 0,
-            parent_ino: ROOT_INO,
-        };
-        fs.put_inode(ino, &inode).unwrap();
-        for i in 0..3u64 {
-            fs.put_extent(ino, i * BLOCK_SIZE, b"x").unwrap();
-        }
-        truncate_extents(&mut fs, ino, BLOCK_SIZE).unwrap();
-        let remaining = fs.list_extents(ino).unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].0, 0);
     }
 }

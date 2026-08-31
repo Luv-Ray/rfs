@@ -31,7 +31,6 @@ use std::collections::HashMap;
 
 use rfs::block_btree::BLOCK_SIZE;
 use rfs::fs::{DirentV1, FILE_KIND_REGULAR, Fs, InodeV1, ROOT_INO, ROOT_SUBVOL, SubvolId};
-use rfs::fuse::do_read;
 
 const N_FILES: u64 = 5; // inodes 2..7
 const N_OFFSETS: u64 = 4; // block offsets 0..4
@@ -45,7 +44,8 @@ type Shadow = HashMap<(u64, u64), Cell>;
 enum Op {
     /// Write a single block of `fill`-bytes (length 1..=BLOCK) at slot.
     Write { file: u8, off: u8, fill: u8, len: u16 },
-    /// Read an arbitrary byte range via `do_read` and diff against the oracle.
+    /// Read an arbitrary byte range via `Fs::read_at` and diff against the
+    /// oracle.
     /// `off`/`len` are intentionally unconstrained (non-block-aligned, may
     /// straddle blocks and run past EOF) to exercise the read path's scan
     /// window and zero-fill.
@@ -167,7 +167,7 @@ fn check_view(fs: &Fs, shadow: &Shadow, label: &str, subvol: SubvolId) {
     }
 }
 
-/// Reconstruct what `do_read(ino, off, len)` must return from the shadow.
+/// Reconstruct what `Fs::read_at(ino, off, len)` must return from the shadow.
 /// Mirrors the read contract: clip `[off, off+len)` to `size`, then fill each
 /// byte from its covering cell (a block-keyed extent holds `fill` for its
 /// first `cell.len` bytes, zero past that up to the block end) or zero where no
@@ -230,7 +230,7 @@ fuzz_target!(|data: &[u8]| {
                 let len = (len as usize % BLOCK_SIZE) + 1; // 1..=BLOCK
                 fs.put_extent(ino, offset, &vec![fill; len]).expect("put_extent");
                 // Mirror the FUSE write path: it grows inode.size to cover the
-                // written range (see `FuseFs::write`). do_read clamps to
+                // written range (see `FuseFs::write`). read_at clamps to
                 // inode.size, so the oracle must track it too.
                 let mut inode = fs.get_inode(ino).expect("get_inode").expect("inode exists");
                 inode.size = inode.size.max(offset + len as u64);
@@ -248,7 +248,7 @@ fuzz_target!(|data: &[u8]| {
                 let span = N_OFFSETS * BLOCK;
                 let off = off as u64 % (span + 1);
                 let len = len as u32 % (span as u32 + 1);
-                let got = do_read(&fs, ino, off, len).expect("do_read");
+                let got = fs.read_at(ino, off, len).expect("read_at");
                 let want = expected_read(&active, ino, sizes[slot], off, len);
                 assert_eq!(
                     got, want,
