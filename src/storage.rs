@@ -155,13 +155,12 @@ impl Superblock {
         Ok(sb)
     }
 
-    /// Render the superblock to its 4 KB on-disk form, stamping the CRC.
-    pub fn to_bytes(mut self) -> [u8; BLOCK_SIZE] {
+    /// Stamp the CRC into `self.checksum` in place: zero the field, hash the
+    /// bytes, write the result back. After this the struct's bytes are the
+    /// exact on-disk form `parse` will re-check.
+    pub fn stamp_checksum(&mut self) {
         self.checksum = 0;
         self.checksum = self.compute_checksum();
-        let mut out = [0u8; BLOCK_SIZE];
-        out.copy_from_slice(self.as_bytes());
-        out
     }
 }
 
@@ -839,11 +838,12 @@ impl BlockStore {
 
     // ---------- Superblock IO ----------
 
-    /// Write the superblock at block 0 (with CRC stamped). Does not fsync.
-    pub fn write_superblock(&self, sb: &Superblock) -> Result<()> {
-        let bytes = sb.to_bytes();
+    /// Write the superblock at block 0, stamping the CRC. Takes `sb` by value
+    /// and stamps in place, so no defensive copy is made. Does not fsync.
+    pub fn write_superblock(&self, mut sb: Superblock) -> Result<()> {
+        sb.stamp_checksum();
         self.device
-            .write_at(&bytes, SUPERBLOCK_BLOCK_NR * BLOCK_SIZE as u64)?;
+            .write_at(sb.as_bytes(), SUPERBLOCK_BLOCK_NR * BLOCK_SIZE as u64)?;
         // Don't cache the superblock alongside node/data — its layout differs.
         Ok(())
     }

@@ -629,7 +629,7 @@ impl Fs {
             free_head,
             _reserved: [0; BLOCK_SIZE - 72],
         };
-        self.store.write_superblock(&sb)?;
+        self.store.write_superblock(sb)?;
         // Second fsync makes the new root visible after a crash.
         self.store.fsync()?;
         self.last_checkpoint_seq = journal_seq;
