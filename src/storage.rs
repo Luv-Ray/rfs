@@ -66,7 +66,7 @@ pub const SUPERBLOCK_VERSION: u32 = 4;
 ///   next_ino:8  journal_seq:8  next_snap_id:4  next_subvol_id:4
 ///   current_subvol:4  checksum:4  _reserved:4032
 #[repr(C)]
-#[derive(KnownLayout, zerocopy::Immutable, IntoBytes, FromBytes, Clone, Copy)]
+#[derive(KnownLayout, zerocopy::Immutable, IntoBytes, FromBytes, Clone)]
 pub struct Superblock {
     pub magic: u32,
     pub version: u32,
@@ -116,9 +116,10 @@ impl Superblock {
         }
     }
 
-    /// Compute the CRC over every field except `checksum`.
+    /// Compute the CRC over every field except `checksum`. Clones the whole
+    /// block to zero `checksum` without disturbing `self`.
     fn compute_checksum(&self) -> u32 {
-        let mut copy = *self;
+        let mut copy = self.clone();
         copy.checksum = 0;
         crc32fast::hash(copy.as_bytes())
     }
@@ -205,7 +206,7 @@ impl FrameKind {
 /// Layout: 32-byte header (magic, checksum, seq, frame_kind, op_kind, op_len)
 /// + 48 bytes of commit-end state scalars + `JOURNAL_OP_CAPACITY` op payload.
 #[repr(C)]
-#[derive(KnownLayout, zerocopy::Immutable, IntoBytes, FromBytes, Clone, Copy)]
+#[derive(KnownLayout, zerocopy::Immutable, IntoBytes, FromBytes, Clone)]
 pub struct JournalFrame {
     pub magic: u32,
     pub checksum: u32,
@@ -303,9 +304,10 @@ impl JournalFrame {
         &self.op_data[..self.op_len as usize]
     }
 
-    /// Compute a CRC32 over the frame with `checksum` treated as zero.
+    /// Compute a CRC32 over the frame with `checksum` treated as zero. Clones
+    /// the frame to zero `checksum` without disturbing `self`.
     pub fn compute_checksum(&self) -> u32 {
-        let mut copy = *self;
+        let mut copy = self.clone();
         copy.checksum = 0;
         crc32fast::hash(copy.as_bytes())
     }
@@ -323,7 +325,7 @@ impl JournalFrame {
 /// on-disk structures that don't need a magic+CRC header). Same alignment
 /// as `BtreeNodeRaw` so the cache always hands out properly-aligned bytes.
 #[repr(C, align(4096))]
-#[derive(KnownLayout, zerocopy::Immutable, IntoBytes, FromBytes, Clone, Copy)]
+#[derive(KnownLayout, zerocopy::Immutable, IntoBytes, FromBytes, Clone)]
 pub struct DataBlock(pub [u8; BLOCK_SIZE]);
 
 impl DataBlock {

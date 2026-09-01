@@ -112,7 +112,7 @@ const _: () = assert!(std::mem::size_of::<NodeHeader>() == 64);
 /// resolve ties between bsets storing the same key), the per-bset entry
 /// count, and a flags field. Bit 0 is [`BSET_FLAG_NEEDS_WHITEOUT`].
 #[repr(C)]
-#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Copy)]
+#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone)]
 pub struct BsetHeader {
     /// Monotonically increasing per-write sequence number. When two bsets
     /// contain the same sortable key, the one with the higher seq wins.

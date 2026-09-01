@@ -198,7 +198,7 @@ fn deleted_inode_from_key(key: &[u8]) -> (u64, SnapId) {
 // ---------- Value structs ----------
 
 #[repr(C)]
-#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Debug, PartialEq, Eq)]
 pub struct InodeV1 {
     pub mode: u32,
     pub uid: u32,
@@ -218,7 +218,7 @@ const _: () = assert!(std::mem::size_of::<InodeV1>() == 56);
 const _: () = assert!(std::mem::size_of::<InodeV1>() <= MAX_VALUE_SIZE);
 
 #[repr(C)]
-#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Debug, PartialEq, Eq)]
 pub struct DirentV1 {
     pub target_ino: u64,
     pub kind: u8,
@@ -238,7 +238,7 @@ impl DirentV1 {
 }
 
 #[repr(C)]
-#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Debug, PartialEq, Eq)]
 pub struct ExtentV1 {
     pub len: u32,
     _pad: [u8; 4],
@@ -252,7 +252,7 @@ const _: () = assert!(std::mem::size_of::<ExtentV1>() == 16);
 /// a snapshot tree). bcachefs convention: parent ids are always larger than
 /// child ids, since new snap_ids are allocated downward from `ROOT_SNAP`.
 #[repr(C)]
-#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotV1 {
     pub parent_id: SnapId,
     /// bit 0 = readonly snapshot view (set on the snapshot side after a
@@ -267,7 +267,7 @@ const _: () = assert!(std::mem::size_of::<SnapshotV1>() == 24);
 /// active snap_id — every fs op performed inside this subvolume reads and
 /// writes at this snap_id.
 #[repr(C)]
-#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Debug, PartialEq, Eq)]
 pub struct SubvolV1 {
     pub snap_id: SnapId,
     pub flags: u32,
@@ -285,7 +285,7 @@ pub const SUBVOL_FLAG_READONLY: u32 = 1 << 0;
 /// `next_offset` is the first extent offset that has not yet been tombstoned
 /// by the reclaim pass.
 #[repr(C)]
-#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(KnownLayout, Immutable, IntoBytes, FromBytes, Clone, Debug, PartialEq, Eq)]
 pub struct DeletedInodeV1 {
     pub next_offset: u64,
     _pad: [u8; 8],
@@ -1440,8 +1440,6 @@ impl Fs {
             flags: 1, // readonly view; not enforced yet but recorded.
             _reserved: [0; 16],
         };
-        let mut updated_src = src_subvol;
-        updated_src.snap_id = s_w;
         let dst_subvol = SubvolV1 {
             snap_id: s_ro,
             flags: SUBVOL_FLAG_READONLY,
@@ -1449,6 +1447,10 @@ impl Fs {
             parent_subvol: src,
             _reserved: [0; 12],
         };
+        // `updated_src` reuses src_subvol's other fields, so build dst_subvol
+        // (which reads root_inode) first, then move src_subvol in here.
+        let mut updated_src = src_subvol;
+        updated_src.snap_id = s_w;
 
         let s_w_key = snapshot_key(s_w);
         let s_ro_key = snapshot_key(s_ro);
