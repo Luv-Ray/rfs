@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-zerocopy = { version = "0.8", features = ["derive"] }
+zerocopy = { version = "0.8", features = ["derive", "alloc"] }
 fuser = { version = "0.17", default-features = false }
 libc = "0.2"
 elsa = "1.10"

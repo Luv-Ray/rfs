@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use zerocopy::FromZeros;
+
 use crate::storage::{BlockStore, FIRST_DATA_BLOCK_NR};
 
 use crate::block_btree::{
@@ -920,19 +922,18 @@ fn verify_node(store: &BlockStore, block_nr: u64, lo: Option<&[u8]>, hi: Option<
 /// temporaries). The single-bset start makes the node usable by single-bset
 /// code paths (split, promote, compact) immediately.
 fn new_node_on_heap(level: u8) -> Box<BtreeNodeRaw> {
-    // SAFETY: repr(C) + FromBytes — zeroed memory is valid; we set header fields below.
-    let mut b: Box<BtreeNodeRaw> = unsafe { Box::<BtreeNodeRaw>::new_zeroed().assume_init() };
+    let mut b: Box<BtreeNodeRaw> = BtreeNodeRaw::new_box_zeroed().unwrap();
     b.header.magic = MAGIC_NUMBER;
     b.header.level = level;
     b.start_new_bset(0);
     b
 }
 
-/// COW clone: heap-copy without touching the stack.
+/// COW clone via heap memcpy, avoiding the 4KB stack temporary `node.clone()`
+/// would materialize.
 fn clone_to_heap(node: &BtreeNodeRaw) -> Box<BtreeNodeRaw> {
-    // SAFETY: repr(C) struct — memcpy on the heap is equivalent to Clone
-    // but avoids the 4KB stack temporary.
-    let mut b: Box<BtreeNodeRaw> = unsafe { Box::<BtreeNodeRaw>::new_zeroed().assume_init() };
+    let mut b: Box<BtreeNodeRaw> = BtreeNodeRaw::new_box_zeroed().unwrap();
+    // SAFETY: repr(C) struct — memcpy on the heap is equivalent to Clone.
     unsafe {
         std::ptr::copy_nonoverlapping(node as *const BtreeNodeRaw, &mut *b as *mut BtreeNodeRaw, 1);
     }

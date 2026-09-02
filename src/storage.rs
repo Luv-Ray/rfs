@@ -26,7 +26,7 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use zerocopy::{FromBytes, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, FromZeros, IntoBytes, KnownLayout};
 
 use crate::block_btree::{BLOCK_SIZE, BtreeNodeRaw, MAGIC_NUMBER};
 use crate::btree::{Error, Result};
@@ -517,16 +517,9 @@ impl BlockStore {
                 return Ok(f(&c.node));
             }
         }
-        // Miss: fault in from the device, then publish and run under the lock.
-        // Allocate an aligned BtreeNodeRaw box, fill it, verify magic + CRC,
-        // then publish to the cache.
-        let mut node = unsafe {
-            // SAFETY: BtreeNodeRaw is a POD `#[derive(FromBytes)]` type and
-            // Box::new_zeroed gives us properly aligned, zero-initialized
-            // memory. We immediately read_at into it, fully overwriting before
-            // any read.
-            Box::<BtreeNodeRaw>::new_zeroed().assume_init()
-        };
+        // Miss: fault in from the device, verify, then publish under the lock.
+        let mut node = BtreeNodeRaw::new_box_zeroed()
+            .map_err(|_| Error::Io(io::Error::from(io::ErrorKind::OutOfMemory)))?;
         self.device
             .read_at(node.as_mut_bytes(), nr * BLOCK_SIZE as u64)?;
         verify_node_in_place(nr, &node)?;
@@ -577,12 +570,9 @@ impl BlockStore {
                 return Ok(r);
             }
         }
-        // Miss: fault in from the device, publish, then mutate under the lock.
-        let mut node = unsafe {
-            // SAFETY: see `with_node` — POD FromBytes type, zeroed + aligned by
-            // new_zeroed, fully overwritten by read_at.
-            Box::<BtreeNodeRaw>::new_zeroed().assume_init()
-        };
+        // Miss: fault in from the device, then mutate under the lock.
+        let mut node = BtreeNodeRaw::new_box_zeroed()
+            .map_err(|_| Error::Io(io::Error::from(io::ErrorKind::OutOfMemory)))?;
         self.device
             .read_at(node.as_mut_bytes(), nr * BLOCK_SIZE as u64)?;
         verify_node_in_place(nr, &node)?;
