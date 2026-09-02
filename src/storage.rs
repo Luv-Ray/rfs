@@ -161,7 +161,7 @@ impl Superblock {
     /// exact on-disk form `parse` will re-check.
     pub fn stamp_checksum(&mut self) {
         self.checksum = 0;
-        self.checksum = self.compute_checksum();
+        self.checksum = crc32fast::hash(self.as_bytes());
     }
 }
 
@@ -310,6 +310,13 @@ impl JournalFrame {
         let mut copy = self.clone();
         copy.checksum = 0;
         crc32fast::hash(copy.as_bytes())
+    }
+
+    /// Stamp the CRC into `self.checksum` in place. Like
+    /// `self.checksum = self.compute_checksum()` but without the clone.
+    pub fn stamp_checksum(&mut self) {
+        self.checksum = 0;
+        self.checksum = crc32fast::hash(self.as_bytes());
     }
 
     /// Return `true` iff magic, seq, kind, and checksum all pass.
@@ -958,7 +965,7 @@ mod journal_tests {
     #[test]
     fn commit_end_frame_crc_roundtrip() {
         let mut f = JournalFrame::commit_end(42, 100, 200, 10, 50, u32::MAX - 5, 3, 1);
-        f.checksum = f.compute_checksum();
+        f.stamp_checksum();
         assert!(f.is_valid(42));
         assert!(!f.is_valid(43)); // wrong seq
         assert_eq!(f.kind(), Some(FrameKind::CommitEnd));
@@ -968,7 +975,7 @@ mod journal_tests {
     #[test]
     fn commit_end_frame_detects_corruption() {
         let mut f = JournalFrame::commit_end(1, 65, 66, 1, 2, u32::MAX - 1, 1, 1);
-        f.checksum = f.compute_checksum();
+        f.stamp_checksum();
         f.root_block = 999; // corrupt
         assert!(!f.is_valid(1));
     }
@@ -977,7 +984,7 @@ mod journal_tests {
     fn logged_op_frame_roundtrip() {
         let payload = b"unlink:parent=5,name=foo";
         let mut f = JournalFrame::logged_op(7, 3, payload);
-        f.checksum = f.compute_checksum();
+        f.stamp_checksum();
         assert!(f.is_valid(7));
         assert_eq!(f.kind(), Some(FrameKind::LoggedOp));
         assert_eq!(f.op_kind, 3);

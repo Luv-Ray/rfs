@@ -558,7 +558,7 @@ impl Fs {
             let seq = self.next_journal_seq;
             self.next_journal_seq += 1;
             let mut frame = crate::storage::JournalFrame::logged_op(seq, rec.kind as u8, &data);
-            frame.checksum = frame.compute_checksum();
+            frame.stamp_checksum();
             journal.append(&frame)?;
         }
         let seq = self.next_journal_seq;
@@ -573,7 +573,7 @@ impl Fs {
             self.next_subvol_id,
             self.current_subvol,
         );
-        end.checksum = end.compute_checksum();
+        end.stamp_checksum();
         journal.append(&end)?;
         self.store.fsync()?;
         Ok(())

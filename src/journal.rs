@@ -121,13 +121,13 @@ mod tests {
 
     fn end_frame(seq: u64, root_block: u64) -> JournalFrame {
         let mut f = JournalFrame::commit_end(seq, root_block, 100, 1, 2, u32::MAX - 1, 1, 1);
-        f.checksum = f.compute_checksum();
+        f.stamp_checksum();
         f
     }
 
     fn op_frame(seq: u64, op_kind: u8, data: &[u8]) -> JournalFrame {
         let mut f = JournalFrame::logged_op(seq, op_kind, data);
-        f.checksum = f.compute_checksum();
+        f.stamp_checksum();
         f
     }
 
