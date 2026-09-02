@@ -52,6 +52,24 @@ jobs:
         MIRIFLAGS: -Zmiri-disable-isolation
       run: cargo miri test --lib --verbose
 
+  bench:
+    # Compile-check the microbenchmark suite (benches/fs_bench.rs) so it can't
+    # silently rot as the Fs API changes. #[bench] requires nightly
+    # (#![feature(test)]); the rest of the build is stable.
+    #
+    # --no-run: build only, never time. CI runners are shared, oversubscribed
+    # VMs — their bench numbers swing tens of percent run to run, so they're
+    # useless for regression tracking. Real numbers need a dedicated runner;
+    # here we only guarantee the suite still compiles.
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install nightly
+      run: rustup toolchain install nightly
+    - name: Compile benches
+      run: cargo +nightly bench --no-run --verbose
+
   fuzz:
     # Differential fuzz of the Fs layer (fuzz/fuzz_targets/fs_ops.rs) against an
     # in-memory oracle: random op sequences run on a real image-backed Fs and a
