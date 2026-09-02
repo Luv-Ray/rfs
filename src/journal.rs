@@ -4,6 +4,7 @@ use zerocopy::{FromZeros, IntoBytes};
 
 use crate::block_btree::BLOCK_SIZE;
 use crate::btree::Result;
+use crate::device::BlockDevice;
 use crate::storage::*;
 
 /// One recovered commit group: the logged-op frames of the group followed by
@@ -109,6 +110,7 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::MemDevice;
     fn make_journal() -> Journal {
         // Back the journal with an in-RAM device — the ring is just a byte
         // range, so no on-disk file is needed to exercise append/scan.
